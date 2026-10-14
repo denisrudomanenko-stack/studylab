@@ -536,7 +536,182 @@ async def get_segment(slug: str, src_slug: str, seg_id: int,
     }
 
 
-# ─── ROUTES END (stages 5-6 inserted above this line) ─────────────────
+# ─── Stage 5: Chat + RAG + SSE ────────────────────────────────────────
+
+import httpx as _httpx
+import base64 as _b64
+
+TIMEWEB_URL = "https://api.timeweb.cloud/api/v1/cloud-ai/chat/completions"
+CHAT_MODEL  = "gemini/gemini-3.5-flash"
+
+SYSTEM_BIO = (
+    "Ты — интеллектуальный ассистент по биологии и микробиологии для студентки МГУ. "
+    "Отвечай строго по предоставленным фрагментам источников. "
+    "Используй правильные латинские названия организмов. "
+    "К каждому факту добавляй провенанс в формате [источник: название | раздел: заголовок]. "
+    "Если ответа в источниках нет — скажи честно и не придумывай."
+)
+
+
+async def _rag_context(subject_slug: str, question: str, k: int = 8) -> list[dict]:
+    """Retrieve top-k relevant chunks from the subject's vector index."""
+    if not MKLIB_OK:
+        return []
+    db_path = subject_dir(subject_slug) / "index.db"
+    if not db_path.exists():
+        return []
+
+    def _fetch():
+        vec = embed_query(question)
+        vdb = mk_open_db(db_path)
+        hits = db_search(vdb, "chunks", vec, k=k)
+        vdb.close()
+        return hits
+
+    try:
+        return await asyncio.to_thread(_fetch)
+    except Exception as e:
+        print(f"[rag error] {e}", flush=True)
+        return []
+
+
+def _build_messages(history: list[dict], question: str,
+                    context_chunks: list[dict], image_b64: str | None = None) -> list[dict]:
+    ctx = ""
+    if context_chunks:
+        parts = []
+        for i, h in enumerate(context_chunks, 1):
+            parts.append(f"[{i}] {h['text'][:600]}")
+        ctx = "Фрагменты из источников:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
+
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_BIO}]
+    for msg in history[-10:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    if image_b64:
+        user_content = [
+            {"type": "text",
+             "text": ctx + "Распознай текст, формулы и схемы с этого фото конспекта, "
+                          "затем ответь на вопрос: " + question},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+        ]
+    else:
+        user_content = ctx + question
+
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+@app.get("/api/subjects/{slug}/chat/history")
+async def chat_history(slug: str, limit: int = 50,
+                        user: dict = Depends(current_user)):
+    db = get_db()
+    rows = db.execute(
+        "SELECT role,content,created_at FROM chat_history "
+        "WHERE subject_slug=? AND user_id=? ORDER BY id DESC LIMIT ?",
+        (slug, int(user["sub"]), limit)
+    ).fetchall()
+    db.close()
+    return list(reversed([dict(r) for r in rows]))
+
+
+@app.delete("/api/subjects/{slug}/chat/history")
+async def clear_chat_history(slug: str, user: dict = Depends(current_user)):
+    db = get_db()
+    db.execute("DELETE FROM chat_history WHERE subject_slug=? AND user_id=?",
+               (slug, int(user["sub"])))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/api/subjects/{slug}/chat/stream")
+async def chat_stream(slug: str, q: str, user: dict = Depends(current_user),
+                       image: Optional[str] = None):
+    if not TIMEWEB_API_KEY:
+        raise HTTPException(503, "TIMEWEB_API_KEY не задан")
+
+    uid = int(user["sub"])
+    now = datetime.now(timezone.utc).isoformat()
+
+    db = get_db()
+    history = [dict(r) for r in db.execute(
+        "SELECT role,content FROM chat_history "
+        "WHERE subject_slug=? AND user_id=? ORDER BY id DESC LIMIT 20",
+        (slug, uid)
+    ).fetchall()]
+    db.close()
+    history = list(reversed(history))
+
+    context_chunks = await _rag_context(slug, q)
+
+    async def generate():
+        full_answer = []
+        try:
+            messages = _build_messages(history, q, context_chunks, image)
+            async with _httpx.AsyncClient(timeout=120) as client:
+                async with client.stream(
+                    "POST", TIMEWEB_URL,
+                    headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+                    json={"model": CHAT_MODEL, "messages": messages,
+                          "stream": True, "max_tokens": 4096, "temperature": 0.3}
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        yield f"data: {{\"error\": \"API error {resp.status_code}\"}}\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:].strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(raw)
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                full_answer.append(delta)
+                                yield f"data: {json.dumps({'content': delta})}\n\n"
+                        except Exception:
+                            pass
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            answer_text = "".join(full_answer)
+            if answer_text:
+                save_db = get_db()
+                save_db.execute(
+                    "INSERT INTO chat_history (subject_slug,user_id,role,content,created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (slug, uid, "user", q, now)
+                )
+                save_db.execute(
+                    "INSERT INTO chat_history (subject_slug,user_id,role,content,created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (slug, uid, "assistant", answer_text,
+                     datetime.now(timezone.utc).isoformat())
+                )
+                save_db.commit()
+                save_db.close()
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/subjects/{slug}/chat/upload-image")
+async def upload_chat_image(slug: str, file: UploadFile = File(),
+                             user: dict = Depends(current_user)):
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(400, "Файл слишком большой (макс. 10 МБ)")
+    encoded = _b64.b64encode(content).decode()
+    return {"image_b64": encoded}
+
+
+# ─── ROUTES END (stage 6 inserted above this line) ────────────────────
 
 
 # ─── Frontend ──────────────────────────────────────────────────────────
