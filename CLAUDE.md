@@ -11,7 +11,7 @@
 
 - **VPS:** Timeweb, `5.42.118.176`
 - **SSH:** `ssh root@5.42.118.176`
-- **Домен:** `study.24pensi.ru` (A-запись нужно добавить)
+- **Домен:** `study.24pensi.ru` (A-запись настроена)
 - **Путь на сервере:** `/opt/studylab/`
 - **На сервере уже стоят:** ollama + embeddinggemma:300m, nginx, certbot, Python 3.10, Docker
 - **Занятые порты:** 8200 (mklib), 8300 (ic-tp-dash), 8443/8444 (nginx SSL для ic-tp/mklib)
@@ -25,7 +25,7 @@
 ├── studylab.py              # FastAPI приложение
 ├── mklib.py                 # движок индексации (из проекта mklib)
 ├── requirements.txt
-├── .env                     # ANTHROPIC_API_KEY, SECRET_KEY
+├── .env                     # TIMEWEB_API_KEY, SECRET_KEY
 └── data/
     ├── studylab.db          # пользователи, сессии, предметы, история чатов
     └── subjects/            # по предмету
@@ -43,9 +43,66 @@
 - **Фронтенд:** SPA, vanilla JS, Liquid Glass CSS (inline)
 - **БД:** SQLite (метаданные + чаты), sqlite-vec (векторный индекс)
 - **Эмбеддинги:** ollama + embeddinggemma:300m (на сервере, порт 11434)
-- **LLM:** Claude API (Haiku — Q&A, Sonnet — билеты). Бюджет $20/мес
+- **LLM:** Timeweb Cloud AI API (см. раздел ниже)
 - **Конвертация:** PyMuPDF (PDF), pandoc (DOCX)
 - **HTTPS:** nginx + Let's Encrypt
+
+## Timeweb Cloud AI API
+
+Чат-ассистент и OCR работают через Timeweb AI API. Ключ уже есть на сервере.
+
+**Эндпоинт:** `https://api.timeweb.cloud/api/v1/cloud-ai/`
+**Авторизация:** Bearer-токен (лежит в nginx конфиге ic-tp-graph.conf на сервере).
+
+Извлечь токен:
+```bash
+grep -oP 'Bearer \K[^"]*' /etc/nginx/sites-enabled/ic-tp-graph.conf | head -1
+```
+
+**Модели для StudyLab:**
+
+| Задача | Модель | model_name |
+|--------|--------|------------|
+| Q&A по источникам | Gemini 3.5 Flash | `gemini/gemini-3.5-flash` |
+| Генерация ответов на билеты | Gemini 3.5 Flash (или DeepSeek V4 Pro для качества) | `gemini/gemini-3.5-flash` |
+| OCR конспектов (фото) | Gemini 3.5 Flash (Vision) | `gemini/gemini-3.5-flash` |
+
+**Формат запроса (OpenAI-совместимый):**
+```python
+import httpx
+
+response = httpx.post(
+    "https://api.timeweb.cloud/api/v1/cloud-ai/chat/completions",
+    headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+    json={
+        "model": "gemini/gemini-3.5-flash",
+        "messages": [
+            {"role": "system", "content": "системный промпт"},
+            {"role": "user", "content": "вопрос"}
+        ],
+        "stream": True,
+        "max_tokens": 4096,
+        "temperature": 0.3
+    },
+    timeout=120
+)
+```
+
+**Стриминг:** SSE, формат `data: {"choices":[{"delta":{"content":"..."}}]}`.
+
+**Vision (для фото конспектов):**
+```python
+{
+    "model": "gemini/gemini-3.5-flash",
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Распознай текст, формулы и схемы с этого фото конспекта"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+        ]
+    }]
+}
+```
 
 ## Зависимости
 
@@ -60,8 +117,9 @@ sqlite-vec>=0.1.6
 bcrypt>=4.0
 PyJWT>=2.8
 httpx>=0.27
-anthropic>=0.40
 ```
+
+Примечание: `anthropic` не нужен — используется Timeweb AI API через httpx.
 
 ## mklib — движок индексации
 
@@ -84,9 +142,9 @@ anthropic>=0.40
 
 ## ИИ-ассистент (RAG)
 
-1. Вопрос → embed_query → вектор 768d
+1. Вопрос → embed_query (ollama, локально) → вектор 768d
 2. Поиск в sqlite-vec по индексу предмета → топ-8 фрагментов
-3. Системный промпт + фрагменты + история → Claude API
+3. Системный промпт + фрагменты + история → Timeweb AI API (Gemini Flash)
 4. Стриминг ответа через SSE
 5. Провенанс: каждый тезис со ссылкой [источник, раздел]
 
@@ -110,7 +168,7 @@ anthropic>=0.40
 | 2 | Авторизация + структура данных | — |
 | 3 | Загрузка и индексация | — |
 | 4 | Поиск и читалка | — |
-| 5 | Чат-ассистент (RAG + SSE) | — |
+| 5 | Чат-ассистент (RAG + SSE через Timeweb AI) | — |
 | 6 | Билеты | — |
 | 7 | Фронтенд (параллельно) | — |
 | 8 | Деплой и тест | — |
@@ -122,4 +180,5 @@ anthropic>=0.40
 - Vanilla JS, без React/Vue
 - Один файл `studylab.py` для бэкенда (FastAPI)
 - Фронтенд inline в Python-файле (как mklib_web.py)
-- Все данные на сервере, наружу ничего не отправляется кроме LLM API
+- Все данные на сервере, наружу ничего не отправляется кроме Timeweb AI API
+- Эмбеддинги считаются локально (ollama), не через внешний API
