@@ -1,0 +1,17 @@
+[Unit]
+Description=StudyLab — персональная образовательная среда
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/studylab
+ExecStart=/opt/studylab/venv/bin/uvicorn studylab:app --host 127.0.0.1 --port 8201
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment="DATA_DIR=/opt/studylab/data"
+
+[Install]
+WantedBy=multi-user.target
