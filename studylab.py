@@ -209,7 +209,260 @@ async def api_me(user: dict = Depends(current_user)):
     return {"username": user["username"], "role": user["role"]}
 
 
-# ─── ROUTES END (stages 3-6 inserted above this line) ─────────────────
+# ─── Stage 3: Subjects + Upload + Indexing ────────────────────────────
+
+import asyncio
+import shutil
+import sys as _sys
+
+_sys.path.insert(0, str(BASE_DIR))
+try:
+    from mklib import (
+        convert_source as mk_convert,
+        segment_text,
+        embed_texts,
+        embed_query,
+        open_db as mk_open_db,
+        init_db as mk_init_db,
+        db_upsert,
+        db_search,
+        chunk_segment,
+        read_text as mk_read_text,
+        DIM,
+    )
+    MKLIB_OK = True
+except Exception as _e:
+    MKLIB_OK = False
+    print(f"[warn] mklib unavailable: {_e}", flush=True)
+
+
+def _slug(text: str, maxlen: int = 60) -> str:
+    s = re.sub(r"[^a-z0-9а-яёa-z]+", "-", text.lower().strip(), flags=re.UNICODE)
+    return s.strip("-")[:maxlen]
+
+
+def subject_dir(slug: str) -> Path:
+    d = SUBJECTS_DIR / slug
+    for sub in ("uploads", "md", ""):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    return d
+
+
+async def _index_source(subject_slug: str, source_slug: str,
+                         upload_path: Path, source_title: str):
+    """Background: convert → segment → embed → store in sqlite-vec."""
+    db = get_db()
+    try:
+        db.execute("UPDATE sources SET status='processing' WHERE subject_slug=? AND slug=?",
+                   (subject_slug, source_slug))
+        db.commit()
+
+        subj_dir = subject_dir(subject_slug)
+        md_dir = subj_dir / "md"
+
+        def _run():
+            if not MKLIB_OK:
+                raise RuntimeError("mklib недоступен")
+            mk_convert(upload_path, source_slug, md_dir)
+            text = mk_read_text(md_dir, source_slug)
+            if not text:
+                raise RuntimeError("Текст не извлечён")
+            segs = segment_text(text)
+            seg_path = subj_dir / "segments.json"
+            all_segs: dict = {}
+            if seg_path.exists():
+                try:
+                    all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+                except Exception:
+                    all_segs = {}
+            all_segs[source_slug] = {"title": source_title, "segments": segs,
+                                      "words": len(text.split())}
+            seg_path.write_text(json.dumps(all_segs, ensure_ascii=False, indent=1),
+                                encoding="utf-8")
+            db_path = subj_dir / "index.db"
+            vec_db = mk_open_db(db_path)
+            mk_init_db(vec_db, "chunks")
+            vec_db.execute("DELETE FROM chunks WHERE slug=?", (source_slug,))
+            vec_db.commit()
+            records, payloads = [], []
+            header = f"Предмет: {subject_slug}. Источник: «{source_title}»."
+            for seg in segs:
+                for ci, (a, b) in enumerate(chunk_segment(text, seg)):
+                    body = text[a:b].strip()
+                    if len(body.split()) < 10:
+                        continue
+                    full = f"{header} Раздел: «{seg['title']}».\n\n{body}"
+                    cid = "c_" + hashlib.sha1(
+                        f"{subject_slug}|{source_slug}|{a}|{b}".encode()
+                    ).hexdigest()[:16]
+                    records.append({
+                        "chunk_id": cid, "slug": source_slug,
+                        "topic": subject_slug, "priority": 1,
+                        "segment": seg["index"], "title": seg["title"],
+                        "text": full, "meta": {"start_char": a, "end_char": b},
+                    })
+                    payloads.append(full)
+            for i in range(0, len(records), 32):
+                vecs = embed_texts(payloads[i:i+32])
+                for r, v in zip(records[i:i+32], vecs):
+                    r["embedding"] = v
+                db_upsert(vec_db, "chunks", records[i:i+32])
+            vec_db.close()
+            return len(records)
+
+        n = await asyncio.to_thread(_run)
+        db.execute(
+            "UPDATE sources SET status='indexed', chunk_count=? WHERE subject_slug=? AND slug=?",
+            (n, subject_slug, source_slug)
+        )
+    except Exception as e:
+        db.execute(
+            "UPDATE sources SET status='error' WHERE subject_slug=? AND slug=?",
+            (subject_slug, source_slug)
+        )
+        print(f"[index error] {subject_slug}/{source_slug}: {e}", flush=True)
+    finally:
+        db.commit()
+        db.close()
+
+
+@app.post("/api/subjects")
+async def create_subject(title: str = Form(), description: str = Form(default=""),
+                          user: dict = Depends(admin_user)):
+    slug = _slug(title)
+    if not slug:
+        raise HTTPException(400, "Некорректное название")
+    subject_dir(slug)
+    db = get_db()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute(
+            "INSERT INTO subjects (slug,title,description,created_at,created_by) VALUES (?,?,?,?,?)",
+            (slug, title, description, now, int(user["sub"]))
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, f"Предмет '{slug}' уже существует")
+    finally:
+        db.close()
+    return {"ok": True, "slug": slug}
+
+
+@app.get("/api/subjects")
+async def list_subjects(user: dict = Depends(current_user)):
+    db = get_db()
+    subjects = [dict(r) for r in db.execute(
+        "SELECT slug,title,description,created_at FROM subjects ORDER BY created_at DESC"
+    ).fetchall()]
+    for s in subjects:
+        rows = db.execute(
+            "SELECT status, chunk_count FROM sources WHERE subject_slug=?", (s["slug"],)
+        ).fetchall()
+        s["source_count"] = len(rows)
+        s["indexed_count"] = sum(1 for r in rows if r["status"] == "indexed")
+        s["total_chunks"] = sum(r["chunk_count"] for r in rows)
+    db.close()
+    return subjects
+
+
+@app.get("/api/subjects/{slug}")
+async def get_subject(slug: str, user: dict = Depends(current_user)):
+    db = get_db()
+    row = db.execute("SELECT * FROM subjects WHERE slug=?", (slug,)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Предмет не найден")
+    return dict(row)
+
+
+@app.post("/api/subjects/{slug}/upload")
+async def upload_source(slug: str, file: UploadFile = File(),
+                         title: str = Form(default=""),
+                         user: dict = Depends(current_user),
+                         background_tasks=None,
+                         request: Request = None):
+    db = get_db()
+    if not db.execute("SELECT id FROM subjects WHERE slug=?", (slug,)).fetchone():
+        db.close()
+        raise HTTPException(404, "Предмет не найден")
+    db.close()
+
+    allowed = {".pdf", ".docx", ".doc", ".txt", ".md"}
+    ext = Path(file.filename).suffix.lower()
+    if ext not in allowed:
+        raise HTTPException(400, f"Формат {ext} не поддерживается. Разрешены: {', '.join(allowed)}")
+
+    src_title = title or Path(file.filename).stem
+    src_slug = _slug(src_title)
+    if not src_slug:
+        src_slug = _slug(file.filename)
+
+    subj_dir = subject_dir(slug)
+    upload_path = subj_dir / "uploads" / file.filename
+
+    content = await file.read()
+    upload_path.write_bytes(content)
+
+    now = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO sources "
+            "(subject_slug,slug,filename,original_name,title,status,chunk_count,created_at) "
+            "VALUES (?,?,?,?,?,'pending',0,?)",
+            (slug, src_slug, upload_path.name, file.filename, src_title, now)
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    asyncio.create_task(_index_source(slug, src_slug, upload_path, src_title))
+    return {"ok": True, "slug": src_slug, "title": src_title, "status": "pending"}
+
+
+@app.get("/api/subjects/{slug}/sources")
+async def list_sources(slug: str, user: dict = Depends(current_user)):
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM sources WHERE subject_slug=? ORDER BY created_at DESC", (slug,)
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+@app.delete("/api/subjects/{slug}/sources/{src_slug}")
+async def delete_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug)
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Источник не найден")
+    upload_path = subject_dir(slug) / "uploads" / row["filename"]
+    if upload_path.exists():
+        upload_path.unlink(missing_ok=True)
+    db.execute("DELETE FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.post("/api/subjects/{slug}/reindex/{src_slug}")
+async def reindex_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug)
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Источник не найден")
+    upload_path = subject_dir(slug) / "uploads" / row["filename"]
+    asyncio.create_task(_index_source(slug, src_slug, upload_path, row["title"]))
+    return {"ok": True, "message": "Переиндексация запущена"}
+
+
+# ─── ROUTES END (stages 4-6 inserted above this line) ─────────────────
 
 
 # ─── Frontend ──────────────────────────────────────────────────────────
