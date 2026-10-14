@@ -711,7 +711,159 @@ async def upload_chat_image(slug: str, file: UploadFile = File(),
     return {"image_b64": encoded}
 
 
-# ─── ROUTES END (stage 6 inserted above this line) ────────────────────
+# ─── Stage 6: Exam Tickets ────────────────────────────────────────────
+
+@app.get("/api/subjects/{slug}/tickets")
+async def list_tickets(slug: str, user: dict = Depends(current_user)):
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM exam_tickets WHERE subject_slug=? ORDER BY id", (slug,)
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/subjects/{slug}/tickets")
+async def create_ticket(slug: str, question: str = Form(),
+                         user: dict = Depends(current_user)):
+    if not question.strip():
+        raise HTTPException(400, "Вопрос не может быть пустым")
+    db = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = db.execute(
+        "INSERT INTO exam_tickets (subject_slug,question,status,created_at) VALUES (?,?,'pending',?)",
+        (slug, question.strip(), now)
+    )
+    ticket_id = cur.lastrowid
+    db.commit()
+    db.close()
+    return {"ok": True, "id": ticket_id}
+
+
+@app.put("/api/subjects/{slug}/tickets/{tid}")
+async def update_ticket(slug: str, tid: int, question: str = Form(),
+                         user: dict = Depends(current_user)):
+    db = get_db()
+    db.execute(
+        "UPDATE exam_tickets SET question=?, status='pending', answer='' WHERE id=? AND subject_slug=?",
+        (question.strip(), tid, slug)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.delete("/api/subjects/{slug}/tickets/{tid}")
+async def delete_ticket(slug: str, tid: int, user: dict = Depends(current_user)):
+    db = get_db()
+    db.execute("DELETE FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/api/subjects/{slug}/tickets/{tid}/generate")
+async def generate_ticket_answer(slug: str, tid: int,
+                                   user: dict = Depends(current_user)):
+    if not TIMEWEB_API_KEY:
+        raise HTTPException(503, "TIMEWEB_API_KEY не задан")
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Билет не найден")
+
+    question = row["question"]
+    context_chunks = await _rag_context(slug, question, k=10)
+
+    system_prompt = (
+        "Ты — преподаватель биологии и микробиологии МГУ. "
+        "Напиши развёрнутый ответ на экзаменационный билет, используя ТОЛЬКО предоставленные источники. "
+        "Структурируй ответ: введение, основная часть с подзаголовками, заключение. "
+        "Используй правильные латинские названия. "
+        "Добавляй провенанс [источник | раздел] после каждого ключевого утверждения. "
+        "Объём: 300-600 слов."
+    )
+
+    ctx = ""
+    if context_chunks:
+        parts = [f"[{i+1}] {h['text'][:800]}" for i, h in enumerate(context_chunks)]
+        ctx = "Источники:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
+
+    async def generate():
+        full_answer = []
+        try:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": ctx + "Вопрос экзаменационного билета: " + question}
+            ]
+            async with _httpx.AsyncClient(timeout=180) as client:
+                async with client.stream(
+                    "POST", TIMEWEB_URL,
+                    headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+                    json={"model": CHAT_MODEL, "messages": messages,
+                          "stream": True, "max_tokens": 4096, "temperature": 0.3}
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:].strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(raw)
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                full_answer.append(delta)
+                                yield f"data: {json.dumps({'content': delta})}\n\n"
+                        except Exception:
+                            pass
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            answer_text = "".join(full_answer)
+            if answer_text:
+                save_db = get_db()
+                save_db.execute(
+                    "UPDATE exam_tickets SET answer=?, status='generated', generated_at=? WHERE id=?",
+                    (answer_text, datetime.now(timezone.utc).isoformat(), tid)
+                )
+                save_db.commit()
+                save_db.close()
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/subjects/{slug}/tickets/export")
+async def export_tickets(slug: str, user: dict = Depends(current_user)):
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM exam_tickets WHERE subject_slug=? ORDER BY id", (slug,)
+    ).fetchall()
+    db.close()
+    subject_row = get_db().execute(
+        "SELECT title FROM subjects WHERE slug=?", (slug,)
+    ).fetchone()
+    title = subject_row["title"] if subject_row else slug
+
+    lines = [f"# Экзаменационные билеты: {title}\n"]
+    for i, r in enumerate(rows, 1):
+        lines.append(f"\n## Билет {i}: {r['question']}\n")
+        if r["answer"]:
+            lines.append(r["answer"])
+        else:
+            lines.append("_(ответ не сгенерирован)_")
+    text = "\n".join(lines)
+    return Response(text, media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="tickets_{slug}.txt"'})
+
+
+# ─── ROUTES END ────────────────────────────────────────────────────────
 
 
 # ─── Frontend ──────────────────────────────────────────────────────────
