@@ -462,7 +462,81 @@ async def reindex_source(slug: str, src_slug: str, user: dict = Depends(admin_us
     return {"ok": True, "message": "Переиндексация запущена"}
 
 
-# ─── ROUTES END (stages 4-6 inserted above this line) ─────────────────
+# ─── Stage 4: Search + Reader ─────────────────────────────────────────
+
+@app.get("/api/subjects/{slug}/search")
+async def search_subject(slug: str, q: str, k: int = 8,
+                          user: dict = Depends(current_user)):
+    if not MKLIB_OK:
+        raise HTTPException(503, "Поисковый движок недоступен")
+    db_path = subject_dir(slug) / "index.db"
+    if not db_path.exists():
+        return []
+
+    def _search():
+        vec = embed_query(q)
+        vdb = mk_open_db(db_path)
+        hits = db_search(vdb, "chunks", vec, k=k)
+        vdb.close()
+        return hits
+
+    hits = await asyncio.to_thread(_search)
+    return [
+        {
+            "score": h["score"],
+            "slug": h["slug"],
+            "segment": h["segment"],
+            "title": h["title"],
+            "text": h["text"][:400],
+        }
+        for h in hits
+    ]
+
+
+@app.get("/api/subjects/{slug}/segments")
+async def list_segments(slug: str, user: dict = Depends(current_user)):
+    seg_path = subject_dir(slug) / "segments.json"
+    if not seg_path.exists():
+        return {}
+    try:
+        return json.loads(seg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@app.get("/api/subjects/{slug}/segments/{src_slug}/{seg_id}")
+async def get_segment(slug: str, src_slug: str, seg_id: int,
+                       user: dict = Depends(current_user)):
+    seg_path = subject_dir(slug) / "segments.json"
+    if not seg_path.exists():
+        raise HTTPException(404, "Сегменты не найдены")
+    all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+    if src_slug not in all_segs:
+        raise HTTPException(404, f"Источник {src_slug} не найден")
+    segs = all_segs[src_slug]["segments"]
+    if seg_id < 0 or seg_id >= len(segs):
+        raise HTTPException(404, "Сегмент не найден")
+    seg = segs[seg_id]
+
+    def _read():
+        md_dir = subject_dir(slug) / "md"
+        if not MKLIB_OK:
+            return ""
+        return mk_read_text(md_dir, src_slug)
+
+    text = await asyncio.to_thread(_read)
+    body = text[seg["start_char"]:seg["end_char"]] if text else ""
+    return {
+        "index": seg["index"],
+        "title": seg["title"],
+        "words": seg["words"],
+        "text": body,
+        "source": src_slug,
+        "source_title": all_segs[src_slug].get("title", src_slug),
+    }
+
+
+# ─── ROUTES END (stages 5-6 inserted above this line) ─────────────────
 
 
 # ─── Frontend ──────────────────────────────────────────────────────────
