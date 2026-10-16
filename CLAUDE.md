@@ -40,7 +40,7 @@
 ## Стек
 
 - **Бэкенд:** Python, FastAPI, uvicorn
-- **Фронтенд:** SPA, vanilla JS, Liquid Glass CSS (inline)
+- **Фронтенд:** SPA, vanilla JS, дизайн «Ночной атлас» (CSS inline, шрифты Unbounded + Geologica с Google Fonts)
 - **БД:** SQLite (метаданные + чаты), sqlite-vec (векторный индекс)
 - **Эмбеддинги:** ollama + embeddinggemma:300m (на сервере, порт 11434)
 - **LLM:** Timeweb Cloud AI API (см. раздел ниже)
@@ -192,7 +192,7 @@ httpx>=0.27
 
 ## Правила
 
-- Liquid Glass стиль для всех HTML (тёмная тема по умолчанию)
+- Дизайн «Ночной атлас»: две темы (тёмная и светлая, по системным настройкам, переключатель в навбаре), токены в :root
 - CSS inline, без внешних файлов
 - Vanilla JS, без React/Vue
 - Один файл `studylab.py` для бэкенда (FastAPI)
