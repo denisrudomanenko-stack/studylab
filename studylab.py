@@ -3639,31 +3639,55 @@ function showImportFileModal(slug) {
     var data = await r.json();
     var qs = data.questions || [];
     if (!qs.length) { toast('Вопросов не найдено', 'error'); return; }
+    // Detect flags: duplicates within file, duplicates vs existing, too short
+    var existing = (_TK.all || []).map(function(t) { return t.question.trim().toLowerCase(); });
+    var seenInFile = {};
+    var flags = qs.map(function(q, i) {
+      var low = q.trim().toLowerCase();
+      var f = [];
+      if (q.trim().length < 8) f.push('short');
+      if (seenInFile[low]) f.push('dup-file');
+      else if (existing.indexOf(low) >= 0) f.push('dup-existing');
+      seenInFile[low] = true;
+      return f;
+    });
+    var flagCount = flags.filter(function(f) { return f.length > 0; }).length;
     // Show preview/edit modal
     var ov = document.createElement('div');
     ov.className = 'modal-overlay';
     var listHtml = qs.map(function(q, i) {
-      return '<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px">' +
+      var hasFlag = flags[i].length > 0;
+      var checked = !hasFlag;
+      var warn = '';
+      if (flags[i].indexOf('dup-existing') >= 0) warn = '<span style="color:var(--yellow);font-size:.75rem">уже есть</span>';
+      else if (flags[i].indexOf('dup-file') >= 0) warn = '<span style="color:var(--yellow);font-size:.75rem">дубль</span>';
+      else if (flags[i].indexOf('short') >= 0) warn = '<span style="color:var(--yellow);font-size:.75rem">короткий</span>';
+      return '<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px' + (hasFlag ? ';opacity:.6' : '') + '">' +
+        '<input type="checkbox" class="import-q-check" data-idx="' + i + '"' + (checked ? ' checked' : '') + ' style="margin-top:8px;min-width:18px;min-height:18px">' +
         '<span style="color:var(--dim);font-size:.8125rem;min-width:24px;padding-top:4px">' + (i+1) + '</span>' +
         '<input type="text" class="import-q-inp" value="' + esc(q) + '" style="flex:1;min-height:36px;font-size:.875rem">' +
+        warn +
         '</div>';
     }).join('');
+    var subtitle = flagCount > 0 ? '<div style="color:var(--yellow);font-size:.8125rem;margin-bottom:12px">' + flagCount + ' строк помечены (дубли или слишком короткие) — снимите галочку, чтобы пропустить</div>' : '';
     ov.innerHTML =
       '<div class="glass modal wide">' +
       '<div class="modal-title">Найдено ' + qs.length + ' вопросов — проверьте и поправьте перед сохранением</div>' +
+      subtitle +
       '<div style="max-height:55vh;overflow-y:auto;padding-right:4px">' + listHtml + '</div>' +
       '<div class="flex gap" style="margin-top:16px">' +
       '<button type="button" class="btn btn-ghost" id="imp-cancel">Отмена</button>' +
-      '<button type="button" class="btn btn-primary" id="imp-save">Добавить ' + qs.length + ' билетов</button>' +
+      '<button type="button" class="btn btn-primary" id="imp-save">Добавить билеты</button>' +
       '</div></div>';
     document.body.appendChild(ov);
     ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
     document.getElementById('imp-cancel').addEventListener('click', function() { ov.remove(); });
     document.getElementById('imp-save').addEventListener('click', async function() {
       var inputs = ov.querySelectorAll('.import-q-inp');
+      var checks = ov.querySelectorAll('.import-q-check');
       var lines = [];
-      inputs.forEach(function(inp2) { var v = inp2.value.trim(); if (v) lines.push(v); });
-      if (!lines.length) { ov.remove(); return; }
+      inputs.forEach(function(inp2, idx) { if (checks[idx] && checks[idx].checked) { var v = inp2.value.trim(); if (v) lines.push(v); } });
+      if (!lines.length) { toast('Нет выбранных вопросов', 'info'); return; }
       var btn = this; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
       var fd2 = new FormData(); fd2.append('questions', lines.join('\n'));
       var r2 = await api('/api/subjects/' + slug + '/tickets/batch', {method:'POST', body:fd2});
