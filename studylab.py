@@ -553,6 +553,9 @@ async def _index_source(subject_slug: str, source_slug: str,
     async with _INDEX_SEM:
         db = get_db()
         try:
+            # Delete existing images for this source before re-indexing
+            db.execute("DELETE FROM images WHERE subject_slug=? AND source_slug=?",
+                       (subject_slug, source_slug))
             db.execute("UPDATE sources SET status='indexing:convert' WHERE subject_slug=? AND slug=?",
                        (subject_slug, source_slug))
             db.commit()
@@ -672,14 +675,7 @@ def _extract_images_from_media(subject_slug: str, source_slug: str,
         ).fetchall()
     }
 
-    # Count page occurrences of each sha1 in the markdown text
-    # Images referenced as ![](media/page{N}_img{M}.png)
-    all_refs = re.findall(r"!\[\]\(media/([^)]+)\)", full_text)
-    total_pages = max(1, len(set(
-        re.match(r"page(\d+)_", r).group(1)
-        for r in all_refs if re.match(r"page(\d+)_", r)
-    )))
-    # sha1 → count of pages it appears on
+    # sha1 → set of page numbers it appears on (from filename like page5_img1.png)
     sha1_page_counts: dict[str, set[str]] = {}
 
     image_files = sorted(media_dir.glob("*.*"))
@@ -692,12 +688,15 @@ def _extract_images_from_media(subject_slug: str, source_slug: str,
         except Exception:
             pass
 
-    # Count page occurrences per sha1
+    # Count page occurrences per sha1 (from actual filename page numbers)
+    pages_with_any_image: set[str] = set()
     for img_path, sha1 in file_sha1.items():
         m = re.match(r"page(\d+)_", img_path.name)
         if m:
             page_num = m.group(1)
             sha1_page_counts.setdefault(sha1, set()).add(page_num)
+            pages_with_any_image.add(page_num)
+    total_pages_with_images = len(pages_with_any_image)
 
     inserted = 0
     seen_sha1_this_source: set[str] = set()
@@ -729,32 +728,16 @@ def _extract_images_from_media(subject_slug: str, source_slug: str,
         if sha1 in seen_sha1_this_source:
             continue
 
-        # Filter 4: logo/header heuristic (appears on 30%+ pages)
-        pages_with_img = len(sha1_page_counts.get(sha1, set()))
-        if total_pages > 1 and pages_with_img / total_pages >= LOGO_PAGE_RATIO:
-            continue
+        # Filter 4: logo/header heuristic (appears on 30%+ pages with images)
+        # Don't filter if ≤3 pages have images (every image could be >30%)
+        if total_pages_with_images > 3:
+            pages_with_img = len(sha1_page_counts.get(sha1, set()))
+            if pages_with_img / total_pages_with_images >= LOGO_PAGE_RATIO:
+                continue
 
-        # Normalize: max 1600px long side
-        long_side = max(w, h)
-        if long_side > MAX_IMAGE_LONG_SIDE:
-            scale = MAX_IMAGE_LONG_SIDE / long_side
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            try:
-                mat = fitz.Matrix(scale, scale)
-                pix2 = pix.set_dpi(72, 72)
-                # Use Pixmap resize via transformation
-                pix2 = fitz.Pixmap(pix, 0) if pix.alpha else pix
-                # fitz doesn't have direct resize — use samples manipulation
-                # Save as PNG, reload scaled via PDF page approach
-                # Since fitz.Pixmap doesn't have .resize(), we save and re-read
-                # to avoid Pillow dependency; just save as-is if too large is the fallback
-                pix2 = pix
-            except Exception:
-                pix2 = pix
-        else:
-            pix2 = pix
-            new_w, new_h = w, h
+        # Record original dimensions (fitz has no direct resize without Pillow)
+        pix2 = pix
+        new_w, new_h = w, h
 
         # Save as PNG in normalized path
         norm_filename = f"img_{sha1[:12]}.png"
@@ -815,8 +798,7 @@ def _extract_images_from_media(subject_slug: str, source_slug: str,
             "width,height,kind,caption,latex,figure_label,context,status,hidden,created_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (subject_slug, source_slug, segment_idx, rel_path, sha1,
-             new_w if long_side > MAX_IMAGE_LONG_SIDE else w,
-             new_h if long_side > MAX_IMAGE_LONG_SIDE else h,
+             new_w, new_h,
              "other", "", "", figure_label, context, "pending", 0, now)
         )
         seen_sha1_this_source.add(sha1)
@@ -850,10 +832,35 @@ async def _extract_and_describe_images(subject_slug: str, source_slug: str):
             return
 
         if not TIMEWEB_API_KEY:
-            print("[images] TIMEWEB_API_KEY not set, skipping vision description", flush=True)
+            print("[images] TIMEWEB_API_KEY not set, marking all pending as skipped_limit", flush=True)
+            skip_db = get_db()
+            skip_db.execute(
+                "UPDATE images SET status='skipped_limit' WHERE subject_slug=? AND source_slug=? AND status='pending'",
+                (subject_slug, source_slug)
+            )
+            skip_db.commit()
+            skip_db.close()
             return
 
         # Step 2: describe with vision model
+        db = get_db()
+        all_pending = db.execute(
+            "SELECT id FROM images WHERE subject_slug=? AND source_slug=? AND status='pending' ORDER BY id",
+            (subject_slug, source_slug)
+        ).fetchall()
+        db.close()
+
+        # Images beyond MAX_IMAGES_PER_SOURCE limit → mark as skipped_limit
+        if len(all_pending) > MAX_IMAGES_PER_SOURCE:
+            over_limit_ids = [r["id"] for r in all_pending[MAX_IMAGES_PER_SOURCE:]]
+            lim_db = get_db()
+            lim_db.execute(
+                f"UPDATE images SET status='skipped_limit' WHERE id IN ({','.join('?' * len(over_limit_ids))})",
+                over_limit_ids
+            )
+            lim_db.commit()
+            lim_db.close()
+
         db = get_db()
         pending = db.execute(
             "SELECT * FROM images WHERE subject_slug=? AND source_slug=? AND status='pending' LIMIT ?",
@@ -1273,6 +1280,8 @@ async def delete_source(slug: str, src_slug: str, user: dict = Depends(current_u
             vec_db.close()
         except Exception:
             pass
+    # Удалить изображения из БД
+    db.execute("DELETE FROM images WHERE subject_slug=? AND source_slug=?", (slug, src_slug))
     # Удалить из БД
     db.execute("DELETE FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug))
     db.commit()
@@ -1416,9 +1425,24 @@ async def _rag_context(subject_slug: str, question: str, k: int = 8) -> list[dic
                         all_hits.append(h)
             except Exception:
                 pass
+        # Filter out image chunks where the image is hidden
+        img_db = get_db()
+        visible_hits = []
+        for h in all_hits:
+            meta = h.get("meta") or {}
+            if isinstance(meta, dict) and meta.get("type") == "image":
+                img_id = meta.get("image_id")
+                if img_id is not None:
+                    img_row = img_db.execute(
+                        "SELECT hidden FROM images WHERE id=?", (img_id,)
+                    ).fetchone()
+                    if img_row and img_row["hidden"]:
+                        continue
+            visible_hits.append(h)
+        img_db.close()
         # Sort by score, prioritize current subject
-        all_hits.sort(key=lambda h: (-0.05 if h.get("_subject") == subject_slug else 0) - h["score"])
-        return all_hits[:k]
+        visible_hits.sort(key=lambda h: (-0.05 if h.get("_subject") == subject_slug else 0) - h["score"])
+        return visible_hits[:k]
 
     try:
         return await asyncio.to_thread(_fetch)
@@ -2237,7 +2261,7 @@ async def serve_media(slug: str, src_slug: str, path: str,
     # Path traversal protection
     allowed_root = (subject_dir(slug) / "md" / src_slug).resolve()
     file_path = (allowed_root / path).resolve()
-    if not str(file_path).startswith(str(allowed_root)):
+    if not file_path.is_relative_to(allowed_root):
         raise HTTPException(403, "Доступ запрещён")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(404, "Файл не найден")
@@ -2252,14 +2276,19 @@ async def serve_image(image_id: int, w: Optional[int] = None,
     """Serve image by id, optional thumbnail width ?w=400."""
     db = get_db()
     row = db.execute("SELECT * FROM images WHERE id=?", (image_id,)).fetchone()
-    db.close()
     if not row:
+        db.close()
         raise HTTPException(404, "Изображение не найдено")
+    # Verify subject exists and is accessible
+    subj_check = db.execute("SELECT slug FROM subjects WHERE slug=?", (row["subject_slug"],)).fetchone()
+    db.close()
+    if not subj_check:
+        raise HTTPException(404, "Предмет не найден")
 
     # Path traversal protection: reconstruct from subject_slug only
     allowed_root = subject_dir(row["subject_slug"]).resolve()
     file_path = (subject_dir(row["subject_slug"]) / row["path"]).resolve()
-    if not str(file_path).startswith(str(allowed_root)):
+    if not file_path.is_relative_to(allowed_root):
         raise HTTPException(403, "Доступ запрещён")
     if not file_path.exists():
         raise HTTPException(404, "Файл не найден")
@@ -2308,10 +2337,15 @@ async def update_image(image_id: int, request: Request,
     """Update hidden flag and/or caption for an image."""
     body = await request.json()
     db = get_db()
-    row = db.execute("SELECT id FROM images WHERE id=?", (image_id,)).fetchone()
+    row = db.execute("SELECT id, subject_slug FROM images WHERE id=?", (image_id,)).fetchone()
     if not row:
         db.close()
         raise HTTPException(404, "Изображение не найдено")
+    # Verify subject exists and is accessible
+    subj_check = db.execute("SELECT slug FROM subjects WHERE slug=?", (row["subject_slug"],)).fetchone()
+    if not subj_check:
+        db.close()
+        raise HTTPException(404, "Предмет не найден")
     updates = []
     params = []
     if "hidden" in body:
