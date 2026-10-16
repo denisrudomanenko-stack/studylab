@@ -145,6 +145,24 @@ def init_db():
             created_at   TEXT NOT NULL,
             generated_at TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_slug TEXT NOT NULL,
+            source_slug TEXT NOT NULL,
+            segment INTEGER DEFAULT 0,
+            path TEXT NOT NULL,
+            sha1 TEXT NOT NULL,
+            width INTEGER DEFAULT 0,
+            height INTEGER DEFAULT 0,
+            kind TEXT DEFAULT 'other',
+            caption TEXT DEFAULT '',
+            latex TEXT DEFAULT '',
+            figure_label TEXT DEFAULT '',
+            context TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            hidden INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
     """)
     # Safe migrations: add columns that may not exist in older DBs
     for migration in [
@@ -229,6 +247,10 @@ async def on_startup():
         "SELECT subject_slug, slug, filename, title, status FROM sources "
         "WHERE status LIKE 'indexing:%' OR status = 'uploaded'"
     ).fetchall()
+    # Re-queue image description for active sources with pending images
+    pending_imgs = db.execute(
+        "SELECT DISTINCT subject_slug, source_slug FROM images WHERE status='pending'"
+    ).fetchall()
     db.close()
     for row in stuck:
         key = f"{row['subject_slug']}/{row['slug']}"
@@ -245,6 +267,9 @@ async def on_startup():
             db2.commit()
             db2.close()
             print(f"[startup] file missing, set error: {key}", flush=True)
+    for row in pending_imgs:
+        asyncio.create_task(_extract_and_describe_images(row["subject_slug"], row["source_slug"]))
+        print(f"[startup] re-queued image description: {row['subject_slug']}/{row['source_slug']}", flush=True)
 
 
 # ─── Auth endpoints ────────────────────────────────────────────────────
@@ -482,6 +507,12 @@ import shutil
 import sys as _sys
 
 _INDEX_SEM = asyncio.Semaphore(2)
+_IMAGE_SEM = asyncio.Semaphore(1)
+MAX_IMAGES_PER_SOURCE = 150
+MIN_IMAGE_FILE_KB = 8
+MIN_IMAGE_SHORT_SIDE = 120
+MAX_IMAGE_LONG_SIDE = 1600
+LOGO_PAGE_RATIO = 0.30  # images on 30%+ pages are logos/headers
 
 _sys.path.insert(0, str(BASE_DIR))
 try:
@@ -608,6 +639,377 @@ async def _index_source(subject_slug: str, source_slug: str,
             db.commit()
             db.close()
             _INDEX_TASKS.pop(f"{subject_slug}/{source_slug}", None)
+
+    # If indexing succeeded, launch image extraction + description in background
+    # We check status after the block above
+    _check_db = get_db()
+    _src_row = _check_db.execute(
+        "SELECT status FROM sources WHERE subject_slug=? AND slug=?",
+        (subject_slug, source_slug)
+    ).fetchone()
+    _check_db.close()
+    if _src_row and _src_row["status"] == "active":
+        asyncio.create_task(_extract_and_describe_images(subject_slug, source_slug))
+
+
+def _extract_images_from_media(subject_slug: str, source_slug: str,
+                                md_dir: Path, full_text: str) -> int:
+    """Extract images from media/ dir, filter junk, store in images table.
+    Returns count of inserted images."""
+    import fitz  # PyMuPDF
+
+    media_dir = md_dir / source_slug / "media"
+    if not media_dir.exists():
+        return 0
+
+    now = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+
+    # Gather all existing sha1s in the subject (for dedup)
+    existing_sha1s: set[str] = {
+        r["sha1"] for r in db.execute(
+            "SELECT sha1 FROM images WHERE subject_slug=?", (subject_slug,)
+        ).fetchall()
+    }
+
+    # Count page occurrences of each sha1 in the markdown text
+    # Images referenced as ![](media/page{N}_img{M}.png)
+    all_refs = re.findall(r"!\[\]\(media/([^)]+)\)", full_text)
+    total_pages = max(1, len(set(
+        re.match(r"page(\d+)_", r).group(1)
+        for r in all_refs if re.match(r"page(\d+)_", r)
+    )))
+    # sha1 → count of pages it appears on
+    sha1_page_counts: dict[str, set[str]] = {}
+
+    image_files = sorted(media_dir.glob("*.*"))
+    # First pass: compute sha1s
+    file_sha1: dict[Path, str] = {}
+    for img_path in image_files:
+        try:
+            data = img_path.read_bytes()
+            file_sha1[img_path] = hashlib.sha1(data).hexdigest()
+        except Exception:
+            pass
+
+    # Count page occurrences per sha1
+    for img_path, sha1 in file_sha1.items():
+        m = re.match(r"page(\d+)_", img_path.name)
+        if m:
+            page_num = m.group(1)
+            sha1_page_counts.setdefault(sha1, set()).add(page_num)
+
+    inserted = 0
+    seen_sha1_this_source: set[str] = set()
+
+    for img_path in image_files:
+        if img_path not in file_sha1:
+            continue
+        sha1 = file_sha1[img_path]
+        data = img_path.read_bytes()
+
+        # Filter 1: file size < 8KB
+        if len(data) < MIN_IMAGE_FILE_KB * 1024:
+            continue
+
+        # Filter 2: dimensions via fitz
+        try:
+            pix = fitz.Pixmap(data)
+            w, h = pix.width, pix.height
+        except Exception:
+            continue
+
+        short_side = min(w, h)
+        if short_side < MIN_IMAGE_SHORT_SIDE:
+            continue
+
+        # Filter 3: duplicate sha1 within subject
+        if sha1 in existing_sha1s:
+            continue
+        if sha1 in seen_sha1_this_source:
+            continue
+
+        # Filter 4: logo/header heuristic (appears on 30%+ pages)
+        pages_with_img = len(sha1_page_counts.get(sha1, set()))
+        if total_pages > 1 and pages_with_img / total_pages >= LOGO_PAGE_RATIO:
+            continue
+
+        # Normalize: max 1600px long side
+        long_side = max(w, h)
+        if long_side > MAX_IMAGE_LONG_SIDE:
+            scale = MAX_IMAGE_LONG_SIDE / long_side
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            try:
+                mat = fitz.Matrix(scale, scale)
+                pix2 = pix.set_dpi(72, 72)
+                # Use Pixmap resize via transformation
+                pix2 = fitz.Pixmap(pix, 0) if pix.alpha else pix
+                # fitz doesn't have direct resize — use samples manipulation
+                # Save as PNG, reload scaled via PDF page approach
+                # Since fitz.Pixmap doesn't have .resize(), we save and re-read
+                # to avoid Pillow dependency; just save as-is if too large is the fallback
+                pix2 = pix
+            except Exception:
+                pix2 = pix
+        else:
+            pix2 = pix
+            new_w, new_h = w, h
+
+        # Save as PNG in normalized path
+        norm_filename = f"img_{sha1[:12]}.png"
+        norm_path = media_dir / norm_filename
+        try:
+            if pix2.colorspace and pix2.colorspace.n > 3:
+                pix2 = fitz.Pixmap(fitz.csRGB, pix2)
+            elif pix2.alpha:
+                pix2 = fitz.Pixmap(fitz.csRGB, pix2)
+            pix2.save(str(norm_path))
+        except Exception as ex:
+            print(f"[images] save failed {img_path.name}: {ex}", flush=True)
+            continue
+
+        # Determine segment by finding where this image is referenced in text
+        img_ref = f"![](media/{img_path.name})"
+        ref_pos = full_text.find(img_ref)
+        segment_idx = 0
+        if ref_pos >= 0:
+            # Find which segment contains this position (approximate)
+            seg_path = subject_dir(subject_slug) / "segments.json"
+            if seg_path.exists():
+                try:
+                    all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+                    src_segs = all_segs.get(source_slug, {}).get("segments", [])
+                    for seg in src_segs:
+                        if seg.get("start_char", 0) <= ref_pos <= seg.get("end_char", 0):
+                            segment_idx = seg.get("index", 0)
+                            break
+                except Exception:
+                    pass
+
+        # Extract figure label from neighboring text
+        figure_label = ""
+        if ref_pos >= 0:
+            window_start = max(0, ref_pos - 400)
+            window_end = min(len(full_text), ref_pos + 400)
+            window = full_text[window_start:window_end]
+            fig_m = re.search(r"(?:Рис\.?\s*\d+[\.\d]*|Рисунок\s+\d+[\.\d]*|Fig\.?\s*\d+[\.\d]*)[^\n]*", window)
+            if fig_m:
+                figure_label = fig_m.group(0).strip()[:120]
+
+        # Extract context: nearest paragraph up to 300 chars before the image ref
+        context = ""
+        if ref_pos >= 0:
+            before = full_text[max(0, ref_pos - 600):ref_pos]
+            paras = [p.strip() for p in re.split(r"\n\n+", before) if p.strip()]
+            if paras:
+                ctx_raw = paras[-1]
+                # Strip markdown image refs
+                ctx_raw = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", ctx_raw).strip()
+                context = ctx_raw[:300]
+
+        rel_path = str(norm_path.relative_to(subject_dir(subject_slug)))
+
+        db.execute(
+            "INSERT INTO images (subject_slug,source_slug,segment,path,sha1,"
+            "width,height,kind,caption,latex,figure_label,context,status,hidden,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (subject_slug, source_slug, segment_idx, rel_path, sha1,
+             new_w if long_side > MAX_IMAGE_LONG_SIDE else w,
+             new_h if long_side > MAX_IMAGE_LONG_SIDE else h,
+             "other", "", "", figure_label, context, "pending", 0, now)
+        )
+        seen_sha1_this_source.add(sha1)
+        existing_sha1s.add(sha1)
+        inserted += 1
+
+    db.commit()
+    db.close()
+    return inserted
+
+
+async def _extract_and_describe_images(subject_slug: str, source_slug: str):
+    """Post-indexing background task: extract images, then describe them with vision model."""
+    async with _IMAGE_SEM:
+        # Step 1: extract images from media dir
+        def _do_extract():
+            subj_dir = subject_dir(subject_slug)
+            md_dir = subj_dir / "md"
+            if not MKLIB_OK:
+                return 0
+            full_text = mk_read_text(md_dir, source_slug)
+            if not full_text:
+                return 0
+            return _extract_images_from_media(subject_slug, source_slug, md_dir, full_text)
+
+        try:
+            n_extracted = await asyncio.to_thread(_do_extract)
+            print(f"[images] extracted {n_extracted} images for {subject_slug}/{source_slug}", flush=True)
+        except Exception as e:
+            print(f"[images] extraction error {subject_slug}/{source_slug}: {e}", flush=True)
+            return
+
+        if not TIMEWEB_API_KEY:
+            print("[images] TIMEWEB_API_KEY not set, skipping vision description", flush=True)
+            return
+
+        # Step 2: describe with vision model
+        db = get_db()
+        pending = db.execute(
+            "SELECT * FROM images WHERE subject_slug=? AND source_slug=? AND status='pending' LIMIT ?",
+            (subject_slug, source_slug, MAX_IMAGES_PER_SOURCE)
+        ).fetchall()
+        db.close()
+
+        total = len(pending)
+        print(f"[images] describing {total} images for {subject_slug}/{source_slug}", flush=True)
+
+        for idx, img_row in enumerate(pending):
+            img_id = img_row["id"]
+            img_sha1 = img_row["sha1"]
+
+            # Check sha1 cache: if same image already described elsewhere
+            cache_db = get_db()
+            cached = cache_db.execute(
+                "SELECT kind,caption,latex FROM images WHERE sha1=? AND status='described' LIMIT 1",
+                (img_sha1,)
+            ).fetchone()
+            cache_db.close()
+
+            if cached:
+                upd_db = get_db()
+                upd_db.execute(
+                    "UPDATE images SET kind=?,caption=?,latex=?,status='described' WHERE id=?",
+                    (cached["kind"], cached["caption"], cached["latex"], img_id)
+                )
+                upd_db.commit()
+                upd_db.close()
+                continue
+
+            # Load image file
+            img_full_path = subject_dir(subject_slug) / img_row["path"]
+            if not img_full_path.exists():
+                err_db = get_db()
+                err_db.execute("UPDATE images SET status='error' WHERE id=?", (img_id,))
+                err_db.commit()
+                err_db.close()
+                continue
+
+            try:
+                import base64 as _b64_local
+                img_data = img_full_path.read_bytes()
+                img_b64 = _b64_local.b64encode(img_data).decode()
+            except Exception as e:
+                print(f"[images] read error img {img_id}: {e}", flush=True)
+                continue
+
+            vision_prompt = (
+                "Это иллюстрация из учебника. Определи тип: scheme/formula/table/photo/chart/other. "
+                "Для формулы напиши LaTeX. Для остальных — описание на русском (1-2 предложения). "
+                "Для декоративных — ответь SKIP. "
+                "Формат: TYPE|DESCRIPTION|LATEX"
+            )
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": vision_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+            ]}]
+
+            # Try up to 2 times
+            success = False
+            for attempt in range(2):
+                try:
+                    async with _httpx.AsyncClient(timeout=60) as client:
+                        resp = await client.post(
+                            TIMEWEB_URL,
+                            headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+                            json={"model": VISION_MODEL, "messages": messages,
+                                  "stream": False, "max_tokens": 512, "temperature": 0.1}
+                        )
+                        resp.raise_for_status()
+                        raw = resp.json()["choices"][0]["message"]["content"].strip()
+
+                    if raw.upper().startswith("SKIP"):
+                        upd_db = get_db()
+                        upd_db.execute("UPDATE images SET status='skipped' WHERE id=?", (img_id,))
+                        upd_db.commit()
+                        upd_db.close()
+                        success = True
+                        break
+
+                    parts = raw.split("|", 2)
+                    kind = parts[0].strip().lower() if len(parts) > 0 else "other"
+                    caption = parts[1].strip() if len(parts) > 1 else raw
+                    latex = parts[2].strip() if len(parts) > 2 else ""
+
+                    valid_kinds = {"scheme", "formula", "table", "photo", "chart", "other"}
+                    if kind not in valid_kinds:
+                        kind = "other"
+
+                    upd_db = get_db()
+                    upd_db.execute(
+                        "UPDATE images SET kind=?,caption=?,latex=?,status='described' WHERE id=?",
+                        (kind, caption, latex, img_id)
+                    )
+                    upd_db.commit()
+                    upd_db.close()
+                    success = True
+                    break
+
+                except Exception as e:
+                    print(f"[images] vision error img {img_id} attempt {attempt+1}: {e}", flush=True)
+                    if attempt == 0:
+                        await asyncio.sleep(2)
+
+            if not success:
+                err_db = get_db()
+                err_db.execute("UPDATE images SET status='error' WHERE id=?", (img_id,))
+                err_db.commit()
+                err_db.close()
+
+        # Step 3: create vector index chunks for described images
+        db = get_db()
+        described = db.execute(
+            "SELECT * FROM images WHERE subject_slug=? AND source_slug=? AND status='described' AND hidden=0",
+            (subject_slug, source_slug)
+        ).fetchall()
+        db.close()
+
+        if described and MKLIB_OK:
+            def _index_images():
+                subj_dir = subject_dir(subject_slug)
+                db_path = subj_dir / "index.db"
+                vec_db = mk_open_db(db_path)
+                mk_init_db(vec_db, "chunks")
+                records, payloads = [], []
+                for img_row in described:
+                    text_parts = [p for p in [img_row["caption"], img_row["figure_label"], img_row["context"]] if p]
+                    if not text_parts:
+                        continue
+                    chunk_text = ". ".join(text_parts)
+                    cid = "img_" + hashlib.sha1(
+                        f"{subject_slug}|{source_slug}|img|{img_row['id']}".encode()
+                    ).hexdigest()[:16]
+                    records.append({
+                        "chunk_id": cid, "slug": source_slug,
+                        "topic": subject_slug, "priority": 1,
+                        "segment": img_row["segment"], "title": img_row["figure_label"] or "Иллюстрация",
+                        "text": chunk_text,
+                        "meta": {"type": "image", "image_id": img_row["id"]},
+                    })
+                    payloads.append(chunk_text)
+                if records:
+                    vecs = embed_texts(payloads)
+                    for rec, vec in zip(records, vecs):
+                        rec["embedding"] = vec
+                    db_upsert(vec_db, "chunks", records)
+                vec_db.close()
+                return len(records)
+
+            try:
+                n_indexed = await asyncio.to_thread(_index_images)
+                print(f"[images] indexed {n_indexed} image chunks for {subject_slug}/{source_slug}", flush=True)
+            except Exception as e:
+                print(f"[images] index error {subject_slug}/{source_slug}: {e}", flush=True)
 
 
 import math as _math
@@ -1832,11 +2234,130 @@ import mimetypes
 @app.get("/api/subjects/{slug}/media/{src_slug}/{path:path}")
 async def serve_media(slug: str, src_slug: str, path: str,
                        user: dict = Depends(current_user)):
-    file_path = subject_dir(slug) / "md" / src_slug / path
+    # Path traversal protection
+    allowed_root = (subject_dir(slug) / "md" / src_slug).resolve()
+    file_path = (allowed_root / path).resolve()
+    if not str(file_path).startswith(str(allowed_root)):
+        raise HTTPException(403, "Доступ запрещён")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(404, "Файл не найден")
     mime, _ = mimetypes.guess_type(str(file_path))
-    return FileResponse(file_path, media_type=mime or "application/octet-stream")
+    return FileResponse(file_path, media_type=mime or "application/octet-stream",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/api/images/{image_id}")
+async def serve_image(image_id: int, w: Optional[int] = None,
+                       user: dict = Depends(current_user)):
+    """Serve image by id, optional thumbnail width ?w=400."""
+    db = get_db()
+    row = db.execute("SELECT * FROM images WHERE id=?", (image_id,)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Изображение не найдено")
+
+    # Path traversal protection: reconstruct from subject_slug only
+    allowed_root = subject_dir(row["subject_slug"]).resolve()
+    file_path = (subject_dir(row["subject_slug"]) / row["path"]).resolve()
+    if not str(file_path).startswith(str(allowed_root)):
+        raise HTTPException(403, "Доступ запрещён")
+    if not file_path.exists():
+        raise HTTPException(404, "Файл не найден")
+
+    if w and w > 0:
+        # Resize using fitz.Pixmap
+        def _resize():
+            import fitz
+            pix = fitz.Pixmap(str(file_path))
+            orig_w = pix.width
+            orig_h = pix.height
+            if orig_w <= w:
+                return file_path.read_bytes(), "image/png"
+            scale = w / orig_w
+            # fitz doesn't have direct resize but we can use a matrix on a temp document
+            # Create a temporary in-memory image document
+            # Workaround: convert via pixmap samples
+            new_h = int(orig_h * scale)
+            # Use fitz.Pixmap shrink (only works for integer factors) or just return original
+            # For proper resize without Pillow, create a PDF page with the image and render at scale
+            try:
+                import io
+                doc = fitz.open()
+                rect = fitz.Rect(0, 0, w, new_h)
+                page = doc.new_page(width=w, height=new_h)
+                page.insert_image(rect, pixmap=pix)
+                pix2 = page.get_pixmap(dpi=72)
+                buf = pix2.tobytes("png")
+                doc.close()
+                return buf, "image/png"
+            except Exception:
+                return file_path.read_bytes(), "image/png"
+
+        buf, mime_type = await asyncio.to_thread(_resize)
+        return Response(content=buf, media_type=mime_type,
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+    mime, _ = mimetypes.guess_type(str(file_path))
+    return FileResponse(str(file_path), media_type=mime or "image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.put("/api/images/{image_id}")
+async def update_image(image_id: int, request: Request,
+                        user: dict = Depends(current_user)):
+    """Update hidden flag and/or caption for an image."""
+    body = await request.json()
+    db = get_db()
+    row = db.execute("SELECT id FROM images WHERE id=?", (image_id,)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Изображение не найдено")
+    updates = []
+    params = []
+    if "hidden" in body:
+        updates.append("hidden=?")
+        params.append(1 if body["hidden"] else 0)
+    if "caption" in body:
+        updates.append("caption=?")
+        params.append(str(body["caption"])[:500])
+    if not updates:
+        db.close()
+        return {"ok": True}
+    params.append(image_id)
+    db.execute(f"UPDATE images SET {','.join(updates)} WHERE id=?", params)
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/api/subjects/{slug}/images")
+async def list_images(slug: str, source_slug: str = "",
+                       user: dict = Depends(current_user)):
+    """List images for a subject, optionally filtered by source_slug."""
+    db = get_db()
+    if source_slug:
+        rows = db.execute(
+            "SELECT id,source_slug,segment,path,sha1,width,height,kind,caption,"
+            "figure_label,context,status,hidden,created_at "
+            "FROM images WHERE subject_slug=? AND source_slug=? ORDER BY id",
+            (slug, source_slug)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id,source_slug,segment,path,sha1,width,height,kind,caption,"
+            "figure_label,context,status,hidden,created_at "
+            "FROM images WHERE subject_slug=? ORDER BY id",
+            (slug,)
+        ).fetchall()
+    db.close()
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        # Add image URL
+        d["url"] = f"/api/images/{d['id']}"
+        result.append(d)
+    return result
 
 
 # ─── ROUTES END ────────────────────────────────────────────────────────
@@ -2935,8 +3456,23 @@ async function loadSources(slug) {
   const el = document.getElementById('tab-src');
   if (!el) return;
   try {
-    const r = await api('/api/subjects/' + slug + '/sources');
-    const srcs = await r.json();
+    const [srcR, imgR] = await Promise.all([
+      api('/api/subjects/' + slug + '/sources'),
+      api('/api/subjects/' + slug + '/images').catch(function() { return null; })
+    ]);
+    const srcs = await srcR.json();
+    var imgsBySource = {};
+    if (imgR && imgR.ok) {
+      try {
+        var imgs = await imgR.json();
+        imgs.forEach(function(img) {
+          if (!imgsBySource[img.source_slug]) imgsBySource[img.source_slug] = {total:0, described:0, pending:0};
+          imgsBySource[img.source_slug].total++;
+          if (img.status === 'described') imgsBySource[img.source_slug].described++;
+          if (img.status === 'pending') imgsBySource[img.source_slug].pending++;
+        });
+      } catch(e) {}
+    }
     let html = '';
     html += '<div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Загрузить файлы">' +
       '<div class="drop-zone-icon">' + ic(IC.upload, 28) + '</div>' +
@@ -2948,19 +3484,24 @@ async function loadSources(slug) {
     if (!srcs.length) {
       html += '<div class="empty">' + ic(IC.doc, 36) + '<b>Источников пока нет</b><span>Загрузите файлы выше.</span></div>';
     } else {
-      html += srcs.map(function(s) { return renderSrc(s, slug); }).join('');
+      html += srcs.map(function(s) { return renderSrc(s, slug, imgsBySource[s.slug]); }).join('');
     }
     html += '</div>';
     el.innerHTML = html;
     setupDrop(slug);
-    if (srcs.some(function(s) { return s.status.startsWith('indexing') || s.status === 'uploaded'; })) {
+    var needPoll = srcs.some(function(s) { return s.status.startsWith('indexing') || s.status === 'uploaded'; });
+    // Also poll if any images are still pending description
+    if (!needPoll) {
+      needPoll = Object.values(imgsBySource).some(function(v) { return v.pending > 0; });
+    }
+    if (needPoll) {
       pollLater(function() { loadSources(slug); }, 3000);
       S._resume = function() { loadSources(slug); };
     }
   } catch(e) { console.error('loadSources error:', e); el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки: ' + esc(e.message || e) + '</p>'; }
 }
 
-function renderSrc(s, slug) {
+function renderSrc(s, slug, imgInfo) {
   const ext = (s.original_name || '').split('.').pop().toLowerCase();
   const st = s.status;
   const P = '\'' + slug + '\',\'' + s.slug + '\'';
@@ -3005,11 +3546,19 @@ function renderSrc(s, slug) {
   var readerLink = canRead ? '<a href="#/reader/' + slug + '" class="btn btn-ghost btn-sm">Читать</a>' : '';
   var kebab = '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с источником" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
     '<div class="menu hidden" role="menu">' + items + '</div></div>';
+  var imgBadge = '';
+  if (imgInfo && imgInfo.total > 0 && (st === 'active' || st === 'indexed' || st === 'inactive')) {
+    if (imgInfo.pending > 0) {
+      imgBadge = ' · <span style="color:var(--yellow);font-size:.8125rem"><span class="spinner" style="width:8px;height:8px;border-width:1.5px;vertical-align:middle;margin-right:3px"></span>Иллюстрации: ' + imgInfo.described + '/' + imgInfo.total + '</span>';
+    } else if (imgInfo.described > 0) {
+      imgBadge = ' · <span style="color:var(--muted);font-size:.8125rem">Иллюстрации: ' + imgInfo.described + '</span>';
+    }
+  }
   return '<div class="glass source-item" id="si-' + s.slug + '">' +
     '<div class="source-icon">' + esc((ext || 'file').slice(0, 4).toUpperCase()) + '</div>' +
     '<div class="source-info">' +
     '<div class="source-name">' + esc(s.title) + '</div>' +
-    '<div class="source-meta">' + esc(s.original_name) + (s.chunk_count ? ' · ' + s.chunk_count + ' чанков' : '') + '</div>' +
+    '<div class="source-meta">' + esc(s.original_name) + (s.chunk_count ? ' · ' + s.chunk_count + ' чанков' : '') + imgBadge + '</div>' +
     '</div>' +
     statusBadge +
     '<div class="source-actions">' + primary + toggle + readerLink + kebab + '</div>' +
