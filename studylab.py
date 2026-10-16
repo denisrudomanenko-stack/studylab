@@ -214,9 +214,34 @@ def admin_user(user: dict = Depends(current_user)) -> dict:
 app = FastAPI(title="StudyLab", docs_url=None, redoc_url=None)
 
 
+_INDEX_TASKS: dict[str, asyncio.Task] = {}  # key = "subject/src_slug"
+
+
 @app.on_event("startup")
 async def on_startup():
     init_db()
+    # Re-queue sources stuck in indexing/uploaded after restart
+    db = get_db()
+    stuck = db.execute(
+        "SELECT subject_slug, slug, filename, title, status FROM sources "
+        "WHERE status LIKE 'indexing:%' OR status = 'uploaded'"
+    ).fetchall()
+    db.close()
+    for row in stuck:
+        key = f"{row['subject_slug']}/{row['slug']}"
+        upload_path = subject_dir(row["subject_slug"]) / "uploads" / row["filename"]
+        if upload_path.exists():
+            task = asyncio.create_task(_index_source(
+                row["subject_slug"], row["slug"], upload_path, row["title"]))
+            _INDEX_TASKS[key] = task
+            print(f"[startup] re-queued: {key}", flush=True)
+        else:
+            db2 = get_db()
+            db2.execute("UPDATE sources SET status='error' WHERE subject_slug=? AND slug=?",
+                        (row["subject_slug"], row["slug"]))
+            db2.commit()
+            db2.close()
+            print(f"[startup] file missing, set error: {key}", flush=True)
 
 
 # ─── Auth endpoints ────────────────────────────────────────────────────
@@ -453,6 +478,8 @@ import asyncio
 import shutil
 import sys as _sys
 
+_INDEX_SEM = asyncio.Semaphore(2)
+
 _sys.path.insert(0, str(BASE_DIR))
 try:
     from mklib import (
@@ -489,99 +516,101 @@ def subject_dir(slug: str) -> Path:
 async def _index_source(subject_slug: str, source_slug: str,
                          upload_path: Path, source_title: str):
     """Background: convert → segment → embed → store in sqlite-vec."""
-    db = get_db()
-    try:
-        db.execute("UPDATE sources SET status='indexing:convert' WHERE subject_slug=? AND slug=?",
-                   (subject_slug, source_slug))
-        db.commit()
+    async with _INDEX_SEM:
+        db = get_db()
+        try:
+            db.execute("UPDATE sources SET status='indexing:convert' WHERE subject_slug=? AND slug=?",
+                       (subject_slug, source_slug))
+            db.commit()
 
-        subj_dir = subject_dir(subject_slug)
-        md_dir = subj_dir / "md"
+            subj_dir = subject_dir(subject_slug)
+            md_dir = subj_dir / "md"
 
-        def _update_status(st):
-            sdb = get_db()
-            sdb.execute("UPDATE sources SET status=? WHERE subject_slug=? AND slug=?",
-                        (st, subject_slug, source_slug))
-            sdb.commit()
-            sdb.close()
+            def _update_status(st):
+                sdb = get_db()
+                sdb.execute("UPDATE sources SET status=? WHERE subject_slug=? AND slug=?",
+                            (st, subject_slug, source_slug))
+                sdb.commit()
+                sdb.close()
 
-        def _run():
-            if not MKLIB_OK:
-                raise RuntimeError("mklib недоступен")
-            mk_convert(upload_path, source_slug, md_dir, with_images=True)
-            _update_status('indexing:segment')
-            text = mk_read_text(md_dir, source_slug)
-            if not text:
-                raise RuntimeError("Текст не извлечён")
-            segs = segment_text(text)
-            if not segs:
-                segs = [{"index": 0, "title": source_title,
-                         "start_char": 0, "end_char": len(text),
-                         "words": len(text.split())}]
-            seg_path = subj_dir / "segments.json"
-            all_segs: dict = {}
-            if seg_path.exists():
-                try:
-                    all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
-                except Exception:
-                    all_segs = {}
-            all_segs[source_slug] = {"title": source_title, "segments": segs,
-                                      "words": len(text.split())}
-            seg_path.write_text(json.dumps(all_segs, ensure_ascii=False, indent=1),
-                                encoding="utf-8")
-            db_path = subj_dir / "index.db"
-            vec_db = mk_open_db(db_path)
-            mk_init_db(vec_db, "chunks")
-            vec_db.execute("DELETE FROM chunks WHERE slug=?", (source_slug,))
-            vec_db.commit()
-            records, payloads = [], []
-            header = f"Предмет: {subject_slug}. Источник: «{source_title}»."
-            for seg in segs:
-                for ci, (a, b) in enumerate(chunk_segment(text, seg)):
-                    body = text[a:b].strip()
-                    if len(body.split()) < 10:
-                        continue
-                    full = f"{header} Раздел: «{seg['title']}».\n\n{body}"
-                    cid = "c_" + hashlib.sha1(
-                        f"{subject_slug}|{source_slug}|{a}|{b}".encode()
-                    ).hexdigest()[:16]
-                    records.append({
-                        "chunk_id": cid, "slug": source_slug,
-                        "topic": subject_slug, "priority": 1,
-                        "segment": seg["index"], "title": seg["title"],
-                        "text": full, "meta": {"start_char": a, "end_char": b},
-                    })
-                    payloads.append(full)
-            _update_status(f'indexing:embed 0/{len(records)}')
-            for i in range(0, len(records), 8):
-                _update_status(f'indexing:embed {i}/{len(records)}')
-                vecs = embed_texts(payloads[i:i+8])
-                for r, v in zip(records[i:i+8], vecs):
-                    r["embedding"] = v
-                db_upsert(vec_db, "chunks", records[i:i+8])
-            vec_db.close()
-            return len(records)
+            def _run():
+                if not MKLIB_OK:
+                    raise RuntimeError("mklib недоступен")
+                mk_convert(upload_path, source_slug, md_dir, with_images=True)
+                _update_status('indexing:segment')
+                text = mk_read_text(md_dir, source_slug)
+                if not text:
+                    raise RuntimeError("Текст не извлечён")
+                segs = segment_text(text)
+                if not segs:
+                    segs = [{"index": 0, "title": source_title,
+                             "start_char": 0, "end_char": len(text),
+                             "words": len(text.split())}]
+                seg_path = subj_dir / "segments.json"
+                all_segs: dict = {}
+                if seg_path.exists():
+                    try:
+                        all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        all_segs = {}
+                all_segs[source_slug] = {"title": source_title, "segments": segs,
+                                          "words": len(text.split())}
+                seg_path.write_text(json.dumps(all_segs, ensure_ascii=False, indent=1),
+                                    encoding="utf-8")
+                db_path = subj_dir / "index.db"
+                vec_db = mk_open_db(db_path)
+                mk_init_db(vec_db, "chunks")
+                vec_db.execute("DELETE FROM chunks WHERE slug=?", (source_slug,))
+                vec_db.commit()
+                records, payloads = [], []
+                header = f"Предмет: {subject_slug}. Источник: «{source_title}»."
+                for seg in segs:
+                    for ci, (a, b) in enumerate(chunk_segment(text, seg)):
+                        body = text[a:b].strip()
+                        if len(body.split()) < 10:
+                            continue
+                        full = f"{header} Раздел: «{seg['title']}».\n\n{body}"
+                        cid = "c_" + hashlib.sha1(
+                            f"{subject_slug}|{source_slug}|{a}|{b}".encode()
+                        ).hexdigest()[:16]
+                        records.append({
+                            "chunk_id": cid, "slug": source_slug,
+                            "topic": subject_slug, "priority": 1,
+                            "segment": seg["index"], "title": seg["title"],
+                            "text": full, "meta": {"start_char": a, "end_char": b},
+                        })
+                        payloads.append(full)
+                _update_status(f'indexing:embed 0/{len(records)}')
+                for i in range(0, len(records), 8):
+                    _update_status(f'indexing:embed {i}/{len(records)}')
+                    vecs = embed_texts(payloads[i:i+8])
+                    for r, v in zip(records[i:i+8], vecs):
+                        r["embedding"] = v
+                    db_upsert(vec_db, "chunks", records[i:i+8])
+                vec_db.close()
+                return len(records)
 
-        n = await asyncio.to_thread(_run)
-        db.execute(
-            "UPDATE sources SET status='indexed', chunk_count=? WHERE subject_slug=? AND slug=?",
-            (n, subject_slug, source_slug)
-        )
-    except Exception as e:
-        db.execute(
-            "UPDATE sources SET status='error' WHERE subject_slug=? AND slug=?",
-            (subject_slug, source_slug)
-        )
-        print(f"[index error] {subject_slug}/{source_slug}: {e}", flush=True)
-    finally:
-        db.commit()
-        db.close()
+            n = await asyncio.to_thread(_run)
+            db.execute(
+                "UPDATE sources SET status='active', chunk_count=? WHERE subject_slug=? AND slug=?",
+                (n, subject_slug, source_slug)
+            )
+        except Exception as e:
+            db.execute(
+                "UPDATE sources SET status='error' WHERE subject_slug=? AND slug=?",
+                (subject_slug, source_slug)
+            )
+            print(f"[index error] {subject_slug}/{source_slug}: {e}", flush=True)
+        finally:
+            db.commit()
+            db.close()
+            _INDEX_TASKS.pop(f"{subject_slug}/{source_slug}", None)
 
 
 @app.post("/api/subjects")
 async def create_subject(title: str = Form(), description: str = Form(default=""),
                           year: int = Form(default=0),
-                          user: dict = Depends(admin_user)):
+                          user: dict = Depends(current_user)):
     slug = _slug(title)
     if not slug:
         raise HTTPException(400, "Некорректное название")
@@ -669,6 +698,11 @@ async def upload_source(slug: str, file: UploadFile = File(),
     finally:
         db.close()
 
+    # Auto-start indexing in background (goes through semaphore queue)
+    key = f"{slug}/{src_slug}"
+    task = asyncio.create_task(_index_source(slug, src_slug, upload_path, src_title))
+    _INDEX_TASKS[key] = task
+
     return {"ok": True, "slug": src_slug, "title": src_title, "status": "uploaded"}
 
 
@@ -683,7 +717,7 @@ async def list_sources(slug: str, user: dict = Depends(current_user)):
 
 
 @app.post("/api/subjects/{slug}/sources/{src_slug}/index")
-async def index_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def index_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Запустить индексацию (конвертация + сегментация + эмбеддинги)."""
     db = get_db()
     row = db.execute(
@@ -697,13 +731,15 @@ async def index_source(slug: str, src_slug: str, user: dict = Depends(admin_user
     upload_path = subject_dir(slug) / "uploads" / row["filename"]
     if not upload_path.exists():
         raise HTTPException(404, "Файл не найден на сервере")
-    asyncio.create_task(_index_source(slug, src_slug, upload_path, row["title"]))
+    key = f"{slug}/{src_slug}"
+    task = asyncio.create_task(_index_source(slug, src_slug, upload_path, row["title"]))
+    _INDEX_TASKS[key] = task
     return {"ok": True, "message": "Индексация запущена"}
 
 
 @app.put("/api/subjects/{slug}/sources/{src_slug}/rename")
 async def rename_source(slug: str, src_slug: str, title: str = Form(),
-                         user: dict = Depends(admin_user)):
+                         user: dict = Depends(current_user)):
     db = get_db()
     db.execute("UPDATE sources SET title=? WHERE subject_slug=? AND slug=?",
                (title.strip(), slug, src_slug))
@@ -713,7 +749,7 @@ async def rename_source(slug: str, src_slug: str, title: str = Form(),
 
 
 @app.post("/api/subjects/{slug}/sources/{src_slug}/activate")
-async def activate_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def activate_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Включить источник в библиотеку (поиск и RAG)."""
     db = get_db()
     row = db.execute(
@@ -733,7 +769,7 @@ async def activate_source(slug: str, src_slug: str, user: dict = Depends(admin_u
 
 
 @app.post("/api/subjects/{slug}/sources/{src_slug}/deactivate")
-async def deactivate_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def deactivate_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Отключить источник от библиотеки (индекс сохраняется)."""
     db = get_db()
     row = db.execute(
@@ -753,7 +789,7 @@ async def deactivate_source(slug: str, src_slug: str, user: dict = Depends(admin
 
 
 @app.delete("/api/subjects/{slug}/sources/{src_slug}")
-async def delete_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def delete_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Полное удаление: файл, markdown, чанки из индекса."""
     db = get_db()
     row = db.execute(
@@ -1921,7 +1957,17 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 </div>
 <script>
 // ── State ──────────────────────────────────────────────────────────────
-const S = { user: null, chatES: null, pendingImg: null, chatConvId: 0, titles: {} };
+const S = { user: null, chatES: null, pendingImg: null, chatConvId: 0, titles: {}, _pollTimers: [] };
+
+// Stop all polling timers
+function stopPolling() { S._pollTimers.forEach(clearTimeout); S._pollTimers = []; }
+function pollLater(fn, ms) { var t = setTimeout(fn, ms); S._pollTimers.push(t); return t; }
+
+// Pause/resume polling on tab visibility
+document.addEventListener('visibilitychange', function() {
+  if (document.hidden) { stopPolling(); }
+  else if (S._resume) { S._resume(); }
+});
 
 // ── Toast ──────────────────────────────────────────────────────────────
 function toast(msg, type) {
@@ -2070,6 +2116,8 @@ function route() {
   const view = parts[0] || 'login';
   const slug = parts[1] || '';
   if (S.chatES) { S.chatES.close(); S.chatES = null; }
+  stopPolling();
+  S._resume = null;
   updateNav(view, slug);
   ensureTitle(view, slug);
   const main = document.getElementById('main');
@@ -2077,7 +2125,7 @@ function route() {
   if (!S.user && view !== 'login') { location.hash = '#/login'; return; }
   if (S.user && view === 'login') { location.hash = '#/dashboard'; return; }
   const views = { login: vLogin, dashboard: vDashboard, subject: vSubject,
-                  reader: vReader, chat: vChat, tickets: vTickets };
+                  reader: vReader, chat: vChat, tickets: vTickets, new: vNewSubject };
   const fn = views[view];
   if (fn) fn(main, slug); else location.hash = '#/dashboard';
 }
@@ -2290,26 +2338,24 @@ function vLogin(main) {
 
 // ── Dashboard ──────────────────────────────────────────────────────────
 async function vDashboard(main) {
-  const isAdmin = S.user && S.user.role === 'admin';
   main.innerHTML =
     '<div class="page">' +
     '<div class="section-header">' +
-    '<h1 class="section-title">Мои предметы</h1>' +
-    (isAdmin ? '<button class="btn btn-primary btn-sm" id="btn-add-subj">+ Добавить предмет</button>' : '') +
+    '<h1 class="section-title">Предметы</h1>' +
+    '<button class="btn btn-primary btn-sm" id="btn-add-subj">+ Новый предмет</button>' +
     '</div>' +
     '<div id="subj-grid" class="card-grid"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
     '</div>';
-  if (isAdmin) {
-    document.getElementById('btn-add-subj').addEventListener('click', showAddSubject);
-  }
+  document.getElementById('btn-add-subj').addEventListener('click', function() {
+    location.hash = '#/new';
+  });
   try {
     const r = await api('/api/subjects');
     const list = await r.json();
     const grid = document.getElementById('subj-grid');
     if (!grid) return;
     if (!list.length) {
-      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">' + ic(IC.flask, 40) + '<b>Предметов пока нет</b><span>' +
-        (isAdmin ? 'Нажмите «+ Добавить предмет», чтобы создать первый.' : 'Администратор ещё не создал ни одного предмета.') + '</span></div>';
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">' + ic(IC.flask, 40) + '<b>Предметов пока нет</b><span>Нажмите «+ Новый предмет», чтобы начать.</span></div>';
       return;
     }
     list.forEach(function(s) { S.titles[s.slug] = s.title; });
@@ -2443,33 +2489,30 @@ async function loadSources(slug) {
   try {
     const r = await api('/api/subjects/' + slug + '/sources');
     const srcs = await r.json();
-    const isAdmin = S.user && S.user.role === 'admin';
     let html = '';
-    if (isAdmin) {
-      html += '<div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Загрузить файлы">' +
-        '<div class="drop-zone-icon">' + ic(IC.upload, 28) + '</div>' +
-        '<div><strong>Перетащите файлы сюда</strong> или нажмите для выбора</div>' +
-        '<div class="drop-zone-sub">PDF, DOCX, TXT, MD — до 50 МБ</div>' +
-        '<input type="file" id="file-input" style="display:none" accept=".pdf,.docx,.doc,.txt,.md" multiple>' +
-        '</div>';
-    }
+    html += '<div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Загрузить файлы">' +
+      '<div class="drop-zone-icon">' + ic(IC.upload, 28) + '</div>' +
+      '<div><strong>Перетащите файлы сюда</strong> или нажмите для выбора</div>' +
+      '<div class="drop-zone-sub">PDF, DOCX, TXT, MD · можно сразу много</div>' +
+      '<input type="file" id="file-input" style="display:none" accept=".pdf,.docx,.doc,.txt,.md" multiple>' +
+      '</div>';
     html += '<div class="source-list mt" id="src-list">';
     if (!srcs.length) {
-      html += '<div class="empty">' + ic(IC.doc, 36) + '<b>Источников пока нет</b><span>' +
-        (isAdmin ? 'Загрузите файлы выше.' : 'Администратор ещё не добавил материалы.') + '</span></div>';
+      html += '<div class="empty">' + ic(IC.doc, 36) + '<b>Источников пока нет</b><span>Загрузите файлы выше.</span></div>';
     } else {
-      html += srcs.map(function(s) { return renderSrc(s, slug, isAdmin); }).join('');
+      html += srcs.map(function(s) { return renderSrc(s, slug); }).join('');
     }
     html += '</div>';
     el.innerHTML = html;
-    if (isAdmin) setupDrop(slug);
-    if (srcs.some(function(s) { return s.status.startsWith('indexing'); })) {
-      setTimeout(function() { loadSources(slug); }, 3000);
+    setupDrop(slug);
+    if (srcs.some(function(s) { return s.status.startsWith('indexing') || s.status === 'uploaded'; })) {
+      pollLater(function() { loadSources(slug); }, 3000);
+      S._resume = function() { loadSources(slug); };
     }
-  } catch(e) { el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>'; }
+  } catch(e) { console.error('loadSources error:', e); el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки: ' + esc(e.message || e) + '</p>'; }
 }
 
-function renderSrc(s, slug, isAdmin) {
+function renderSrc(s, slug) {
   const ext = (s.original_name || '').split('.').pop().toLowerCase();
   const st = s.status;
   const P = '\'' + slug + '\',\'' + s.slug + '\'';
@@ -2477,7 +2520,6 @@ function renderSrc(s, slug, isAdmin) {
   if (st.startsWith('indexing:')) {
     var parts = st.split(':')[1].split(' ');
     var phase = parts[0];
-    var phaseLabel = {convert:'конвертация',segment:'сегментация',embed:'эмбеддинг'}[phase] || phase;
     if (phase === 'embed' && parts[1]) {
       var nums = parts[1].split('/');
       var done = parseInt(nums[0]) || 0;
@@ -2485,38 +2527,36 @@ function renderSrc(s, slug, isAdmin) {
       var pct = Math.round(done / total * 100);
       statusBadge = '<span class="badge badge-yellow" style="min-width:150px"><span class="spinner" style="width:10px;height:10px"></span>' +
         '<span style="flex:1"><span class="progress" style="display:block;margin:0"><span class="progress-bar" style="display:block;width:' + pct + '%;background:var(--yellow)"></span></span></span>' +
-        '<span style="font-size:.75rem">' + done + '/' + total + '</span></span>';
+        '<span style="font-size:.75rem">Читаю… ' + pct + '%</span></span>';
     } else {
-      statusBadge = '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> ' + phaseLabel + '</span>';
+      statusBadge = '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> Читаю…</span>';
     }
+  } else if (st === 'error') {
+    statusBadge = '<span class="badge badge-red badge-dot">Не удалось прочитать</span>';
   } else {
     statusBadge = {
-      uploaded: '<span class="badge badge-blue badge-dot">загружен</span>',
-      indexing: '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> индексация</span>',
-      indexed: '<span class="badge badge-blue badge-dot">проиндексирован</span>',
-      active: '<span class="badge badge-green badge-dot">активен</span>',
-      inactive: '<span class="badge badge-dim badge-dot">отключён</span>',
-      error: '<span class="badge badge-red badge-dot">ошибка</span>'
+      uploaded: '<span class="badge badge-blue badge-dot">Загружен</span>',
+      indexing: '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> Читаю…</span>',
+      indexed: '<span class="badge badge-green badge-dot">Прочитан</span>',
+      active: '<span class="badge badge-green badge-dot">Прочитан</span>',
+      inactive: '<span class="badge badge-dim badge-dot">Отключён</span>'
     }[st] || '<span class="badge badge-blue">' + esc(st) + '</span>';
   }
   var primary = '', toggle = '', items = '';
   var canRead = (st === 'active' || st === 'indexed' || st === 'inactive');
-  if (isAdmin) {
-    if (st === 'uploaded' || st === 'error') {
-      primary = '<button class="btn btn-primary btn-sm" type="button" onclick="srcAction(' + P + ',\'index\')">Индексировать</button>';
-    }
-    if (canRead) {
-      var on = st === 'active';
-      toggle = '<button class="sw" type="button" role="switch" aria-checked="' + on + '" aria-label="Использовать источник в ответах" onclick="srcAction(' + P + ',\'' + (on ? 'deactivate' : 'activate') + '\')"><span class="knob"></span><span>' + (on ? 'Включён' : 'Выключен') + '</span></button>';
-      items += '<button type="button" role="menuitem" onclick="closeMenus(null);srcAction(' + P + ',\'index\')">Индексировать заново</button>';
-    }
-    items += '<button type="button" role="menuitem" onclick="closeMenus(null);renameSrc(' + P + ',\'' + esc(s.title).replace(/'/g,'\\&#39;') + '\')">Переименовать</button>';
-    items += '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delSrc(' + P + ')">Удалить</button>';
+  if (st === 'error') {
+    primary = '<button class="btn btn-primary btn-sm" type="button" onclick="srcAction(' + P + ',\'index\')">Попробовать снова</button>';
   }
+  if (canRead) {
+    var on = st === 'active';
+    toggle = '<button class="sw" type="button" role="switch" aria-checked="' + on + '" aria-label="Использовать источник в ответах" onclick="srcAction(' + P + ',\'' + (on ? 'deactivate' : 'activate') + '\')"><span class="knob"></span><span>' + (on ? 'Включён' : 'Выключен') + '</span></button>';
+    items += '<button type="button" role="menuitem" onclick="closeMenus(null);srcAction(' + P + ',\'index\')">Прочитать заново</button>';
+  }
+  items += '<button type="button" role="menuitem" onclick="closeMenus(null);renameSrc(' + P + ',\'' + esc(s.title).replace(/'/g,'\\&#39;') + '\')">Переименовать</button>';
+  items += '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delSrc(' + P + ')">Удалить</button>';
   var readerLink = canRead ? '<a href="#/reader/' + slug + '" class="btn btn-ghost btn-sm">Читать</a>' : '';
-  var kebab = isAdmin ?
-    '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с источником" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
-    '<div class="menu hidden" role="menu">' + items + '</div></div>' : '';
+  var kebab = '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с источником" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
+    '<div class="menu hidden" role="menu">' + items + '</div></div>';
   return '<div class="glass source-item" id="si-' + s.slug + '">' +
     '<div class="source-icon">' + esc((ext || 'file').slice(0, 4).toUpperCase()) + '</div>' +
     '<div class="source-info">' +
@@ -3052,6 +3092,257 @@ async function delTicket(slug, tid) {
   const r = await api('/api/subjects/' + slug + '/tickets/' + tid, {method:'DELETE'});
   if (r.ok) { toast('Билет удалён', 'success'); loadTickets(slug); }
   else toast('Ошибка удаления', 'error');
+}
+
+// ── New Subject Wizard ─────────────────────────────────────────────────
+function vNewSubject(main) {
+  var wizSlug = null;
+  var step = 1;
+
+  function wizHTML(stepN, body, btns) {
+    var pct = Math.round(stepN / 3 * 100);
+    return '<div class="page" style="max-width:680px;margin:0 auto">' +
+      '<div style="margin-bottom:24px">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">' +
+      '<span class="text-muted text-sm">Шаг ' + stepN + ' из 3</span>' +
+      '<a href="#/dashboard" class="btn btn-ghost btn-sm" style="min-height:36px;padding:0 12px">Отмена</a>' +
+      '</div>' +
+      '<div class="progress"><div class="progress-bar" style="width:' + pct + '%"></div></div>' +
+      '</div>' +
+      '<div class="glass" style="padding:28px 32px">' +
+      body +
+      '<div class="flex gap" style="margin-top:24px;flex-wrap:wrap">' + btns + '</div>' +
+      '</div></div>';
+  }
+
+  function renderStep1() {
+    main.innerHTML = wizHTML(1,
+      '<h2 class="section-title" style="font-size:1.375rem;margin-bottom:20px">Новый предмет</h2>' +
+      '<div class="form-group"><label class="form-label">Название</label>' +
+      '<input type="text" id="wiz-title" placeholder="Микробиология" required></div>' +
+      '<div class="form-group"><label class="form-label" style="color:var(--dim)">Семестр</label>' +
+      '<input type="text" disabled placeholder="Появится в задаче 02" style="opacity:.5;cursor:not-allowed"></div>' +
+      '<div class="form-group"><label class="form-label" style="color:var(--dim)">Дата экзамена</label>' +
+      '<input type="text" disabled placeholder="Появится в задаче 02" style="opacity:.5;cursor:not-allowed"></div>' +
+      '<div id="wiz-err" class="form-error hidden"></div>',
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-primary" id="wiz-next1">Дальше: материалы</button>'
+    );
+    setTimeout(function() {
+      var inp = document.getElementById('wiz-title');
+      if (inp) inp.focus();
+    }, 50);
+    document.getElementById('wiz-next1').addEventListener('click', async function() {
+      var title = (document.getElementById('wiz-title').value || '').trim();
+      if (!title) {
+        var errEl = document.getElementById('wiz-err');
+        errEl.textContent = 'Введите название предмета';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      var btn = this;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Создаю…';
+      var fd = new FormData();
+      fd.append('title', title);
+      fd.append('description', '');
+      fd.append('year', '0');
+      try {
+        var r = await api('/api/subjects', {method:'POST', body:fd});
+        if (r.ok) {
+          var data = await r.json();
+          wizSlug = data.slug;
+          S.titles[wizSlug] = title;
+          step = 2;
+          renderStep2();
+        } else {
+          var err = await r.json();
+          var errEl = document.getElementById('wiz-err');
+          errEl.textContent = err.detail || 'Ошибка создания предмета';
+          errEl.classList.remove('hidden');
+          btn.disabled = false;
+          btn.textContent = 'Дальше: материалы';
+        }
+      } catch(e) {
+        var errEl2 = document.getElementById('wiz-err');
+        errEl2.textContent = 'Ошибка сети';
+        errEl2.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Дальше: материалы';
+      }
+    });
+  }
+
+  function renderStep2() {
+    main.innerHTML = wizHTML(2,
+      '<h2 class="section-title" style="font-size:1.375rem;margin-bottom:20px">Материалы</h2>' +
+      '<div class="drop-zone" id="wiz-drop" role="button" tabindex="0" aria-label="Загрузить файлы">' +
+      '<div class="drop-zone-icon">' + ic(IC.upload, 28) + '</div>' +
+      '<div><strong>Перетащите файлы сюда</strong> или нажмите для выбора</div>' +
+      '<div class="drop-zone-sub">PDF, DOCX, TXT, MD · можно сразу много</div>' +
+      '<input type="file" id="wiz-file" style="display:none" accept=".pdf,.docx,.doc,.txt,.md" multiple>' +
+      '</div>' +
+      '<div class="source-list mt" id="wiz-src-list"></div>',
+      '<button class="btn btn-ghost" id="wiz-back2">Назад</button>' +
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-ghost btn-sm" id="wiz-skip2">Пропустить</button>' +
+      '<button class="btn btn-primary" id="wiz-next2" disabled>Дальше: список билетов</button>'
+    );
+    var wizPollTimer = null;
+
+    function wizStatusBadge(st) {
+      if (!st) return '';
+      if (st.startsWith('indexing:')) {
+        var parts = st.split(':')[1].split(' ');
+        var phase = parts[0];
+        if (phase === 'embed' && parts[1]) {
+          var nums = parts[1].split('/');
+          var pct = Math.round((parseInt(nums[0])||0) / (parseInt(nums[1])||1) * 100);
+          return '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> Читаю… ' + pct + '%</span>';
+        }
+        return '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> Читаю…</span>';
+      }
+      return {
+        uploaded: '<span class="badge badge-blue badge-dot">Загружен</span>',
+        active: '<span class="badge badge-green badge-dot">Прочитан</span>',
+        indexed: '<span class="badge badge-green badge-dot">Прочитан</span>',
+        inactive: '<span class="badge badge-dim badge-dot">Отключён</span>',
+        error: '<span class="badge badge-red badge-dot">Не удалось прочитать</span>'
+      }[st] || '<span class="badge badge-blue">' + esc(st) + '</span>';
+    }
+
+    function checkNext() {
+      var btn = document.getElementById('wiz-next2');
+      if (!btn) return;
+      var list = document.getElementById('wiz-src-list');
+      var hasReady = list && (list.querySelector('.badge-green') !== null);
+      btn.disabled = !hasReady;
+    }
+
+    async function wizPollSources() {
+      if (!wizSlug || !document.getElementById('wiz-src-list')) return;
+      try {
+        var r = await api('/api/subjects/' + wizSlug + '/sources');
+        var srcs = await r.json();
+        var list = document.getElementById('wiz-src-list');
+        if (!list) return;
+        var needPoll = false;
+        srcs.forEach(function(s) {
+          var el = document.getElementById('wiz-si-' + s.slug);
+          if (el) {
+            var badgeEl = el.querySelector('.badge');
+            if (badgeEl) badgeEl.outerHTML = wizStatusBadge(s.status);
+          }
+          if (s.status === 'uploaded' || s.status.startsWith('indexing')) needPoll = true;
+        });
+        checkNext();
+        if (needPoll && document.getElementById('wiz-src-list')) {
+          wizPollTimer = pollLater(wizPollSources, 2000);
+          S._resume = wizPollSources;
+        }
+      } catch(e) {}
+    }
+
+    function addSrcRow(file, status, slug) {
+      var list = document.getElementById('wiz-src-list');
+      if (!list) return;
+      var id = 'wiz-si-' + (slug || file.name.replace(/[^a-z0-9]/gi, '-'));
+      var existing = document.getElementById(id);
+      var badge = status === 'uploading'
+        ? '<span class="badge badge-blue"><span class="spinner" style="width:10px;height:10px"></span> Загружается…</span>'
+        : wizStatusBadge(status);
+      var html = '<div class="glass source-item" id="' + id + '">' +
+        '<div class="source-icon">' + esc((file.name.split('.').pop() || 'file').slice(0,4).toUpperCase()) + '</div>' +
+        '<div class="source-info"><div class="source-name">' + esc(file.name) + '</div>' +
+        '<div class="source-meta">' + file.name + '</div></div>' +
+        badge + '</div>';
+      if (existing) { existing.outerHTML = html; }
+      else { list.insertAdjacentHTML('beforeend', html); }
+    }
+
+    async function wizUpload(files) {
+      for (var i = 0; i < files.length; i++) {
+        var file = files[i];
+        addSrcRow(file, 'uploading', null);
+        var fd = new FormData();
+        fd.append('file', file);
+        fd.append('title', file.name.replace(/\.[^.]+$/, ''));
+        try {
+          var r = await api('/api/subjects/' + wizSlug + '/upload', {method:'POST', body:fd});
+          if (r.ok) {
+            var data = await r.json();
+            addSrcRow(file, 'uploaded', data.slug);
+            checkNext();
+            // Start polling for indexing progress
+            clearTimeout(wizPollTimer);
+            wizPollTimer = pollLater(wizPollSources, 2000);
+          } else {
+            toast(file.name + ': ошибка загрузки', 'error');
+          }
+        } catch(e) { toast(file.name + ': ошибка сети', 'error'); }
+      }
+    }
+
+    var zone = document.getElementById('wiz-drop');
+    var inp = document.getElementById('wiz-file');
+    zone.addEventListener('click', function(e) { if (e.target !== inp) inp.click(); });
+    zone.addEventListener('keydown', function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inp.click(); } });
+    zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.classList.add('drag-over'); });
+    zone.addEventListener('dragleave', function() { zone.classList.remove('drag-over'); });
+    zone.addEventListener('drop', function(e) { e.preventDefault(); zone.classList.remove('drag-over'); wizUpload(e.dataTransfer.files); });
+    inp.addEventListener('change', function() { wizUpload(inp.files); });
+
+    document.getElementById('wiz-back2').addEventListener('click', function() {
+      step = 1; renderStep1();
+    });
+    document.getElementById('wiz-skip2').addEventListener('click', function() {
+      step = 3; renderStep3();
+    });
+    document.getElementById('wiz-next2').addEventListener('click', function() {
+      step = 3; renderStep3();
+    });
+  }
+
+  function renderStep3() {
+    main.innerHTML = wizHTML(3,
+      '<h2 class="section-title" style="font-size:1.375rem;margin-bottom:8px">Список билетов</h2>' +
+      '<p class="text-muted text-sm" style="margin-bottom:16px">Один вопрос на строку. Нумерация удаляется автоматически. Можно пропустить и вернуться позже.</p>' +
+      '<textarea id="wiz-tickets" rows="10" placeholder="1. Первый вопрос&#10;2. Второй вопрос&#10;3. Третий вопрос" style="font-size:.9375rem"></textarea>' +
+      '<div id="wiz-t-err" class="form-error hidden"></div>',
+      '<button class="btn btn-ghost" id="wiz-back3">Назад</button>' +
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-ghost btn-sm" id="wiz-skip3">Пропустить</button>' +
+      '<button class="btn btn-primary" id="wiz-save3">Сохранить</button>'
+    );
+    document.getElementById('wiz-back3').addEventListener('click', function() {
+      step = 2; renderStep2();
+    });
+    document.getElementById('wiz-skip3').addEventListener('click', function() {
+      location.hash = '#/subject/' + wizSlug;
+    });
+    document.getElementById('wiz-save3').addEventListener('click', async function() {
+      var text = (document.getElementById('wiz-tickets').value || '').trim();
+      if (!text) { location.hash = '#/subject/' + wizSlug; return; }
+      var btn = this;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Сохраняю…';
+      var fd = new FormData();
+      fd.append('questions', text);
+      try {
+        var r = await api('/api/subjects/' + wizSlug + '/tickets/batch', {method:'POST', body:fd});
+        if (r.ok) {
+          var data = await r.json();
+          toast(data.count + ' ' + plural(data.count, ['вопрос', 'вопроса', 'вопросов']) + ' сохранено', 'success');
+        } else {
+          var err = await r.json();
+          toast(err.detail || 'Ошибка сохранения', 'error');
+        }
+      } catch(e) { toast('Ошибка сети', 'error'); }
+      location.hash = '#/subject/' + wizSlug;
+    });
+  }
+
+  renderStep1();
 }
 
 // ── Init ───────────────────────────────────────────────────────────────
