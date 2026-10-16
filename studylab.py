@@ -150,6 +150,8 @@ def init_db():
     for migration in [
         "ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE subjects ADD COLUMN year INTEGER DEFAULT 0",
+        "ALTER TABLE subjects ADD COLUMN semester INTEGER DEFAULT 0",
+        "ALTER TABLE subjects ADD COLUMN exam_date TEXT DEFAULT ''",
     ]:
         try:
             db.execute(migration)
@@ -607,20 +609,27 @@ async def _index_source(subject_slug: str, source_slug: str,
             _INDEX_TASKS.pop(f"{subject_slug}/{source_slug}", None)
 
 
+import math as _math
+
 @app.post("/api/subjects")
 async def create_subject(title: str = Form(), description: str = Form(default=""),
                           year: int = Form(default=0),
+                          semester: int = Form(default=0),
+                          exam_date: str = Form(default=""),
                           user: dict = Depends(current_user)):
     slug = _slug(title)
     if not slug:
         raise HTTPException(400, "Некорректное название")
     subject_dir(slug)
+    # Auto-compute year from semester
+    if semester > 0:
+        year = _math.ceil(semester / 2)
     db = get_db()
     try:
         now = datetime.now(timezone.utc).isoformat()
         db.execute(
-            "INSERT INTO subjects (slug,title,description,year,created_at,created_by) VALUES (?,?,?,?,?,?)",
-            (slug, title, description, year, now, int(user["sub"]))
+            "INSERT INTO subjects (slug,title,description,year,semester,exam_date,created_at,created_by) VALUES (?,?,?,?,?,?,?,?)",
+            (slug, title, description, year, semester, exam_date.strip(), now, int(user["sub"]))
         )
         db.commit()
     except sqlite3.IntegrityError:
@@ -630,11 +639,37 @@ async def create_subject(title: str = Form(), description: str = Form(default=""
     return {"ok": True, "slug": slug}
 
 
+@app.put("/api/subjects/{slug}")
+async def update_subject(slug: str,
+                          title: str = Form(default=""),
+                          semester: int = Form(default=-1),
+                          exam_date: str = Form(default="__unchanged__"),
+                          description: str = Form(default="__unchanged__"),
+                          user: dict = Depends(current_user)):
+    db = get_db()
+    row = db.execute("SELECT * FROM subjects WHERE slug=?", (slug,)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Предмет не найден")
+    new_title = title.strip() if title.strip() else row["title"]
+    new_semester = semester if semester >= 0 else (row["semester"] or 0)
+    new_year = _math.ceil(new_semester / 2) if new_semester > 0 else (row["year"] or 0)
+    new_exam_date = exam_date if exam_date != "__unchanged__" else (row["exam_date"] or "")
+    new_description = description if description != "__unchanged__" else (row["description"] or "")
+    db.execute(
+        "UPDATE subjects SET title=?,semester=?,year=?,exam_date=?,description=? WHERE slug=?",
+        (new_title, new_semester, new_year, new_exam_date.strip(), new_description, slug)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
 @app.get("/api/subjects")
 async def list_subjects(user: dict = Depends(current_user)):
     db = get_db()
     subjects = [dict(r) for r in db.execute(
-        "SELECT slug,title,description,year,created_at FROM subjects ORDER BY created_at DESC"
+        "SELECT slug,title,description,year,semester,exam_date,created_at FROM subjects ORDER BY created_at DESC"
     ).fetchall()]
     for s in subjects:
         rows = db.execute(
@@ -643,6 +678,15 @@ async def list_subjects(user: dict = Depends(current_user)):
         s["source_count"] = len(rows)
         s["active_count"] = sum(1 for r in rows if r["status"] == "active")
         s["total_chunks"] = sum(r["chunk_count"] for r in rows if r["status"] == "active")
+        # ticket stats
+        ticket_rows = db.execute(
+            "SELECT status FROM exam_tickets WHERE subject_slug=?", (s["slug"],)
+        ).fetchall()
+        s["ticket_count"] = len(ticket_rows)
+        s["answered_count"] = sum(1 for t in ticket_rows if t["status"] == "generated")
+        # normalize nulls
+        s["semester"] = s.get("semester") or 0
+        s["exam_date"] = s.get("exam_date") or ""
     db.close()
     return subjects
 
@@ -2337,39 +2381,224 @@ function vLogin(main) {
 }
 
 // ── Dashboard ──────────────────────────────────────────────────────────
+function _examBadge(examDate) {
+  if (!examDate) return '';
+  var today = new Date(); today.setHours(0,0,0,0);
+  var exam = new Date(examDate); exam.setHours(0,0,0,0);
+  var diff = Math.round((exam - today) / 86400000);
+  if (diff < 0) return '<span class="badge badge-dim badge-dot">прошёл</span>';
+  if (diff === 0) return '<span class="badge badge-red badge-dot">сегодня</span>';
+  var cls = diff <= 3 ? 'badge-red' : (diff <= 7 ? 'badge-yellow' : 'badge-dim');
+  return '<span class="badge ' + cls + ' badge-dot">через ' + diff + ' ' + plural(diff, ['день','дня','дней']) + '</span>';
+}
+
+function _subjectCardBtn(s) {
+  if (!s.source_count) return '<a href="#/new" class="btn btn-primary btn-sm">Подготовить</a>';
+  if (!s.ticket_count) return '<a href="#/tickets/' + s.slug + '" class="btn btn-ghost btn-sm">Добавить билеты</a>';
+  return '<a href="#/tickets/' + s.slug + '" class="btn btn-primary btn-sm">Открыть</a>';
+}
+
+function _renderSubjectCard(s) {
+  var pct = s.ticket_count ? Math.round(s.answered_count / s.ticket_count * 100) : 0;
+  var unanswered = s.ticket_count - s.answered_count;
+  var badge = _examBadge(s.exam_date);
+  var semBadge = s.semester ? '<span class="badge badge-blue">' + s.semester + ' сем.</span>' : '<span class="badge badge-dim">Укажите семестр</span>';
+  var meta = s.ticket_count
+    ? (s.answered_count + ' из ' + s.ticket_count + ' ' + plural(s.ticket_count, ['билета','билетов','билетов']) + (unanswered > 0 ? ' · ' + unanswered + ' без ответа' : ''))
+    : (s.source_count + ' ' + plural(s.source_count, ['источник','источника','источников']));
+  return '<div class="glass subject-card" style="cursor:default">' +
+    '<div class="card-top">' + semBadge + badge + '</div>' +
+    '<div class="card-title">' + esc(s.title) + '</div>' +
+    '<div><div class="progress" style="margin-top:0"><div class="progress-bar" style="width:' + pct + '%"></div></div>' +
+    '<div class="card-meta" style="margin-top:8px">' + esc(meta) + '</div></div>' +
+    '<div style="display:flex;align-items:center;gap:8px;justify-content:space-between">' +
+    _subjectCardBtn(s) +
+    '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с предметом" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
+    '<div class="menu hidden" role="menu">' +
+    '<a role="menuitem" href="#/subject/' + s.slug + '" onclick="closeMenus(null)">Источники</a>' +
+    '<a role="menuitem" href="#/tickets/' + s.slug + '" onclick="closeMenus(null)">Билеты</a>' +
+    '<a role="menuitem" href="#/chat/' + s.slug + '" onclick="closeMenus(null)">Чат</a>' +
+    '<button type="button" role="menuitem" onclick="closeMenus(null);showEditSubject(\'' + s.slug + '\',\'' + esc(s.title).replace(/'/g,"&#39;") + '\',' + (s.semester||0) + ',\'' + esc(s.exam_date||'') + '\',\'' + esc(s.description||'').replace(/'/g,"&#39;") + '\')">Изменить</button>' +
+    '</div></div></div>' +
+    '</div>';
+}
+
 async function vDashboard(main) {
-  main.innerHTML =
-    '<div class="page">' +
-    '<div class="section-header">' +
+  main.innerHTML = '<div class="page">' +
+    '<div class="section-header" style="margin-bottom:16px">' +
     '<h1 class="section-title">Предметы</h1>' +
     '<button class="btn btn-primary btn-sm" id="btn-add-subj">+ Новый предмет</button>' +
     '</div>' +
-    '<div id="subj-grid" class="card-grid"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
+    '<div id="dash-tabs" class="tabs" role="tablist" style="margin-bottom:16px"></div>' +
+    '<div style="margin-bottom:20px"><input type="text" id="dash-search" placeholder="Поиск по названию…" style="max-width:360px"></div>' +
+    '<div id="dash-content"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
     '</div>';
+
   document.getElementById('btn-add-subj').addEventListener('click', function() {
+    var sem = 0;
+    try { sem = parseInt(localStorage.getItem('sl-semester') || '0') || 0; } catch(e) {}
     location.hash = '#/new';
   });
-  try {
-    const r = await api('/api/subjects');
-    const list = await r.json();
-    const grid = document.getElementById('subj-grid');
-    if (!grid) return;
-    if (!list.length) {
-      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">' + ic(IC.flask, 40) + '<b>Предметов пока нет</b><span>Нажмите «+ Новый предмет», чтобы начать.</span></div>';
+
+  var allSubjects = [];
+  var activeSem = 0;
+
+  function detectSemester(list) {
+    var today = new Date(); today.setHours(0,0,0,0);
+    // find highest semester with a future exam_date
+    var withFuture = list.filter(function(s) { return s.semester > 0 && s.exam_date && new Date(s.exam_date) >= today; });
+    if (withFuture.length) {
+      return Math.max.apply(null, withFuture.map(function(s) { return s.semester; }));
+    }
+    var withSem = list.filter(function(s) { return s.semester > 0; });
+    if (withSem.length) {
+      return Math.max.apply(null, withSem.map(function(s) { return s.semester; }));
+    }
+    return 0;
+  }
+
+  function getSemesters(list) {
+    var set = {};
+    list.forEach(function(s) { if (s.semester > 0) set[s.semester] = true; });
+    return Object.keys(set).map(Number).sort(function(a,b) { return b - a; });
+  }
+
+  function renderTabs(semesters, current) {
+    var tabs = document.getElementById('dash-tabs');
+    if (!tabs) return;
+    var html = '<button class="tab' + (current === 0 ? ' active' : '') + '" onclick="dashSetSem(0)">Все семестры</button>';
+    semesters.forEach(function(sem) {
+      html += '<button class="tab' + (current === sem ? ' active' : '') + '" onclick="dashSetSem(' + sem + ')">' + sem + ' семестр</button>';
+    });
+    tabs.innerHTML = html;
+  }
+
+  function renderContent(list, sem, query) {
+    var today = new Date(); today.setHours(0,0,0,0);
+    var filtered = list.filter(function(s) {
+      if (sem > 0 && s.semester !== sem) return false;
+      if (query && s.title.toLowerCase().indexOf(query.toLowerCase()) === -1) return false;
+      return true;
+    });
+
+    var active = [], past = [];
+    filtered.forEach(function(s) {
+      if (s.exam_date && new Date(s.exam_date) < today) { past.push(s); }
+      else { active.push(s); }
+    });
+
+    // Sort active by exam_date asc, no date at end
+    active.sort(function(a,b) {
+      if (!a.exam_date && !b.exam_date) return 0;
+      if (!a.exam_date) return 1;
+      if (!b.exam_date) return -1;
+      return a.exam_date < b.exam_date ? -1 : 1;
+    });
+    // Past: sorted by exam_date desc
+    past.sort(function(a,b) { return a.exam_date > b.exam_date ? -1 : 1; });
+
+    var content = document.getElementById('dash-content');
+    if (!content) return;
+
+    if (!filtered.length) {
+      content.innerHTML = '<div class="empty">' + ic(IC.flask, 40) + '<b>Предметов нет</b><span>Попробуйте другой семестр или нажмите «+ Новый предмет».</span></div>';
       return;
     }
-    list.forEach(function(s) { S.titles[s.slug] = s.title; });
-    grid.innerHTML = list.map(function(s) {
-      const pct = s.source_count ? Math.round(s.active_count / s.source_count * 100) : 0;
-      return '<a href="#/subject/' + s.slug + '" class="glass subject-card">' +
-        '<div class="card-top">' + (s.year ? '<span class="badge badge-blue">' + s.year + ' курс</span>' : '<span></span>') +
-        '<span class="card-meta">' + s.source_count + ' ' + plural(s.source_count, ['источник', 'источника', 'источников']) + '</span></div>' +
-        '<div class="card-title">' + esc(s.title) + '</div>' +
-        '<div><div class="progress" style="margin-top:0"><div class="progress-bar" style="width:' + pct + '%"></div></div>' +
-        '<div class="card-meta" style="margin-top:8px">' + s.active_count + ' из ' + s.source_count + ' активных</div></div>' +
-        '</a>';
-    }).join('');
+
+    var html = '';
+    if (active.length) {
+      html += '<div class="card-grid" id="dash-grid">' + active.map(_renderSubjectCard).join('') + '</div>';
+    }
+    if (past.length) {
+      html += '<details style="margin-top:32px"><summary style="cursor:pointer;color:var(--muted);font-size:.9375rem;font-weight:500;padding:8px 0;list-style:none;display:flex;align-items:center;gap:8px">' +
+        ic(IC.chev, 16) + 'Прошедшие (' + past.length + ')</summary>' +
+        '<div class="card-grid" style="margin-top:16px">' + past.map(_renderSubjectCard).join('') + '</div></details>';
+    }
+    if (!active.length && !past.length) {
+      html = '<div class="empty">' + ic(IC.flask, 40) + '<b>Предметов нет</b><span>Нажмите «+ Новый предмет».</span></div>';
+    }
+    content.innerHTML = html;
+  }
+
+  window.dashSetSem = function(sem) {
+    activeSem = sem;
+    try { if (sem > 0) localStorage.setItem('sl-semester', sem); } catch(e) {}
+    var sems = getSemesters(allSubjects);
+    renderTabs(sems, activeSem);
+    var q = '';
+    var si = document.getElementById('dash-search');
+    if (si) q = si.value.trim();
+    renderContent(allSubjects, activeSem, q);
+  };
+
+  document.getElementById('dash-search').addEventListener('input', function() {
+    renderContent(allSubjects, activeSem, this.value.trim());
+  });
+
+  try {
+    const r = await api('/api/subjects');
+    allSubjects = await r.json();
+    allSubjects.forEach(function(s) { S.titles[s.slug] = s.title; });
+
+    var storedSem = 0;
+    try { storedSem = parseInt(localStorage.getItem('sl-semester') || '0') || 0; } catch(e) {}
+    if (storedSem > 0 && allSubjects.some(function(s) { return s.semester === storedSem; })) {
+      activeSem = storedSem;
+    } else {
+      activeSem = detectSemester(allSubjects);
+      if (activeSem > 0) { try { localStorage.setItem('sl-semester', activeSem); } catch(e) {} }
+    }
+
+    var sems = getSemesters(allSubjects);
+    renderTabs(sems, activeSem);
+    renderContent(allSubjects, activeSem, '');
   } catch(e) { toast('Ошибка загрузки', 'error'); }
+}
+
+function showEditSubject(slug, title, semester, examDate, description) {
+  var semOptions = '<option value="0">— не указан —</option>';
+  for (var si = 1; si <= 12; si++) {
+    semOptions += '<option value="' + si + '"' + (si === semester ? ' selected' : '') + '>' + si + ' семестр</option>';
+  }
+  var ov = document.createElement('div');
+  ov.className = 'modal-overlay';
+  ov.innerHTML =
+    '<div class="glass modal">' +
+    '<div class="modal-title">Изменить предмет</div>' +
+    '<form id="edit-subj-form">' +
+    '<div class="form-group"><label class="form-label">Название</label>' +
+    '<input type="text" id="es-title" value="' + esc(title) + '" required></div>' +
+    '<div class="form-group"><label class="form-label">Семестр</label>' +
+    '<select id="es-semester">' + semOptions + '</select></div>' +
+    '<div class="form-group"><label class="form-label">Дата экзамена</label>' +
+    '<input type="date" id="es-exam-date" value="' + esc(examDate) + '"></div>' +
+    '<div class="form-group"><label class="form-label">Описание</label>' +
+    '<textarea id="es-desc" rows="2">' + esc(description) + '</textarea></div>' +
+    '<div class="flex gap" style="margin-top:4px">' +
+    '<button type="button" class="btn btn-ghost" id="es-cancel">Отмена</button>' +
+    '<button type="submit" class="btn btn-primary">Сохранить</button>' +
+    '</div></form></div>';
+  document.body.appendChild(ov);
+  ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+  document.getElementById('es-cancel').addEventListener('click', function() { ov.remove(); });
+  document.getElementById('edit-subj-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var fd = new FormData();
+    fd.append('title', document.getElementById('es-title').value);
+    fd.append('semester', document.getElementById('es-semester').value);
+    fd.append('exam_date', document.getElementById('es-exam-date').value);
+    fd.append('description', document.getElementById('es-desc').value);
+    var r = await api('/api/subjects/' + slug, {method:'PUT', body:fd});
+    if (r.ok) {
+      toast('Предмет обновлён', 'success');
+      ov.remove();
+      vDashboard(document.getElementById('main'));
+    } else {
+      var err = await r.json();
+      toast(err.detail || 'Ошибка', 'error');
+    }
+  });
+  setTimeout(function() { var t = document.getElementById('es-title'); if(t) t.focus(); }, 50);
 }
 
 function showAddSubject() {
@@ -3116,14 +3345,20 @@ function vNewSubject(main) {
   }
 
   function renderStep1() {
+    var storedSem = 0;
+    try { storedSem = parseInt(localStorage.getItem('sl-semester') || '0') || 0; } catch(e) {}
+    var semOptions = '<option value="0">— не указан —</option>';
+    for (var si = 1; si <= 12; si++) {
+      semOptions += '<option value="' + si + '"' + (si === storedSem ? ' selected' : '') + '>' + si + ' семестр</option>';
+    }
     main.innerHTML = wizHTML(1,
       '<h2 class="section-title" style="font-size:1.375rem;margin-bottom:20px">Новый предмет</h2>' +
       '<div class="form-group"><label class="form-label">Название</label>' +
       '<input type="text" id="wiz-title" placeholder="Микробиология" required></div>' +
-      '<div class="form-group"><label class="form-label" style="color:var(--dim)">Семестр</label>' +
-      '<input type="text" disabled placeholder="Появится в задаче 02" style="opacity:.5;cursor:not-allowed"></div>' +
-      '<div class="form-group"><label class="form-label" style="color:var(--dim)">Дата экзамена</label>' +
-      '<input type="text" disabled placeholder="Появится в задаче 02" style="opacity:.5;cursor:not-allowed"></div>' +
+      '<div class="form-group"><label class="form-label">Семестр</label>' +
+      '<select id="wiz-semester">' + semOptions + '</select></div>' +
+      '<div class="form-group"><label class="form-label">Дата экзамена</label>' +
+      '<input type="date" id="wiz-exam-date"></div>' +
       '<div id="wiz-err" class="form-error hidden"></div>',
       '<span style="flex:1"></span>' +
       '<button class="btn btn-primary" id="wiz-next1">Дальше: материалы</button>'
@@ -3140,6 +3375,8 @@ function vNewSubject(main) {
         errEl.classList.remove('hidden');
         return;
       }
+      var semVal = parseInt(document.getElementById('wiz-semester').value) || 0;
+      var examVal = (document.getElementById('wiz-exam-date').value || '').trim();
       var btn = this;
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Создаю…';
@@ -3147,12 +3384,15 @@ function vNewSubject(main) {
       fd.append('title', title);
       fd.append('description', '');
       fd.append('year', '0');
+      fd.append('semester', semVal);
+      fd.append('exam_date', examVal);
       try {
         var r = await api('/api/subjects', {method:'POST', body:fd});
         if (r.ok) {
           var data = await r.json();
           wizSlug = data.slug;
           S.titles[wizSlug] = title;
+          if (semVal > 0) { try { localStorage.setItem('sl-semester', semVal); } catch(e) {} }
           step = 2;
           renderStep2();
         } else {
