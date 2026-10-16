@@ -453,6 +453,8 @@ import asyncio
 import shutil
 import sys as _sys
 
+_INDEX_SEM = asyncio.Semaphore(2)
+
 _sys.path.insert(0, str(BASE_DIR))
 try:
     from mklib import (
@@ -486,102 +488,179 @@ def subject_dir(slug: str) -> Path:
     return d
 
 
+def _ocr_images_in_text(text: str, src_dir: Path, subject_slug: str, source_slug: str) -> str:
+    """OCR images in markdown text using Vision API. Returns text with alt-text filled in."""
+    if not TIMEWEB_API_KEY:
+        return text
+    import requests as _req
+    img_re = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+    result = text
+    offset = 0
+    for m in img_re.finditer(text):
+        alt = m.group(1)
+        img_path = m.group(2)
+        if alt and len(alt) > 10:
+            continue  # already has alt text
+        full_path = src_dir / img_path
+        if not full_path.exists():
+            continue
+        if full_path.stat().st_size < 500:
+            continue  # skip tiny images (icons, dots)
+        if full_path.stat().st_size > 5 * 1024 * 1024:
+            continue  # skip huge images
+        try:
+            img_b64 = _b64.b64encode(full_path.read_bytes()).decode()
+            ext = full_path.suffix.lower()
+            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "gif": "image/gif", "webp": "image/webp"}.get(ext.lstrip("."), "image/png")
+            resp = _req.post(
+                _cfg("LLM_BASE_URL", "https://api.timeweb.ai/v1") + "/chat/completions",
+                headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+                json={
+                    "model": VISION_MODEL,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text":
+                         "Это изображение из учебника. Если это формула — напиши её в LaTeX (без обрамления $). "
+                         "Если это схема или диаграмма — опиши кратко (1-2 предложения). "
+                         "Если это просто декоративный элемент — ответь: SKIP. "
+                         "Отвечай только текстом, без пояснений."},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}}
+                    ]}],
+                    "max_tokens": 300, "temperature": 0.1
+                },
+                timeout=60
+            )
+            resp.raise_for_status()
+            ocr_text = resp.json()["choices"][0]["message"]["content"].strip()
+            if ocr_text == "SKIP" or len(ocr_text) < 3:
+                continue
+            # Replace the empty alt with OCR text
+            new_ref = f"![{ocr_text}]({img_path})"
+            start = m.start() + offset
+            end = m.end() + offset
+            result = result[:start] + new_ref + result[end:]
+            offset += len(new_ref) - (m.end() - m.start())
+            print(f"  [ocr] {source_slug}/{img_path}: {ocr_text[:60]}...", flush=True)
+        except Exception as e:
+            print(f"  [ocr error] {source_slug}/{img_path}: {e}", flush=True)
+    return result
+
+
 async def _index_source(subject_slug: str, source_slug: str,
                          upload_path: Path, source_title: str):
     """Background: convert → segment → embed → store in sqlite-vec."""
-    db = get_db()
-    try:
-        db.execute("UPDATE sources SET status='indexing:convert' WHERE subject_slug=? AND slug=?",
-                   (subject_slug, source_slug))
-        db.commit()
+    async with _INDEX_SEM:
+        db = get_db()
+        try:
+            db.execute("UPDATE sources SET status='indexing:convert' WHERE subject_slug=? AND slug=?",
+                       (subject_slug, source_slug))
+            db.commit()
 
-        subj_dir = subject_dir(subject_slug)
-        md_dir = subj_dir / "md"
+            subj_dir = subject_dir(subject_slug)
+            md_dir = subj_dir / "md"
 
-        def _update_status(st):
-            sdb = get_db()
-            sdb.execute("UPDATE sources SET status=? WHERE subject_slug=? AND slug=?",
-                        (st, subject_slug, source_slug))
-            sdb.commit()
-            sdb.close()
+            def _update_status(st):
+                sdb = get_db()
+                sdb.execute("UPDATE sources SET status=? WHERE subject_slug=? AND slug=?",
+                            (st, subject_slug, source_slug))
+                sdb.commit()
+                sdb.close()
 
-        def _run():
-            if not MKLIB_OK:
-                raise RuntimeError("mklib недоступен")
-            mk_convert(upload_path, source_slug, md_dir, with_images=True)
-            _update_status('indexing:segment')
-            text = mk_read_text(md_dir, source_slug)
-            if not text:
-                raise RuntimeError("Текст не извлечён")
-            segs = segment_text(text)
-            if not segs:
-                segs = [{"index": 0, "title": source_title,
-                         "start_char": 0, "end_char": len(text),
-                         "words": len(text.split())}]
-            seg_path = subj_dir / "segments.json"
-            all_segs: dict = {}
-            if seg_path.exists():
-                try:
-                    all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
-                except Exception:
-                    all_segs = {}
-            all_segs[source_slug] = {"title": source_title, "segments": segs,
-                                      "words": len(text.split())}
-            seg_path.write_text(json.dumps(all_segs, ensure_ascii=False, indent=1),
-                                encoding="utf-8")
-            db_path = subj_dir / "index.db"
-            vec_db = mk_open_db(db_path)
-            mk_init_db(vec_db, "chunks")
-            vec_db.execute("DELETE FROM chunks WHERE slug=?", (source_slug,))
-            vec_db.commit()
-            records, payloads = [], []
-            header = f"Предмет: {subject_slug}. Источник: «{source_title}»."
-            for seg in segs:
-                for ci, (a, b) in enumerate(chunk_segment(text, seg)):
-                    body = text[a:b].strip()
-                    if len(body.split()) < 10:
-                        continue
-                    full = f"{header} Раздел: «{seg['title']}».\n\n{body}"
-                    cid = "c_" + hashlib.sha1(
-                        f"{subject_slug}|{source_slug}|{a}|{b}".encode()
-                    ).hexdigest()[:16]
-                    records.append({
-                        "chunk_id": cid, "slug": source_slug,
-                        "topic": subject_slug, "priority": 1,
-                        "segment": seg["index"], "title": seg["title"],
-                        "text": full, "meta": {"start_char": a, "end_char": b},
-                    })
-                    payloads.append(full)
-            _update_status(f'indexing:embed 0/{len(records)}')
-            for i in range(0, len(records), 8):
-                _update_status(f'indexing:embed {i}/{len(records)}')
-                vecs = embed_texts(payloads[i:i+8])
-                for r, v in zip(records[i:i+8], vecs):
-                    r["embedding"] = v
-                db_upsert(vec_db, "chunks", records[i:i+8])
-            vec_db.close()
-            return len(records)
+            def _run():
+                if not MKLIB_OK:
+                    raise RuntimeError("mklib недоступен")
+                mk_convert(upload_path, source_slug, md_dir, with_images=True)
+                _update_status('indexing:ocr')
+                text = mk_read_text(md_dir, source_slug)
+                # OCR images: replace ![](media/X) with ![OCR text](media/X)
+                text = _ocr_images_in_text(text, md_dir / source_slug, subject_slug, source_slug)
+                # Re-save markdown with OCR alt-texts
+                book_path = md_dir / source_slug / "book.md"
+                if book_path.exists():
+                    book_path.write_text(text, encoding="utf-8")
+                _update_status('indexing:segment')
+                if not text:
+                    raise RuntimeError("Текст не извлечён")
+                segs = segment_text(text)
+                if not segs:
+                    segs = [{"index": 0, "title": source_title,
+                             "start_char": 0, "end_char": len(text),
+                             "words": len(text.split())}]
+                seg_path = subj_dir / "segments.json"
+                all_segs: dict = {}
+                if seg_path.exists():
+                    try:
+                        all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        all_segs = {}
+                # Map images to segments by position in text
+                img_re = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+                seg_images: dict[int, list[str]] = {}
+                for m in img_re.finditer(text):
+                    img_pos = m.start()
+                    img_path = m.group(2)
+                    for seg in segs:
+                        if seg["start_char"] <= img_pos < seg["end_char"]:
+                            seg_images.setdefault(seg["index"], []).append(img_path)
+                            break
+                all_segs[source_slug] = {"title": source_title, "segments": segs,
+                                          "words": len(text.split()),
+                                          "images": seg_images}
+                seg_path.write_text(json.dumps(all_segs, ensure_ascii=False, indent=1),
+                                    encoding="utf-8")
+                db_path = subj_dir / "index.db"
+                vec_db = mk_open_db(db_path)
+                mk_init_db(vec_db, "chunks")
+                vec_db.execute("DELETE FROM chunks WHERE slug=?", (source_slug,))
+                vec_db.commit()
+                records, payloads = [], []
+                header = f"Предмет: {subject_slug}. Источник: «{source_title}»."
+                for seg in segs:
+                    for ci, (a, b) in enumerate(chunk_segment(text, seg)):
+                        body = text[a:b].strip()
+                        if len(body.split()) < 10:
+                            continue
+                        full = f"{header} Раздел: «{seg['title']}».\n\n{body}"
+                        cid = "c_" + hashlib.sha1(
+                            f"{subject_slug}|{source_slug}|{a}|{b}".encode()
+                        ).hexdigest()[:16]
+                        records.append({
+                            "chunk_id": cid, "slug": source_slug,
+                            "topic": subject_slug, "priority": 1,
+                            "segment": seg["index"], "title": seg["title"],
+                            "text": full, "meta": {"start_char": a, "end_char": b},
+                        })
+                        payloads.append(full)
+                _update_status(f'indexing:embed 0/{len(records)}')
+                for i in range(0, len(records), 8):
+                    _update_status(f'indexing:embed {i}/{len(records)}')
+                    vecs = embed_texts(payloads[i:i+8])
+                    for r, v in zip(records[i:i+8], vecs):
+                        r["embedding"] = v
+                    db_upsert(vec_db, "chunks", records[i:i+8])
+                vec_db.close()
+                return len(records)
 
-        n = await asyncio.to_thread(_run)
-        db.execute(
-            "UPDATE sources SET status='indexed', chunk_count=? WHERE subject_slug=? AND slug=?",
-            (n, subject_slug, source_slug)
-        )
-    except Exception as e:
-        db.execute(
-            "UPDATE sources SET status='error' WHERE subject_slug=? AND slug=?",
-            (subject_slug, source_slug)
-        )
-        print(f"[index error] {subject_slug}/{source_slug}: {e}", flush=True)
-    finally:
-        db.commit()
-        db.close()
+            n = await asyncio.to_thread(_run)
+            db.execute(
+                "UPDATE sources SET status='active', chunk_count=? WHERE subject_slug=? AND slug=?",
+                (n, subject_slug, source_slug)
+            )
+        except Exception as e:
+            db.execute(
+                "UPDATE sources SET status='error' WHERE subject_slug=? AND slug=?",
+                (subject_slug, source_slug)
+            )
+            print(f"[index error] {subject_slug}/{source_slug}: {e}", flush=True)
+        finally:
+            db.commit()
+            db.close()
 
 
 @app.post("/api/subjects")
 async def create_subject(title: str = Form(), description: str = Form(default=""),
                           year: int = Form(default=0),
-                          user: dict = Depends(admin_user)):
+                          user: dict = Depends(current_user)):
     slug = _slug(title)
     if not slug:
         raise HTTPException(400, "Некорректное название")
@@ -669,6 +748,9 @@ async def upload_source(slug: str, file: UploadFile = File(),
     finally:
         db.close()
 
+    # Auto-start indexing in background (goes through semaphore queue)
+    asyncio.create_task(_index_source(slug, src_slug, upload_path, src_title))
+
     return {"ok": True, "slug": src_slug, "title": src_title, "status": "uploaded"}
 
 
@@ -679,11 +761,17 @@ async def list_sources(slug: str, user: dict = Depends(current_user)):
         "SELECT * FROM sources WHERE subject_slug=? ORDER BY created_at DESC", (slug,)
     ).fetchall()
     db.close()
-    return [dict(r) for r in rows]
+    result = []
+    for r in rows:
+        d = dict(r)
+        upload_path = subject_dir(slug) / "uploads" / r["filename"]
+        d["file_size"] = upload_path.stat().st_size if upload_path.exists() else 0
+        result.append(d)
+    return result
 
 
 @app.post("/api/subjects/{slug}/sources/{src_slug}/index")
-async def index_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def index_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Запустить индексацию (конвертация + сегментация + эмбеддинги)."""
     db = get_db()
     row = db.execute(
@@ -703,7 +791,7 @@ async def index_source(slug: str, src_slug: str, user: dict = Depends(admin_user
 
 @app.put("/api/subjects/{slug}/sources/{src_slug}/rename")
 async def rename_source(slug: str, src_slug: str, title: str = Form(),
-                         user: dict = Depends(admin_user)):
+                         user: dict = Depends(current_user)):
     db = get_db()
     db.execute("UPDATE sources SET title=? WHERE subject_slug=? AND slug=?",
                (title.strip(), slug, src_slug))
@@ -713,7 +801,7 @@ async def rename_source(slug: str, src_slug: str, title: str = Form(),
 
 
 @app.post("/api/subjects/{slug}/sources/{src_slug}/activate")
-async def activate_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def activate_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Включить источник в библиотеку (поиск и RAG)."""
     db = get_db()
     row = db.execute(
@@ -733,7 +821,7 @@ async def activate_source(slug: str, src_slug: str, user: dict = Depends(admin_u
 
 
 @app.post("/api/subjects/{slug}/sources/{src_slug}/deactivate")
-async def deactivate_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def deactivate_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Отключить источник от библиотеки (индекс сохраняется)."""
     db = get_db()
     row = db.execute(
@@ -753,7 +841,7 @@ async def deactivate_source(slug: str, src_slug: str, user: dict = Depends(admin
 
 
 @app.delete("/api/subjects/{slug}/sources/{src_slug}")
-async def delete_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+async def delete_source(slug: str, src_slug: str, user: dict = Depends(current_user)):
     """Полное удаление: файл, markdown, чанки из индекса."""
     db = get_db()
     row = db.execute(
@@ -904,6 +992,38 @@ SYSTEM_BIO = (
 )
 
 
+def _collect_images(chunks: list[dict]) -> list[dict]:
+    """Find images from segments used by RAG chunks."""
+    images = []
+    seen = set()
+    for chunk in chunks:
+        subj = chunk.get("_subject") or chunk.get("topic", "")
+        src_slug = chunk.get("slug", "")
+        seg_idx = chunk.get("segment", 0)
+        seg_path = subject_dir(subj) / "segments.json" if subj else None
+        if not seg_path or not seg_path.exists():
+            continue
+        try:
+            all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+            src_data = all_segs.get(src_slug, {})
+            seg_images = src_data.get("images", {})
+            for img_path in seg_images.get(str(seg_idx), []):
+                full_path = subject_dir(subj) / "md" / src_slug / img_path
+                if full_path.exists():
+                    url = f"/api/subjects/{subj}/media/{src_slug}/{img_path}"
+                    key = f"{subj}/{src_slug}/{img_path}"
+                    if key not in seen:
+                        seen.add(key)
+                        images.append({
+                            "url": url,
+                            "source": src_data.get("title", src_slug),
+                            "segment": chunk.get("title", ""),
+                        })
+        except Exception:
+            pass
+    return images
+
+
 async def _rag_context(subject_slug: str, question: str, k: int = 8) -> list[dict]:
     """Retrieve top-k relevant chunks from active sources across ALL subjects."""
     if not MKLIB_OK:
@@ -1031,6 +1151,7 @@ async def chat_stream(slug: str, q: str, conversation_id: int = 0,
     history = list(reversed(history))
 
     context_chunks = await _rag_context(slug, q)
+    rag_images = _collect_images(context_chunks)
 
     async def generate():
         full_answer = []
@@ -1084,7 +1205,7 @@ async def chat_stream(slug: str, q: str, conversation_id: int = 0,
                 )
                 save_db.commit()
                 save_db.close()
-            yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'images': rag_images})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream",
@@ -1201,6 +1322,7 @@ async def generate_ticket_answer(slug: str, tid: int,
 
     question = row["question"]
     context_chunks = await _rag_context(slug, question, k=10)
+    ticket_images = _collect_images(context_chunks)
 
     system_prompt = (
         "Ты — преподаватель университетского курса, готовишь студенту развёрнутый ответ на экзаменационный билет.\n\n"
@@ -1261,6 +1383,12 @@ async def generate_ticket_answer(slug: str, tid: int,
         finally:
             answer_text = "".join(full_answer)
             if answer_text:
+                # Append source images as markdown
+                if ticket_images:
+                    img_md = "\n\n---\n\n**Иллюстрации из источников:**\n\n"
+                    for img in ticket_images:
+                        img_md += f"![{img['segment']}]({img['url']})\n*{img['source']} · {img['segment']}*\n\n"
+                    answer_text += img_md
                 save_db = get_db()
                 save_db.execute(
                     "UPDATE exam_tickets SET answer=?, status='generated', generated_at=? WHERE id=?",
@@ -1288,6 +1416,18 @@ def _md_to_html(text: str) -> str:
         return f"\x00F{len(_formulas)-1}\x00"
     text = re.sub(r"\$\$[^$]+\$\$", _save_formula, text)
     text = re.sub(r"\$[^$\n]+\$", _save_formula, text)
+    # Protect images from line-by-line parsing
+    _images: list[str] = []
+    def _save_img(m):
+        alt = m.group(1)
+        url = m.group(2)
+        if alt and len(alt) > 5:
+            html = f'<figure style="margin:12px 0"><img src="{_html.escape(url)}" alt="{_html.escape(alt)}" style="max-width:100%;border-radius:8px" loading="lazy"><figcaption style="font-size:.78rem;color:#8888a0;margin-top:4px">{_html.escape(alt)}</figcaption></figure>'
+        else:
+            html = f'<img src="{_html.escape(url)}" alt="{_html.escape(alt)}" style="max-width:100%;border-radius:8px;margin:8px 0" loading="lazy">'
+        _images.append(html)
+        return f"\x00I{len(_images)-1}\x00"
+    text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", _save_img, text)
     lines = text.split("\n")
     out = []
     in_table = False
@@ -1371,6 +1511,8 @@ def _md_to_html(text: str) -> str:
             return f'<div style="text-align:center;margin:.8em 0">{f}</div>'
         return f
     result = re.sub(r"\x00F(\d+)\x00", _restore, result)
+    # Restore images
+    result = re.sub(r"\x00I(\d+)\x00", lambda m: _images[int(m.group(1))], result)
     return result
 
 
@@ -1947,6 +2089,11 @@ async function api(path, opts) {
 }
 
 // ── HTML escape ────────────────────────────────────────────────────────
+function fmtSize(b) {
+  if (b < 1024) return b + ' Б';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' КБ';
+  return (b / 1048576).toFixed(1) + ' МБ';
+}
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -2018,6 +2165,14 @@ function md(text) {
   h = h.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
   h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Markdown images: ![alt](url) — show alt as caption if present
+  h = h.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(_, alt, url) {
+    var img = '<img src="' + url + '" alt="' + alt + '" title="' + alt + '" style="max-width:100%;border-radius:8px;margin:8px 0" loading="lazy">';
+    if (alt && alt.length > 5) {
+      return '<figure style="margin:12px 0">' + img + '<figcaption style="font-size:.78rem;color:var(--muted);margin-top:4px">' + alt + '</figcaption></figure>';
+    }
+    return img;
+  });
   // Provenance links: [src:SLUG#SEG | раздел: Title] → clickable link to reader
   h = h.replace(/\[src:([a-z0-9а-яё\-]+)#(\d+)\s*\|\s*([^\]]+)\]/gi, function(_, srcSlug, seg, rest) {
     var subjectSlug = (location.hash.match(/\/(chat|tickets|subject|reader)\/([^/]+)/) || [])[2] || '';
@@ -2077,7 +2232,7 @@ function route() {
   if (!S.user && view !== 'login') { location.hash = '#/login'; return; }
   if (S.user && view === 'login') { location.hash = '#/dashboard'; return; }
   const views = { login: vLogin, dashboard: vDashboard, subject: vSubject,
-                  reader: vReader, chat: vChat, tickets: vTickets };
+                  reader: vReader, chat: vChat, tickets: vTickets, new: vNewSubject };
   const fn = views[view];
   if (fn) fn(main, slug); else location.hash = '#/dashboard';
 }
@@ -2290,26 +2445,24 @@ function vLogin(main) {
 
 // ── Dashboard ──────────────────────────────────────────────────────────
 async function vDashboard(main) {
-  const isAdmin = S.user && S.user.role === 'admin';
   main.innerHTML =
     '<div class="page">' +
     '<div class="section-header">' +
-    '<h1 class="section-title">Мои предметы</h1>' +
-    (isAdmin ? '<button class="btn btn-primary btn-sm" id="btn-add-subj">+ Добавить предмет</button>' : '') +
+    '<h1 class="section-title">Предметы</h1>' +
+    '<button class="btn btn-primary btn-sm" id="btn-add-subj">+ Новый предмет</button>' +
     '</div>' +
     '<div id="subj-grid" class="card-grid"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
     '</div>';
-  if (isAdmin) {
-    document.getElementById('btn-add-subj').addEventListener('click', showAddSubject);
-  }
+  document.getElementById('btn-add-subj').addEventListener('click', function() {
+    location.hash = '#/new';
+  });
   try {
     const r = await api('/api/subjects');
     const list = await r.json();
     const grid = document.getElementById('subj-grid');
     if (!grid) return;
     if (!list.length) {
-      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">' + ic(IC.flask, 40) + '<b>Предметов пока нет</b><span>' +
-        (isAdmin ? 'Нажмите «+ Добавить предмет», чтобы создать первый.' : 'Администратор ещё не создал ни одного предмета.') + '</span></div>';
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1">' + ic(IC.flask, 40) + '<b>Предметов пока нет</b><span>Нажмите «+ Новый предмет», чтобы начать.</span></div>';
       return;
     }
     list.forEach(function(s) { S.titles[s.slug] = s.title; });
@@ -2443,33 +2596,29 @@ async function loadSources(slug) {
   try {
     const r = await api('/api/subjects/' + slug + '/sources');
     const srcs = await r.json();
-    const isAdmin = S.user && S.user.role === 'admin';
     let html = '';
-    if (isAdmin) {
-      html += '<div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Загрузить файлы">' +
-        '<div class="drop-zone-icon">' + ic(IC.upload, 28) + '</div>' +
-        '<div><strong>Перетащите файлы сюда</strong> или нажмите для выбора</div>' +
-        '<div class="drop-zone-sub">PDF, DOCX, TXT, MD — до 50 МБ</div>' +
-        '<input type="file" id="file-input" style="display:none" accept=".pdf,.docx,.doc,.txt,.md" multiple>' +
-        '</div>';
-    }
+    html += '<div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Загрузить файлы">' +
+      '<div class="drop-zone-icon">' + ic(IC.upload, 28) + '</div>' +
+      '<div><strong>Перетащите файлы сюда</strong> или нажмите для выбора</div>' +
+      '<div class="drop-zone-sub">PDF, DOCX, TXT, MD · можно сразу много</div>' +
+      '<input type="file" id="file-input" style="display:none" accept=".pdf,.docx,.doc,.txt,.md" multiple>' +
+      '</div>';
     html += '<div class="source-list mt" id="src-list">';
     if (!srcs.length) {
-      html += '<div class="empty">' + ic(IC.doc, 36) + '<b>Источников пока нет</b><span>' +
-        (isAdmin ? 'Загрузите файлы выше.' : 'Администратор ещё не добавил материалы.') + '</span></div>';
+      html += '<div class="empty">' + ic(IC.doc, 36) + '<b>Источников пока нет</b><span>Загрузите файлы выше.</span></div>';
     } else {
-      html += srcs.map(function(s) { return renderSrc(s, slug, isAdmin); }).join('');
+      html += srcs.map(function(s) { return renderSrc(s, slug); }).join('');
     }
     html += '</div>';
     el.innerHTML = html;
-    if (isAdmin) setupDrop(slug);
-    if (srcs.some(function(s) { return s.status.startsWith('indexing'); })) {
+    setupDrop(slug);
+    if (srcs.some(function(s) { return s.status.startsWith('indexing') || s.status === 'uploaded'; })) {
       setTimeout(function() { loadSources(slug); }, 3000);
     }
-  } catch(e) { el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>'; }
+  } catch(e) { console.error('loadSources error:', e); el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки: ' + esc(e.message || e) + '</p>'; }
 }
 
-function renderSrc(s, slug, isAdmin) {
+function renderSrc(s, slug) {
   const ext = (s.original_name || '').split('.').pop().toLowerCase();
   const st = s.status;
   const P = '\'' + slug + '\',\'' + s.slug + '\'';
@@ -2477,7 +2626,6 @@ function renderSrc(s, slug, isAdmin) {
   if (st.startsWith('indexing:')) {
     var parts = st.split(':')[1].split(' ');
     var phase = parts[0];
-    var phaseLabel = {convert:'конвертация',segment:'сегментация',embed:'эмбеддинг'}[phase] || phase;
     if (phase === 'embed' && parts[1]) {
       var nums = parts[1].split('/');
       var done = parseInt(nums[0]) || 0;
@@ -2485,43 +2633,41 @@ function renderSrc(s, slug, isAdmin) {
       var pct = Math.round(done / total * 100);
       statusBadge = '<span class="badge badge-yellow" style="min-width:150px"><span class="spinner" style="width:10px;height:10px"></span>' +
         '<span style="flex:1"><span class="progress" style="display:block;margin:0"><span class="progress-bar" style="display:block;width:' + pct + '%;background:var(--yellow)"></span></span></span>' +
-        '<span style="font-size:.75rem">' + done + '/' + total + '</span></span>';
+        '<span style="font-size:.75rem">Читаю… ' + pct + '%</span></span>';
     } else {
-      statusBadge = '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> ' + phaseLabel + '</span>';
+      statusBadge = '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> Читаю…</span>';
     }
+  } else if (st === 'error') {
+    statusBadge = '<span class="badge badge-red badge-dot">Не удалось прочитать</span>';
   } else {
     statusBadge = {
-      uploaded: '<span class="badge badge-blue badge-dot">загружен</span>',
-      indexing: '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> индексация</span>',
-      indexed: '<span class="badge badge-blue badge-dot">проиндексирован</span>',
-      active: '<span class="badge badge-green badge-dot">активен</span>',
-      inactive: '<span class="badge badge-dim badge-dot">отключён</span>',
-      error: '<span class="badge badge-red badge-dot">ошибка</span>'
+      uploaded: '<span class="badge badge-blue badge-dot">Загружен</span>',
+      indexing: '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> Читаю…</span>',
+      indexed: '<span class="badge badge-green badge-dot">Прочитан</span>',
+      active: '<span class="badge badge-green badge-dot">Прочитан</span>',
+      inactive: '<span class="badge badge-dim badge-dot">Отключён</span>'
     }[st] || '<span class="badge badge-blue">' + esc(st) + '</span>';
   }
   var primary = '', toggle = '', items = '';
   var canRead = (st === 'active' || st === 'indexed' || st === 'inactive');
-  if (isAdmin) {
-    if (st === 'uploaded' || st === 'error') {
-      primary = '<button class="btn btn-primary btn-sm" type="button" onclick="srcAction(' + P + ',\'index\')">Индексировать</button>';
-    }
-    if (canRead) {
-      var on = st === 'active';
-      toggle = '<button class="sw" type="button" role="switch" aria-checked="' + on + '" aria-label="Использовать источник в ответах" onclick="srcAction(' + P + ',\'' + (on ? 'deactivate' : 'activate') + '\')"><span class="knob"></span><span>' + (on ? 'Включён' : 'Выключен') + '</span></button>';
-      items += '<button type="button" role="menuitem" onclick="closeMenus(null);srcAction(' + P + ',\'index\')">Индексировать заново</button>';
-    }
-    items += '<button type="button" role="menuitem" onclick="closeMenus(null);renameSrc(' + P + ',\'' + esc(s.title).replace(/'/g,'\\&#39;') + '\')">Переименовать</button>';
-    items += '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delSrc(' + P + ')">Удалить</button>';
+  if (st === 'error') {
+    primary = '<button class="btn btn-primary btn-sm" type="button" onclick="srcAction(' + P + ',\'index\')">Попробовать снова</button>';
   }
+  if (canRead) {
+    var on = st === 'active';
+    toggle = '<button class="sw" type="button" role="switch" aria-checked="' + on + '" aria-label="Использовать источник в ответах" onclick="srcAction(' + P + ',\'' + (on ? 'deactivate' : 'activate') + '\')"><span class="knob"></span><span>' + (on ? 'Включён' : 'Выключен') + '</span></button>';
+    items += '<button type="button" role="menuitem" onclick="closeMenus(null);srcAction(' + P + ',\'index\')">Прочитать заново</button>';
+  }
+  items += '<button type="button" role="menuitem" onclick="closeMenus(null);renameSrc(' + P + ',\'' + esc(s.title).replace(/'/g,'\\&#39;') + '\')">Переименовать</button>';
+  items += '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delSrc(' + P + ')">Удалить</button>';
   var readerLink = canRead ? '<a href="#/reader/' + slug + '" class="btn btn-ghost btn-sm">Читать</a>' : '';
-  var kebab = isAdmin ?
-    '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с источником" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
-    '<div class="menu hidden" role="menu">' + items + '</div></div>' : '';
+  var kebab = '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с источником" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
+    '<div class="menu hidden" role="menu">' + items + '</div></div>';
   return '<div class="glass source-item" id="si-' + s.slug + '">' +
     '<div class="source-icon">' + esc((ext || 'file').slice(0, 4).toUpperCase()) + '</div>' +
     '<div class="source-info">' +
     '<div class="source-name">' + esc(s.title) + '</div>' +
-    '<div class="source-meta">' + esc(s.original_name) + (s.chunk_count ? ' · ' + s.chunk_count + ' чанков' : '') + '</div>' +
+    '<div class="source-meta">' + esc(s.original_name) + ' · ' + fmtSize(s.file_size || 0) + (s.chunk_count ? ' · ' + s.chunk_count + ' чанков' : '') + '</div>' +
     '</div>' +
     statusBadge +
     '<div class="source-actions">' + primary + toggle + readerLink + kebab + '</div>' +
@@ -2614,8 +2760,16 @@ async function vReader(main, slug) {
     '<div class="toc-group-label">Содержание</div>' +
     '<div id="toc"></div>' +
     '</div></div>' +
-    '<div id="rcontent" class="reader-content"><p class="text-muted">Выберите раздел слева.</p></div>' +
-    '</div>';
+    '<div style="flex:1;display:flex;flex-direction:column">' +
+    '<div id="reader-status" style="display:none;padding:8px 24px;border-bottom:1px solid var(--border);font-size:.8125rem;color:var(--muted);background:var(--glass);align-items:center;gap:12px;flex-wrap:wrap">' +
+    '<span id="rs-doc" style="font-weight:500;color:var(--text)"></span>' +
+    '<span id="rs-meta"></span>' +
+    '<span style="flex:1"></span>' +
+    '<span id="rs-pos"></span>' +
+    '<input type="range" id="rs-slider" min="0" max="0" value="0" style="width:120px;accent-color:var(--accent)">' +
+    '</div>' +
+    '<div id="rcontent" class="reader-content" style="flex:1;overflow-y:auto"><p class="text-muted">Выберите раздел слева.</p></div>' +
+    '</div></div>';
   try {
     const r = await api('/api/subjects/' + slug + '/segments');
     const segs = await r.json();
@@ -2636,6 +2790,18 @@ async function vReader(main, slug) {
       });
     }
     toc.innerHTML = html;
+    // Store segments data for slider
+    S._readerSegs = segs;
+    S._readerSlug = slug;
+    // Slider navigation
+    var slider = document.getElementById('rs-slider');
+    if (slider) {
+      slider.addEventListener('input', function() {
+        var idx = parseInt(this.value);
+        var items = document.querySelectorAll('.toc-item');
+        if (items[idx]) items[idx].click();
+      });
+    }
     // Auto-open segment from query params: ?src=SLUG&seg=N
     var qm = location.hash.indexOf('?');
     if (qm > -1) {
@@ -2667,6 +2833,23 @@ async function loadSeg(slug, srcSlug, segId, tocEl) {
       '<p class="text-muted text-sm" style="margin-bottom:20px">' + esc(seg.source_title) + ' · ' + seg.words + ' слов</p>' +
       '<div style="white-space:pre-wrap">' + esc(seg.text) + '</div>';
     renderMath(content);
+    // Update status bar
+    var statusBar = document.getElementById('reader-status');
+    if (statusBar && S._readerSegs) {
+      statusBar.style.display = 'flex';
+      var srcData = S._readerSegs[srcSlug] || {};
+      var totalSegs = (srcData.segments || []).length;
+      var totalWords = srcData.words || 0;
+      document.getElementById('rs-doc').textContent = seg.source_title || srcSlug;
+      var ext = (function() { try { var ss = document.querySelector('[data-src="' + srcSlug + '"]'); return ss ? '' : ''; } catch(e) { return ''; } })();
+      document.getElementById('rs-meta').textContent = totalWords + ' слов · ' + totalSegs + ' разделов';
+      document.getElementById('rs-pos').textContent = (segId + 1) + ' / ' + totalSegs;
+      var slider = document.getElementById('rs-slider');
+      var allItems = document.querySelectorAll('.toc-item');
+      var currentIdx = Array.from(allItems).indexOf(tocEl);
+      slider.max = allItems.length - 1;
+      slider.value = currentIdx;
+    }
   } catch(e) {
     content.innerHTML = '<p style="color:var(--red)">Ошибка загрузки сегмента</p>';
   }
@@ -2785,6 +2968,18 @@ async function vChat(main, slug) {
       if (ev.data === '[DONE]') {
         es.close(); S.chatES = null;
         bubble.innerHTML = md(full);
+        if (S._ragImages && S._ragImages.length) {
+          var imgHtml = '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px">' +
+            '<div style="font-size:.75rem;color:var(--muted);margin-bottom:8px">Иллюстрации из источников:</div>' +
+            '<div style="display:flex;flex-wrap:wrap;gap:8px">';
+          S._ragImages.forEach(function(img) {
+            imgHtml += '<div style="max-width:280px"><img src="' + img.url + '" style="width:100%;border-radius:8px;border:1px solid var(--border)" loading="lazy">' +
+              '<div style="font-size:.7rem;color:var(--muted);margin-top:4px">' + esc(img.source) + ' &middot; ' + esc(img.segment) + '</div></div>';
+          });
+          imgHtml += '</div></div>';
+          bubble.innerHTML += imgHtml;
+          S._ragImages = null;
+        }
         renderMath(bubble);
         msgsDiv.scrollTop = msgsDiv.scrollHeight;
         loadConvList(slug);
@@ -2794,6 +2989,7 @@ async function vChat(main, slug) {
         var d = JSON.parse(ev.data);
         if (d.error) { bubble.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; es.close(); return; }
         if (d.conversation_id) { S.chatConvId = d.conversation_id; }
+        if (d.images && d.images.length) { S._ragImages = d.images; }
         if (d.content) {
           full += d.content;
           bubble.innerHTML = md(full) + '<span class="spinner" style="width:10px;height:10px;margin-left:4px"></span>';
@@ -3052,6 +3248,207 @@ async function delTicket(slug, tid) {
   const r = await api('/api/subjects/' + slug + '/tickets/' + tid, {method:'DELETE'});
   if (r.ok) { toast('Билет удалён', 'success'); loadTickets(slug); }
   else toast('Ошибка удаления', 'error');
+}
+
+// ── New Subject Wizard ─────────────────────────────────────────────────
+function vNewSubject(main) {
+  var wizSlug = null;
+  var step = 1;
+
+  function wizHTML(stepN, body, btns) {
+    var pct = Math.round(stepN / 3 * 100);
+    return '<div class="page" style="max-width:680px;margin:0 auto">' +
+      '<div style="margin-bottom:24px">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">' +
+      '<span class="text-muted text-sm">Шаг ' + stepN + ' из 3</span>' +
+      '<a href="#/dashboard" class="btn btn-ghost btn-sm" style="min-height:36px;padding:0 12px">Отмена</a>' +
+      '</div>' +
+      '<div class="progress"><div class="progress-bar" style="width:' + pct + '%"></div></div>' +
+      '</div>' +
+      '<div class="glass" style="padding:28px 32px">' +
+      body +
+      '<div class="flex gap" style="margin-top:24px;flex-wrap:wrap">' + btns + '</div>' +
+      '</div></div>';
+  }
+
+  function renderStep1() {
+    main.innerHTML = wizHTML(1,
+      '<h2 class="section-title" style="font-size:1.375rem;margin-bottom:20px">Новый предмет</h2>' +
+      '<div class="form-group"><label class="form-label">Название</label>' +
+      '<input type="text" id="wiz-title" placeholder="Микробиология" required></div>' +
+      '<div class="form-group"><label class="form-label" style="color:var(--dim)">Семестр</label>' +
+      '<input type="text" disabled placeholder="Появится в задаче 02" style="opacity:.5;cursor:not-allowed"></div>' +
+      '<div class="form-group"><label class="form-label" style="color:var(--dim)">Дата экзамена</label>' +
+      '<input type="text" disabled placeholder="Появится в задаче 02" style="opacity:.5;cursor:not-allowed"></div>' +
+      '<div id="wiz-err" class="form-error hidden"></div>',
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-primary" id="wiz-next1">Дальше: материалы</button>'
+    );
+    setTimeout(function() {
+      var inp = document.getElementById('wiz-title');
+      if (inp) inp.focus();
+    }, 50);
+    document.getElementById('wiz-next1').addEventListener('click', async function() {
+      var title = (document.getElementById('wiz-title').value || '').trim();
+      if (!title) {
+        var errEl = document.getElementById('wiz-err');
+        errEl.textContent = 'Введите название предмета';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      var btn = this;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Создаю…';
+      var fd = new FormData();
+      fd.append('title', title);
+      fd.append('description', '');
+      fd.append('year', '0');
+      try {
+        var r = await api('/api/subjects', {method:'POST', body:fd});
+        if (r.ok) {
+          var data = await r.json();
+          wizSlug = data.slug;
+          S.titles[wizSlug] = title;
+          step = 2;
+          renderStep2();
+        } else {
+          var err = await r.json();
+          var errEl = document.getElementById('wiz-err');
+          errEl.textContent = err.detail || 'Ошибка создания предмета';
+          errEl.classList.remove('hidden');
+          btn.disabled = false;
+          btn.textContent = 'Дальше: материалы';
+        }
+      } catch(e) {
+        var errEl2 = document.getElementById('wiz-err');
+        errEl2.textContent = 'Ошибка сети';
+        errEl2.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Дальше: материалы';
+      }
+    });
+  }
+
+  function renderStep2() {
+    main.innerHTML = wizHTML(2,
+      '<h2 class="section-title" style="font-size:1.375rem;margin-bottom:20px">Материалы</h2>' +
+      '<div class="drop-zone" id="wiz-drop" role="button" tabindex="0" aria-label="Загрузить файлы">' +
+      '<div class="drop-zone-icon">' + ic(IC.upload, 28) + '</div>' +
+      '<div><strong>Перетащите файлы сюда</strong> или нажмите для выбора</div>' +
+      '<div class="drop-zone-sub">PDF, DOCX, TXT, MD · можно сразу много</div>' +
+      '<input type="file" id="wiz-file" style="display:none" accept=".pdf,.docx,.doc,.txt,.md" multiple>' +
+      '</div>' +
+      '<div class="source-list mt" id="wiz-src-list"></div>',
+      '<button class="btn btn-ghost" id="wiz-back2">Назад</button>' +
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-ghost btn-sm" id="wiz-skip2">Пропустить</button>' +
+      '<button class="btn btn-primary" id="wiz-next2" disabled>Дальше: список билетов</button>'
+    );
+    var uploadedCount = 0;
+
+    function checkNext() {
+      var btn = document.getElementById('wiz-next2');
+      if (btn) btn.disabled = uploadedCount < 1;
+    }
+
+    function addSrcRow(file, status, slug) {
+      var list = document.getElementById('wiz-src-list');
+      if (!list) return;
+      var id = 'wiz-si-' + (slug || file.name.replace(/[^a-z0-9]/gi, '-'));
+      var existing = document.getElementById(id);
+      var badge = status === 'uploading'
+        ? '<span class="badge badge-blue"><span class="spinner" style="width:10px;height:10px"></span> Загружается…</span>'
+        : '<span class="badge badge-blue badge-dot">Загружен</span>';
+      var html = '<div class="glass source-item" id="' + id + '">' +
+        '<div class="source-icon">' + esc((file.name.split('.').pop() || 'file').slice(0,4).toUpperCase()) + '</div>' +
+        '<div class="source-info"><div class="source-name">' + esc(file.name) + '</div>' +
+        '<div class="source-meta">' + fmtSize(file.size) + '</div></div>' +
+        badge + '</div>';
+      if (existing) { existing.outerHTML = html; }
+      else { list.insertAdjacentHTML('beforeend', html); }
+    }
+
+    async function wizUpload(files) {
+      for (var i = 0; i < files.length; i++) {
+        var file = files[i];
+        addSrcRow(file, 'uploading', null);
+        var fd = new FormData();
+        fd.append('file', file);
+        fd.append('title', file.name.replace(/\.[^.]+$/, ''));
+        try {
+          var r = await api('/api/subjects/' + wizSlug + '/upload', {method:'POST', body:fd});
+          if (r.ok) {
+            var data = await r.json();
+            addSrcRow(file, 'uploaded', data.slug);
+            uploadedCount++;
+            checkNext();
+          } else {
+            toast(file.name + ': ошибка загрузки', 'error');
+          }
+        } catch(e) { toast(file.name + ': ошибка сети', 'error'); }
+      }
+    }
+
+    var zone = document.getElementById('wiz-drop');
+    var inp = document.getElementById('wiz-file');
+    zone.addEventListener('click', function(e) { if (e.target !== inp) inp.click(); });
+    zone.addEventListener('keydown', function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inp.click(); } });
+    zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.classList.add('drag-over'); });
+    zone.addEventListener('dragleave', function() { zone.classList.remove('drag-over'); });
+    zone.addEventListener('drop', function(e) { e.preventDefault(); zone.classList.remove('drag-over'); wizUpload(e.dataTransfer.files); });
+    inp.addEventListener('change', function() { wizUpload(inp.files); });
+
+    document.getElementById('wiz-back2').addEventListener('click', function() {
+      step = 1; renderStep1();
+    });
+    document.getElementById('wiz-skip2').addEventListener('click', function() {
+      step = 3; renderStep3();
+    });
+    document.getElementById('wiz-next2').addEventListener('click', function() {
+      step = 3; renderStep3();
+    });
+  }
+
+  function renderStep3() {
+    main.innerHTML = wizHTML(3,
+      '<h2 class="section-title" style="font-size:1.375rem;margin-bottom:8px">Список билетов</h2>' +
+      '<p class="text-muted text-sm" style="margin-bottom:16px">Один вопрос на строку. Нумерация удаляется автоматически. Можно пропустить и вернуться позже.</p>' +
+      '<textarea id="wiz-tickets" rows="10" placeholder="1. Первый вопрос&#10;2. Второй вопрос&#10;3. Третий вопрос" style="font-size:.9375rem"></textarea>' +
+      '<div id="wiz-t-err" class="form-error hidden"></div>',
+      '<button class="btn btn-ghost" id="wiz-back3">Назад</button>' +
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-ghost btn-sm" id="wiz-skip3">Пропустить</button>' +
+      '<button class="btn btn-primary" id="wiz-save3">Сохранить</button>'
+    );
+    document.getElementById('wiz-back3').addEventListener('click', function() {
+      step = 2; renderStep2();
+    });
+    document.getElementById('wiz-skip3').addEventListener('click', function() {
+      location.hash = '#/subject/' + wizSlug;
+    });
+    document.getElementById('wiz-save3').addEventListener('click', async function() {
+      var text = (document.getElementById('wiz-tickets').value || '').trim();
+      if (!text) { location.hash = '#/subject/' + wizSlug; return; }
+      var btn = this;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Сохраняю…';
+      var fd = new FormData();
+      fd.append('questions', text);
+      try {
+        var r = await api('/api/subjects/' + wizSlug + '/tickets/batch', {method:'POST', body:fd});
+        if (r.ok) {
+          var data = await r.json();
+          toast(data.count + ' ' + plural(data.count, ['вопрос', 'вопроса', 'вопросов']) + ' сохранено', 'success');
+        } else {
+          var err = await r.json();
+          toast(err.detail || 'Ошибка сохранения', 'error');
+        }
+      } catch(e) { toast('Ошибка сети', 'error'); }
+      location.hash = '#/subject/' + wizSlug;
+    });
+  }
+
+  renderStep1();
 }
 
 // ── Init ───────────────────────────────────────────────────────────────

@@ -413,26 +413,103 @@ MIN_SEGMENT_WORDS = 500
 CHUNK_WORDS = 500
 HEADING_RE = re.compile(r"(?m)^(#{1,6})\s+(\S.*)$")
 
+# Patterns for detecting implicit headings (no # markup)
+_NUMBERED_HEADING_RE = re.compile(
+    r"(?m)^(\d{1,2})\.\s+([А-ЯA-Z][а-яёa-z][^\n]{15,120})$"
+)
+_SUB_HEADING_RE = re.compile(
+    r"(?m)^(\d{1,2}\.\d{1,2})\.\s+([А-ЯA-Z][^\n]{5,120})$"
+)
+
+
+def _clean_page_headers(text: str) -> str:
+    """Remove repeating page headers/footers (lines that appear on 3+ pages)."""
+    pages = text.split("\n---\n")
+    if len(pages) < 3:
+        return text
+    # Find lines that repeat across pages
+    from collections import Counter
+    line_counts: Counter = Counter()
+    for page in pages:
+        seen_on_page: set = set()
+        for line in page.strip().split("\n"):
+            stripped = line.strip()
+            if stripped and len(stripped) < 80 and stripped not in seen_on_page:
+                seen_on_page.add(stripped)
+                line_counts[stripped] += 1
+    # Lines appearing on 40%+ of pages are likely headers/footers
+    threshold = max(3, len(pages) * 0.4)
+    noise = {line for line, count in line_counts.items() if count >= threshold}
+    if not noise:
+        return text
+    # Remove noise lines and clean up separators
+    cleaned_lines = []
+    for line in text.split("\n"):
+        if line.strip() in noise:
+            continue
+        cleaned_lines.append(line)
+    result = "\n".join(cleaned_lines)
+    # Collapse multiple --- separators
+    result = re.sub(r"(\n---\n\s*){2,}", "\n---\n", result)
+    return result
+
+
+def _extract_title(text_block: str) -> str:
+    """Extract a meaningful title from a text block, skipping noise."""
+    lines = text_block.strip().split("\n")
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip image references
+        if stripped.startswith("!["):
+            continue
+        # Skip separators
+        if stripped == "---" or set(stripped) <= {"-", " "}:
+            continue
+        # Skip very short lines (< 3 words)
+        if len(stripped.split()) < 3:
+            continue
+        # Check for numbered heading pattern: "1. Основные понятия..."
+        m = re.match(r"^(\d{1,2})\.\s+(.+)", stripped)
+        if m:
+            return m.group(0)[:120]
+        # Check for bold heading: **Термин** or bold start
+        m = re.match(r"^\*\*([^*]+)\*\*", stripped)
+        if m:
+            return m.group(1)[:120]
+        # Use first meaningful line, truncated
+        clean = stripped[:120]
+        if len(clean) > 80:
+            clean = clean[:80] + "…"
+        return clean
+    return "без названия"
+
 
 def read_text(md_dir: Path, slug: str) -> str:
     p = md_dir / slug / "book.md"
     if not p.exists():
         return ""
     text = p.read_text(encoding="utf-8")
-    return re.sub(r"\A---\n.*?\n---\n", "", text, count=1, flags=re.S)
+    text = re.sub(r"\A---\n.*?\n---\n", "", text, count=1, flags=re.S)
+    return text
 
 
 def segment_text(text: str) -> list[dict]:
-    heads = HEADING_RE.findall(text)
-    wph = len(text.split()) / len(heads) if heads else float("inf")
+    # Step 1: Clean page headers
+    cleaned = _clean_page_headers(text)
+
+    # Step 2: Try markdown headings first
+    heads = HEADING_RE.findall(cleaned)
+    wph = len(cleaned.split()) / len(heads) if heads else float("inf")
 
     if heads and wph <= 1500:
-        positions = [m.start() for m in HEADING_RE.finditer(text)]
-        positions.append(len(text))
+        positions = [m.start() for m in HEADING_RE.finditer(cleaned)]
+        positions.append(len(cleaned))
         segments = []
         for i in range(len(positions) - 1):
             start, end = positions[i], positions[i + 1]
-            body = text[start:end].strip()
+            body = cleaned[start:end].strip()
             words = len(body.split())
             if words < 50:
                 continue
@@ -444,29 +521,80 @@ def segment_text(text: str) -> list[dict]:
             title = m.group(2).strip()[:160] if m else f"сегмент {len(segments)+1}"
             segments.append({"index": len(segments), "start_char": start,
                              "end_char": end, "words": words, "title": title})
-        return segments
-    else:
-        total_words = len(text.split())
-        want = max(1, round(total_words / TARGET_SEGMENT_WORDS))
-        paras = [(m.start(), m.end()) for m in re.finditer(r"[^\n]+(?:\n(?!\n)[^\n]+)*", text)]
-        if not paras:
-            return [{"index": 0, "start_char": 0, "end_char": len(text),
-                     "words": total_words, "title": "полный текст"}]
-        target_per = total_words / want
-        segments, cur_start, cur_words = [], 0, 0
-        for s, e in paras:
-            cur_words += len(text[s:e].split())
-            if cur_words >= target_per and len(segments) < want - 1:
-                tw = text[cur_start:cur_start+200].split()
-                title = " ".join(tw[:8]) + "…" if tw else f"сегмент {len(segments)+1}"
-                segments.append({"index": len(segments), "start_char": cur_start,
-                                 "end_char": e, "words": cur_words, "title": title})
-                cur_start, cur_words = e, 0
-        if cur_words > 0 or not segments:
-            tw = text[cur_start:cur_start+200].split()
-            title = " ".join(tw[:8]) + "…" if tw else f"сегмент {len(segments)+1}"
+        if segments:
+            return segments
+
+    # Step 3: Try numbered headings (e.g. "1. Основные понятия...")
+    numbered = list(_NUMBERED_HEADING_RE.finditer(cleaned))
+    if len(numbered) >= 2:
+        positions = [m.start() for m in numbered]
+        positions.append(len(cleaned))
+        segments = []
+        for i in range(len(positions) - 1):
+            start, end = positions[i], positions[i + 1]
+            body = cleaned[start:end].strip()
+            words = len(body.split())
+            if words < 30:
+                continue
+            m = _NUMBERED_HEADING_RE.match(body)
+            title = m.group(0).strip()[:160] if m else _extract_title(body)
+            # Merge very small segments into previous (< 150 words)
+            if segments and words < 150:
+                segments[-1]["end_char"] = end
+                segments[-1]["words"] += words
+                continue
+            segments.append({"index": len(segments), "start_char": start,
+                             "end_char": end, "words": words, "title": title})
+        # Re-index
+        for i, s in enumerate(segments):
+            s["index"] = i
+        if segments:
+            return segments
+
+    # Step 4: Fall back to page-break splitting (---) with smart titles
+    pages = cleaned.split("\n---\n")
+    if len(pages) >= 3:
+        segments = []
+        pos = 0
+        for page in pages:
+            words = len(page.split())
+            if words < 30:
+                pos += len(page) + 5  # +5 for "\n---\n"
+                continue
+            title = _extract_title(page)
+            # Merge small pages into previous segment
+            if segments and words < MIN_SEGMENT_WORDS:
+                segments[-1]["end_char"] = pos + len(page)
+                segments[-1]["words"] += words
+            else:
+                segments.append({"index": len(segments), "start_char": pos,
+                                 "end_char": pos + len(page), "words": words,
+                                 "title": title})
+            pos += len(page) + 5
+        if segments:
+            return segments
+
+    # Step 5: Final fallback — split by word count with smart titles
+    total_words = len(cleaned.split())
+    want = max(1, round(total_words / TARGET_SEGMENT_WORDS))
+    paras = [(m.start(), m.end()) for m in re.finditer(r"[^\n]+(?:\n(?!\n)[^\n]+)*", cleaned)]
+    if not paras:
+        return [{"index": 0, "start_char": 0, "end_char": len(cleaned),
+                 "words": total_words, "title": "полный текст"}]
+    target_per = total_words / want
+    segments, cur_start, cur_words = [], 0, 0
+    for s, e in paras:
+        cur_words += len(cleaned[s:e].split())
+        if cur_words >= target_per and len(segments) < want - 1:
+            title = _extract_title(cleaned[cur_start:e])
             segments.append({"index": len(segments), "start_char": cur_start,
-                             "end_char": len(text), "words": cur_words or total_words, "title": title})
+                             "end_char": e, "words": cur_words, "title": title})
+            cur_start, cur_words = e, 0
+    if cur_words > 0 or not segments:
+        title = _extract_title(cleaned[cur_start:])
+        segments.append({"index": len(segments), "start_char": cur_start,
+                         "end_char": len(cleaned), "words": cur_words or total_words,
+                         "title": title})
         return segments
 
 
