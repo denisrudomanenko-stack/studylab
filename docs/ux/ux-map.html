@@ -156,6 +156,14 @@ footer{padding-block:40px 56px;color:var(--muted);font-size:.85rem}
     <div class="card"><h3>Ответ</h3><p class="small muted">Тома отмечает нужные пункты и сама запускает подготовку. Конспект нужной глубины с чипами источников и блоком «чего нет в материалах».</p></div>
     <div class="card"><h3>Доработка</h3><p class="small muted">«Дополнить: …», «Короче», «Подробнее». Устраивает — фиксируем как эталон билета.</p></div>
   </div>
+  <div class="card"><span class="tag acc">Иллюстрации</span><h3 style="margin:8px 0 0">Как работают картинки</h3>
+    <div class="flow" style="margin-top:12px">
+      <div class="card"><h3>Извлечь</h3><p class="small muted">Из PDF и DOCX берутся рисунки; мусор (логотипы, значки, повторы) отсеивается.</p></div>
+      <div class="card"><h3>Описать</h3><p class="small muted">Модель один раз описывает каждую: что изображено, тип, для формул LaTeX. Фоном, с прогрессом и кэшем.</p></div>
+      <div class="card"><h3>Найти</h3><p class="small muted">Описание попадает в поиск: вопрос билета и чата находят картинку по смыслу.</p></div>
+      <div class="card"><h3>Вставить</h3><p class="small muted">Модель ставит маркер на нужное место ответа только из найденных; код проверяет его.</p></div>
+      <div class="card"><h3>Управлять</h3><p class="small muted">Тома убирает, заменяет, добавляет рисунок; «Объяснить рисунок» по кнопке.</p></div>
+    </div></div>
   <div class="grid2">
     <div class="card"><span class="tag ok">Критерии</span><h3 style="margin:8px 0 0">Что считаем идеальным ответом</h3>
       <ul class="check small">
@@ -164,6 +172,7 @@ footer{padding-block:40px 56px;color:var(--muted);font-size:.85rem}
         <li><b>Каждый тезис с источником:</b> чип «Лекция 4, §2» открывает читалку на этом месте.</li>
         <li><b>Только из материалов:</b> чего нет, то названо в блоке «в материалах не найдено», а не выдумано.</li>
         <li><b>Точность терминов:</b> латинские названия, формулы и таблицы отображаются корректно.</li>
+        <li><b>Иллюстрации на месте:</b> рисунки, схемы и формулы из её материалов стоят там, где о них говорится, с подписью «Рис. 3.2 · Лекция 4, §2».</li>
         <li><b>Можно доработать</b> комментарием с сохранением версий.</li>
       </ul></div>
     <div class="card"><span class="tag acc">Лучше, чем DeepSeek</span><h3 style="margin:8px 0 0">Чем StudyLab должен выиграть</h3>
@@ -365,6 +374,7 @@ footer{padding-block:40px 56px;color:var(--muted);font-size:.85rem}
               <div><b>Определение.</b> Окрашиваются по Граму в фиолетовый <span class="chip">Лекция 4</span></div>
               <div><b>Клеточная стенка.</b> Толстый слой пептидогликана <span class="chip">Лекция 4, §2</span></div>
               <div><b>Тейхоевые кислоты</b> связывают слои с мембраной <span class="chip">Учебник, гл. 3</span></div>
+              <div style="border:1px solid var(--line);border-radius:8px;padding:12px;text-align:center;color:var(--muted)">▨ Рис. 3.2 · Лекция 4, §2</div>
               <div class="muted">Не найдено в материалах: примеры бактерий</div>
             </div>
             <div class="inp">Пожелания: как у Иванова, с классификацией…</div>
@@ -375,6 +385,7 @@ footer{padding-block:40px 56px;color:var(--muted);font-size:.85rem}
               <div class="row"><span>Лекция 4 · §2</span><span class="pill ok">сильно</span></div>
               <div class="row"><span>Учебник · гл. 3</span><span class="pill ok">сильно</span></div>
               <div class="row"><span>Конспект · стр. 12</span><span class="pill warn">слабо</span></div></div>
+            <div class="box"><b>Иллюстрации</b><div class="row"><span class="chip">▨ Рис. 3.2</span><span class="chip">▨ Рис. 3.4</span><span class="pill acc">+ вставить</span></div></div>
             <div class="box"><b>Читалка</b><div class="muted">Лекция 4, §2</div><div style="background:color-mix(in srgb,var(--warn) 22%,transparent);padding:4px 6px;border-radius:6px">…клеточная стенка содержит толстый слой пептидогликана…</div></div>
           </div>
         </div>
@@ -455,6 +466,7 @@ footer{padding-block:40px 56px;color:var(--muted);font-size:.85rem}
         <li><b>Чипы источников</b> кликабельны и ведут в читалку на нужный фрагмент (сначала проверить, как сейчас формируются ссылки)</li>
         <li><b>Панель покрытия</b> перед генерацией и шаги «ищу → читаю → пишу»</li>
         <li><b>Статусы материалов</b> на человеческом языке: прочитан, частично, не распознан</li>
+        <li><b>Иллюстрации:</b> конвейер (извлечение, описание, поиск) и вставка в ответы и ответы ассистента, управление из интерфейса (задачи 10 и 11)</li>
       </ul></div>
     <div class="card"><div class="head"><span class="tag warn">P1 · нужен бэкенд</span><b>Масштаб: очередь по отмеченным, версии, прогресс</b></div>
       <ul class="clean small">
