@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StudyLab — карта ресурса</title>
+<style>
+/* ── Liquid Glass ──────────────────────────────────────── */
+:root {
+  --lg-bg: #0f0f1a;
+  --lg-bg-gradient: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+  --lg-fg: #e8e8f0;
+  --lg-muted: #8888a0;
+  --lg-accent: #60a5fa;
+  --lg-accent-glow: rgba(96, 165, 250, 0.3);
+  --lg-glass-bg: rgba(255, 255, 255, 0.06);
+  --lg-glass-border: rgba(255, 255, 255, 0.12);
+  --lg-glass-highlight: rgba(255, 255, 255, 0.15);
+  --lg-glass-blur: 20px;
+  --lg-glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --lg-glass-radius: 16px;
+  --lg-card-bg: rgba(255, 255, 255, 0.08);
+  --lg-card-border: rgba(255, 255, 255, 0.15);
+  --lg-card-shadow: 0 8px 32px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --lg-green: #4ade80;
+  --lg-green-glass: rgba(74, 222, 128, 0.1);
+  --lg-amber: #fbbf24;
+  --lg-amber-glass: rgba(251, 191, 36, 0.1);
+  --lg-red: #f87171;
+  --lg-blue: #60a5fa;
+  --lg-blue-glass: rgba(96, 165, 250, 0.1);
+  --lg-purple: #c084fc;
+  --lg-purple-glass: rgba(192, 132, 252, 0.1);
+}
+[data-theme="light"] {
+  --lg-bg: #f0f0f5;
+  --lg-bg-gradient: linear-gradient(135deg, #e8e8f0 0%, #f0f0f5 50%, #e0e0f0 100%);
+  --lg-fg: #1c1c2e;
+  --lg-muted: #6b6b80;
+  --lg-glass-bg: rgba(255, 255, 255, 0.5);
+  --lg-glass-border: rgba(255, 255, 255, 0.7);
+  --lg-glass-highlight: rgba(255, 255, 255, 0.8);
+  --lg-glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+  --lg-card-bg: rgba(255, 255, 255, 0.6);
+  --lg-card-border: rgba(255, 255, 255, 0.8);
+  --lg-card-shadow: 0 8px 32px rgba(0, 0, 0, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, 'SF Pro Display', 'Inter', system-ui, sans-serif;
+  background: var(--lg-bg-gradient);
+  color: var(--lg-fg);
+  line-height: 1.7;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+body::before, body::after {
+  content: ''; position: fixed; border-radius: 50%; filter: blur(120px); opacity: 0.4; z-index: -1; pointer-events: none;
+}
+body::before { width: 500px; height: 500px; top: -10%; left: -5%; background: radial-gradient(circle, rgba(96,165,250,0.3), transparent 70%); }
+body::after { width: 400px; height: 400px; bottom: -10%; right: -5%; background: radial-gradient(circle, rgba(192,132,252,0.25), transparent 70%); }
+
+.lg-container { max-width: 960px; margin: 0 auto; padding: 2.5rem 1.5rem; position: relative; }
+h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.03em; margin-bottom: 0.3rem; }
+h2 { font-size: 1.15rem; font-weight: 600; margin: 2.2rem 0 0.8rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--lg-glass-border); }
+.lg-subtitle { color: var(--lg-muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+a { color: var(--lg-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── Theme toggle ── */
+.lg-theme-toggle {
+  position: fixed; top: 1rem; right: 1rem;
+  background: var(--lg-glass-bg); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--lg-glass-border); border-radius: 50%;
+  width: 40px; height: 40px; cursor: pointer; font-size: 1.1rem;
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+  color: var(--lg-fg); transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.lg-theme-toggle:hover { transform: scale(1.1); box-shadow: 0 0 20px var(--lg-accent-glow); }
+
+/* ── Sitemap tree ── */
+.tree { display: flex; flex-direction: column; gap: 0; margin: 1.5rem 0; }
+.tree-node {
+  display: grid; grid-template-columns: 56px 1fr; gap: 16px; align-items: start;
+  padding: 20px 24px;
+  background: var(--lg-card-bg); backdrop-filter: blur(var(--lg-glass-blur)); -webkit-backdrop-filter: blur(var(--lg-glass-blur));
+  border: 1px solid var(--lg-card-border); border-radius: var(--lg-glass-radius);
+  box-shadow: var(--lg-card-shadow);
+  position: relative; overflow: hidden;
+  margin-bottom: 12px;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.tree-node::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent 10%, var(--lg-glass-highlight) 50%, transparent 90%);
+}
+.tree-node:hover { transform: translateY(-1px); box-shadow: var(--lg-card-shadow), 0 0 20px var(--lg-accent-glow); }
+.tree-node.entry-point { border-color: var(--lg-accent); border-width: 2px; }
+.tree-node.child { margin-left: 48px; }
+.tree-node.grandchild { margin-left: 96px; }
+
+.node-icon {
+  width: 56px; height: 56px; border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.5rem; flex-shrink: 0;
+  background: var(--lg-glass-bg); border: 1px solid var(--lg-glass-border);
+}
+.node-icon.accent { background: rgba(96,165,250,0.15); border-color: rgba(96,165,250,0.3); }
+.node-icon.green { background: rgba(74,222,128,0.12); border-color: rgba(74,222,128,0.25); }
+.node-icon.purple { background: rgba(192,132,252,0.12); border-color: rgba(192,132,252,0.25); }
+.node-icon.amber { background: rgba(251,191,36,0.12); border-color: rgba(251,191,36,0.25); }
+
+.node-body { min-width: 0; }
+.node-title { font-size: 1rem; font-weight: 600; margin-bottom: 2px; display: flex; align-items: center; gap: 8px; }
+.node-route { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.78rem; color: var(--lg-accent); margin-bottom: 6px; }
+.node-desc { font-size: 0.88rem; color: var(--lg-muted); line-height: 1.5; }
+.node-elements {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
+}
+.el-tag {
+  display: inline-block; font-size: 0.72rem; font-weight: 500; padding: 2px 10px;
+  border-radius: 20px; background: var(--lg-glass-bg); border: 1px solid var(--lg-glass-border);
+  color: var(--lg-muted);
+}
+.el-tag.new { background: var(--lg-blue-glass); border-color: rgba(96,165,250,0.3); color: var(--lg-accent); }
+
+/* ── Connector lines ── */
+.connector { display: flex; align-items: center; margin-left: 76px; height: 20px; }
+.connector::before {
+  content: ''; display: block; width: 2px; height: 20px;
+  background: linear-gradient(to bottom, var(--lg-glass-border), rgba(96,165,250,0.3));
+}
+.connector.branch { margin-left: 76px; }
+.connector.branch::after {
+  content: ''; display: block; width: 24px; height: 2px; background: var(--lg-glass-border);
+}
+
+/* ── Table ── */
+table { width: 100%; border-collapse: collapse; margin: 0.8rem 0; font-size: 0.88rem; }
+th, td { text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--lg-glass-border); }
+th { font-weight: 600; font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--lg-muted); }
+
+/* ── Footer ── */
+.lg-footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--lg-glass-border); font-size: 0.78rem; color: var(--lg-muted); }
+
+@media (max-width: 640px) {
+  .lg-container { padding: 1.5rem 1rem; }
+  h1 { font-size: 1.3rem; }
+  .tree-node.child { margin-left: 24px; }
+  .tree-node.grandchild { margin-left: 48px; }
+  .connector { margin-left: 52px; }
+  .tree-node { grid-template-columns: 44px 1fr; padding: 16px 18px; }
+  .node-icon { width: 44px; height: 44px; font-size: 1.2rem; }
+}
+</style>
+</head>
+<body>
+<button class="lg-theme-toggle" onclick="toggleTheme()" id="theme-icon"></button>
+<div class="lg-container">
+
+<h1>StudyLab &mdash; карта ресурса</h1>
+<p class="lg-subtitle">8 экранов &middot; SPA hash-роутинг &middot; JWT авторизация &middot; 14.10.2026</p>
+
+<!-- ── TREE ── -->
+<div class="tree">
+
+  <!-- 1. Login -->
+  <div class="tree-node entry-point">
+    <div class="node-icon accent">&#128274;</div>
+    <div class="node-body">
+      <div class="node-title">Логин</div>
+      <div class="node-route">#/login</div>
+      <div class="node-desc">Точка входа. Форма логин/пароль, JWT cookie на 30 дней.</div>
+      <div class="node-elements">
+        <span class="el-tag">Форма входа</span>
+        <span class="el-tag new">Забыла пароль</span>
+        <span class="el-tag">Валидация</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- 2. Dashboard -->
+  <div class="tree-node">
+    <div class="node-icon green">&#128218;</div>
+    <div class="node-body">
+      <div class="node-title">Дашборд</div>
+      <div class="node-route">#/dashboard</div>
+      <div class="node-desc">Список предметов с прогрессом индексации. Админ может добавить новый предмет.</div>
+      <div class="node-elements">
+        <span class="el-tag">Карточки предметов</span>
+        <span class="el-tag">Прогресс-бар</span>
+        <span class="el-tag">+ Добавить (admin)</span>
+        <span class="el-tag new">Смена пароля</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector"></div>
+
+  <!-- 3. Subject -->
+  <div class="tree-node child">
+    <div class="node-icon purple">&#128193;</div>
+    <div class="node-body">
+      <div class="node-title">Предмет</div>
+      <div class="node-route">#/subject/<em>slug</em></div>
+      <div class="node-desc">Управление источниками + семантический поиск. Две вкладки.</div>
+      <div class="node-elements">
+        <span class="el-tag">Drag &amp; drop загрузка</span>
+        <span class="el-tag">Список источников</span>
+        <span class="el-tag">Статусы (pending/indexed/error)</span>
+        <span class="el-tag">Семантический поиск</span>
+        <span class="el-tag">Переиндексация</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector branch"></div>
+
+  <!-- 4. Reader -->
+  <div class="tree-node grandchild">
+    <div class="node-icon">&#128214;</div>
+    <div class="node-body">
+      <div class="node-title">Читалка</div>
+      <div class="node-route">#/reader/<em>slug</em></div>
+      <div class="node-desc">Двухколоночный layout: оглавление слева (группы по источникам), текст сегмента справа.</div>
+      <div class="node-elements">
+        <span class="el-tag">Боковое оглавление</span>
+        <span class="el-tag">Контент сегмента</span>
+        <span class="el-tag">Мобильная адаптивность</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector branch"></div>
+
+  <!-- 5. Chat -->
+  <div class="tree-node grandchild">
+    <div class="node-icon accent">&#128172;</div>
+    <div class="node-body">
+      <div class="node-title">Чат-ассистент</div>
+      <div class="node-route">#/chat/<em>slug</em></div>
+      <div class="node-desc">RAG-ассистент по источникам предмета. DeepSeek V4 Pro через Timeweb AI API, стриминг SSE.</div>
+      <div class="node-elements">
+        <span class="el-tag new">Боковая панель бесед</span>
+        <span class="el-tag new">Поиск по беседам</span>
+        <span class="el-tag new">Удаление бесед</span>
+        <span class="el-tag">Стриминг SSE</span>
+        <span class="el-tag">OCR фото (Vision)</span>
+        <span class="el-tag">Провенанс [источник | раздел]</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="connector branch"></div>
+
+  <!-- 6. Tickets -->
+  <div class="tree-node grandchild">
+    <div class="node-icon amber">&#128203;</div>
+    <div class="node-body">
+      <div class="node-title">Билеты</div>
+      <div class="node-route">#/tickets/<em>slug</em></div>
+      <div class="node-desc">Экзаменационные билеты: CRUD вопросов, генерация развёрнутых ответов через RAG, экспорт в TXT.</div>
+      <div class="node-elements">
+        <span class="el-tag">Список билетов</span>
+        <span class="el-tag">Генерация ответа (SSE)</span>
+        <span class="el-tag">Экспорт .txt</span>
+        <span class="el-tag">Удаление</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Отдельная ветка: сброс пароля ── -->
+<h2>Отдельная ветка: сброс пароля</h2>
+
+<div class="tree">
+  <div class="tree-node">
+    <div class="node-icon">&#128231;</div>
+    <div class="node-body">
+      <div class="node-title">Подтверждение сброса</div>
+      <div class="node-route">#/approve-reset/<em>token</em></div>
+      <div class="node-desc">Публичная страница по ссылке из email. Админ кликает &mdash; пароль разблокирован для смены.</div>
+      <div class="node-elements">
+        <span class="el-tag new">Email на y53@yandex.ru</span>
+        <span class="el-tag new">Один активный запрос</span>
+        <span class="el-tag new">Валидация пароля (8+, A-Z, спецсимвол)</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Таблица ── -->
+<h2>Сводная таблица экранов</h2>
+
+<div style="overflow-x:auto">
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Экран</th>
+      <th>Маршрут</th>
+      <th>Назначение</th>
+      <th>Ключевые элементы</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>Логин</td>
+      <td><code>#/login</code></td>
+      <td>Авторизация</td>
+      <td>Форма, кнопка &laquo;Забыла пароль&raquo;</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Дашборд</td>
+      <td><code>#/dashboard</code></td>
+      <td>Список предметов</td>
+      <td>Карточки, прогресс, + Добавить (admin)</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Предмет</td>
+      <td><code>#/subject/slug</code></td>
+      <td>Источники + поиск</td>
+      <td>Drag&amp;drop, статусы, семантический поиск</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>Читалка</td>
+      <td><code>#/reader/slug</code></td>
+      <td>Чтение материалов</td>
+      <td>Оглавление слева, контент справа</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>Чат</td>
+      <td><code>#/chat/slug</code></td>
+      <td>RAG-ассистент</td>
+      <td>Беседы, SSE, OCR, провенанс</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>Билеты</td>
+      <td><code>#/tickets/slug</code></td>
+      <td>Экзаменационные билеты</td>
+      <td>CRUD, генерация, экспорт TXT</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>Смена пароля</td>
+      <td><em>модальное окно</em></td>
+      <td>Запрос + установка пароля</td>
+      <td>Email админу, блокировка повторного запроса</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>Подтверждение сброса</td>
+      <td><code>#/approve-reset/token</code></td>
+      <td>Админ одобряет</td>
+      <td>Публичная страница по ссылке из email</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="lg-footer">
+  StudyLab &middot; study.24pensi.ru &middot; Биофак МГУ, Микробиология
+</div>
+
+</div>
+
+<script>
+function toggleTheme(){const h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',n);document.getElementById('theme-icon').textContent=n==='dark'?'\u2600':'\u263D';localStorage.setItem('theme',n)}
+(function(){const s=localStorage.getItem('theme')||(window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');document.documentElement.setAttribute('data-theme',s);document.getElementById('theme-icon').textContent=s==='dark'?'\u2600':'\u263D'})();
+</script>
+</body>
+</html>

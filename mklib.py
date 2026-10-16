@@ -183,11 +183,11 @@ EMB_URL = (os.environ.get("LMSTUDIO_BASE_URL")
            or "http://127.0.0.1:11434/v1").rstrip("/")
 EMB_MODEL = (os.environ.get("LMSTUDIO_MODEL")
              or _emb_config("LMSTUDIO_MODEL")
-             or "embeddinggemma:300m")
+             or "bge-m3")
 
-DOC_PREFIX = "title: none | text: "
-QUERY_PREFIX = "task: search result | query: "
-DIM = 768
+DOC_PREFIX = ""
+QUERY_PREFIX = ""
+DIM = 1024
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -195,7 +195,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     for i in range(0, len(texts), 32):
         batch = [DOC_PREFIX + (t or "") for t in texts[i:i+32]]
         resp = requests.post(f"{EMB_URL}/embeddings",
-                             json={"model": EMB_MODEL, "input": batch}, timeout=120)
+                             json={"model": EMB_MODEL, "input": batch}, timeout=600)
         resp.raise_for_status()
         vecs = [it["embedding"] for it in sorted(resp.json()["data"], key=lambda x: x["index"])]
         for v in vecs:
@@ -207,7 +207,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
 def embed_query(query: str) -> list[float]:
     resp = requests.post(f"{EMB_URL}/embeddings",
-                         json={"model": EMB_MODEL, "input": [QUERY_PREFIX + query]}, timeout=120)
+                         json={"model": EMB_MODEL, "input": [QUERY_PREFIX + query]}, timeout=300)
     resp.raise_for_status()
     v = resp.json()["data"][0]["embedding"]
     a = np.asarray(v, dtype=np.float32)

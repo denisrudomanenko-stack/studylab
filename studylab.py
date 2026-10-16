@@ -11,10 +11,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import secrets
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 import bcrypt
 import jwt
 from fastapi import (Cookie, Depends, FastAPI, File, Form, HTTPException,
-                     Request, Response, UploadFile)
+                     Query, Request, Response, UploadFile)
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 
@@ -53,6 +58,11 @@ SECRET_KEY       = _cfg("SECRET_KEY", "dev-secret-please-change")
 TIMEWEB_API_KEY  = _cfg("TIMEWEB_API_KEY", "")
 ADMIN_PASSWORD   = _cfg("ADMIN_PASSWORD", "admin123")
 STUDENT_PASSWORD = _cfg("STUDENT_PASSWORD", "student123")
+SMTP_EMAIL       = _cfg("SMTP_EMAIL", "")
+SMTP_PASSWORD    = _cfg("SMTP_PASSWORD", "")
+SMTP_HOST        = _cfg("SMTP_HOST", "smtp.yandex.ru")
+SMTP_PORT        = int(_cfg("SMTP_PORT", "465"))
+ADMIN_EMAIL      = "y53@yandex.ru"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SUBJECTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,6 +95,7 @@ def init_db():
             slug        TEXT UNIQUE NOT NULL,
             title       TEXT        NOT NULL,
             description TEXT        DEFAULT '',
+            year        INTEGER     DEFAULT 0,
             created_at  TEXT        NOT NULL,
             created_by  INTEGER
         );
@@ -95,18 +106,35 @@ def init_db():
             filename      TEXT NOT NULL,
             original_name TEXT NOT NULL,
             title         TEXT NOT NULL,
-            status        TEXT NOT NULL DEFAULT 'pending',
+            status        TEXT NOT NULL DEFAULT 'uploaded',
             chunk_count   INTEGER      DEFAULT 0,
             created_at    TEXT         NOT NULL,
             UNIQUE(subject_slug, slug)
         );
-        CREATE TABLE IF NOT EXISTS chat_history (
+        CREATE TABLE IF NOT EXISTS conversations (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             subject_slug TEXT NOT NULL,
             user_id      INTEGER NOT NULL,
-            role         TEXT    NOT NULL,
-            content      TEXT    NOT NULL,
-            created_at   TEXT    NOT NULL
+            title        TEXT NOT NULL DEFAULT '',
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL DEFAULT 0,
+            subject_slug    TEXT NOT NULL,
+            user_id         INTEGER NOT NULL,
+            role            TEXT    NOT NULL,
+            content         TEXT    NOT NULL,
+            created_at      TEXT    NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS password_reset_requests (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            token      TEXT    UNIQUE NOT NULL,
+            status     TEXT    NOT NULL DEFAULT 'pending',
+            created_at TEXT    NOT NULL,
+            resolved_at TEXT   DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS exam_tickets (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +146,16 @@ def init_db():
             generated_at TEXT DEFAULT ''
         );
     """)
+    # Safe migrations: add columns that may not exist in older DBs
+    for migration in [
+        "ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE subjects ADD COLUMN year INTEGER DEFAULT 0",
+    ]:
+        try:
+            db.execute(migration)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     now = datetime.now(timezone.utc).isoformat()
     for uname, pwd, role in [("admin", ADMIN_PASSWORD, "admin"),
                               ("student", STUDENT_PASSWORD, "student")]:
@@ -209,6 +247,206 @@ async def api_me(user: dict = Depends(current_user)):
     return {"username": user["username"], "role": user["role"]}
 
 
+# ─── Password validation & SMTP ──────────────────────────────────────
+
+def _validate_password(pw: str) -> str | None:
+    if len(pw) < 8:
+        return "Пароль должен содержать минимум 8 символов"
+    if not any(c.isupper() for c in pw):
+        return "Пароль должен содержать хотя бы одну заглавную букву"
+    if not any(c in "!@#$%^&*()-_=+[]{}|;:',.<>?/`~" for c in pw):
+        return "Пароль должен содержать хотя бы один спецсимвол"
+    return None
+
+
+def _send_email(subject: str, body_html: str):
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        print("[smtp] SMTP not configured, skipping email", flush=True)
+        return
+    msg = MIMEMultipart("alternative")
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = ADMIN_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body_html, "html", "utf-8"))
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as srv:
+            srv.login(SMTP_EMAIL, SMTP_PASSWORD)
+            srv.sendmail(SMTP_EMAIL, ADMIN_EMAIL, msg.as_string())
+        print(f"[smtp] Email sent: {subject}", flush=True)
+    except Exception as e:
+        print(f"[smtp error] {e}", flush=True)
+
+
+# ─── Password reset flow ─────────────────────────────────────────────
+
+@app.post("/api/request-password-reset")
+async def request_password_reset(user: dict = Depends(current_user)):
+    uid = int(user["sub"])
+    db = get_db()
+    pending = db.execute(
+        "SELECT id FROM password_reset_requests WHERE user_id=? AND status='pending'", (uid,)
+    ).fetchone()
+    if pending:
+        db.close()
+        raise HTTPException(409, "Уже есть активный запрос на смену пароля")
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "INSERT INTO password_reset_requests (user_id,token,status,created_at) VALUES (?,?,'pending',?)",
+        (uid, token, now)
+    )
+    db.commit()
+    db.close()
+    _send_email(
+        f"StudyLab: запрос на смену пароля от {user['username']}",
+        f"<p>Пользователь <b>{user['username']}</b> запросил смену пароля.</p>"
+        f"<p><a href='https://study.24pensi.ru/#/approve-reset/{token}'>Подтвердить смену пароля</a></p>"
+        f"<p>Если вы не одобряете — просто проигнорируйте это письмо.</p>"
+    )
+    return {"ok": True, "message": "Запрос отправлен администратору"}
+
+
+@app.get("/api/password-reset-status")
+async def password_reset_status(user: dict = Depends(current_user)):
+    db = get_db()
+    row = db.execute(
+        "SELECT status FROM password_reset_requests WHERE user_id=? ORDER BY id DESC LIMIT 1",
+        (int(user["sub"]),)
+    ).fetchone()
+    db.close()
+    if not row:
+        return {"has_pending": False, "status": None}
+    return {"has_pending": row["status"] == "pending", "status": row["status"]}
+
+
+@app.get("/api/approve-reset/{token}")
+async def approve_reset(token: str):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM password_reset_requests WHERE token=? AND status='pending'", (token,)
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Запрос не найден или уже обработан")
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "UPDATE password_reset_requests SET status='approved', resolved_at=? WHERE id=?",
+        (now, row["id"])
+    )
+    db.commit()
+    db.close()
+    return HTMLResponse(
+        "<html><body style='font-family:sans-serif;padding:40px;text-align:center'>"
+        "<h2>Смена пароля одобрена</h2>"
+        "<p>Пользователь теперь может установить новый пароль.</p>"
+        "</body></html>"
+    )
+
+
+@app.post("/api/set-new-password")
+async def set_new_password(new_password: str = Form(), user: dict = Depends(current_user)):
+    err = _validate_password(new_password)
+    if err:
+        raise HTTPException(400, err)
+    uid = int(user["sub"])
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM password_reset_requests WHERE user_id=? AND status='approved' ORDER BY id DESC LIMIT 1",
+        (uid,)
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(403, "Нет одобренного запроса на смену пароля")
+    pw_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    db.execute("UPDATE users SET password_hash=? WHERE id=?", (pw_hash, uid))
+    db.execute(
+        "UPDATE password_reset_requests SET status='completed', resolved_at=? WHERE id=?",
+        (datetime.now(timezone.utc).isoformat(), row["id"])
+    )
+    db.commit()
+    db.close()
+    return {"ok": True, "message": "Пароль успешно изменён"}
+
+
+# ─── Conversations ────────────────────────────────────────────────────
+
+@app.get("/api/subjects/{slug}/conversations")
+async def list_conversations(slug: str, q: str = "", user: dict = Depends(current_user)):
+    uid = int(user["sub"])
+    db = get_db()
+    if q:
+        rows = db.execute(
+            "SELECT DISTINCT c.* FROM conversations c "
+            "JOIN chat_history h ON h.conversation_id=c.id "
+            "WHERE c.subject_slug=? AND c.user_id=? AND h.content LIKE ? "
+            "ORDER BY c.updated_at DESC",
+            (slug, uid, f"%{q}%")
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM conversations WHERE subject_slug=? AND user_id=? ORDER BY updated_at DESC",
+            (slug, uid)
+        ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/subjects/{slug}/conversations")
+async def create_conversation(slug: str, title: str = Form(default=""),
+                               user: dict = Depends(current_user)):
+    uid = int(user["sub"])
+    now = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO conversations (subject_slug,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
+        (slug, uid, title or "Новая беседа", now, now)
+    )
+    cid = cur.lastrowid
+    db.commit()
+    db.close()
+    return {"ok": True, "id": cid}
+
+
+@app.put("/api/subjects/{slug}/conversations/{cid}")
+async def rename_conversation(slug: str, cid: int, title: str = Form(),
+                                user: dict = Depends(current_user)):
+    db = get_db()
+    db.execute("UPDATE conversations SET title=? WHERE id=? AND user_id=?",
+               (title, cid, int(user["sub"])))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.delete("/api/subjects/{slug}/conversations/{cid}")
+async def delete_conversation(slug: str, cid: int, user: dict = Depends(current_user)):
+    uid = int(user["sub"])
+    db = get_db()
+    db.execute("DELETE FROM chat_history WHERE conversation_id=? AND user_id=?", (cid, uid))
+    db.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (cid, uid))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.delete("/api/subjects/{slug}/conversations")
+async def delete_all_conversations(slug: str, user: dict = Depends(current_user)):
+    uid = int(user["sub"])
+    db = get_db()
+    conv_ids = [r["id"] for r in db.execute(
+        "SELECT id FROM conversations WHERE subject_slug=? AND user_id=?", (slug, uid)
+    ).fetchall()]
+    if conv_ids:
+        placeholders = ",".join("?" * len(conv_ids))
+        db.execute(f"DELETE FROM chat_history WHERE conversation_id IN ({placeholders}) AND user_id=?",
+                   conv_ids + [uid])
+        db.execute(f"DELETE FROM conversations WHERE id IN ({placeholders}) AND user_id=?",
+                   conv_ids + [uid])
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
 # ─── Stage 3: Subjects + Upload + Indexing ────────────────────────────
 
 import asyncio
@@ -253,21 +491,33 @@ async def _index_source(subject_slug: str, source_slug: str,
     """Background: convert → segment → embed → store in sqlite-vec."""
     db = get_db()
     try:
-        db.execute("UPDATE sources SET status='processing' WHERE subject_slug=? AND slug=?",
+        db.execute("UPDATE sources SET status='indexing:convert' WHERE subject_slug=? AND slug=?",
                    (subject_slug, source_slug))
         db.commit()
 
         subj_dir = subject_dir(subject_slug)
         md_dir = subj_dir / "md"
 
+        def _update_status(st):
+            sdb = get_db()
+            sdb.execute("UPDATE sources SET status=? WHERE subject_slug=? AND slug=?",
+                        (st, subject_slug, source_slug))
+            sdb.commit()
+            sdb.close()
+
         def _run():
             if not MKLIB_OK:
                 raise RuntimeError("mklib недоступен")
-            mk_convert(upload_path, source_slug, md_dir)
+            mk_convert(upload_path, source_slug, md_dir, with_images=True)
+            _update_status('indexing:segment')
             text = mk_read_text(md_dir, source_slug)
             if not text:
                 raise RuntimeError("Текст не извлечён")
             segs = segment_text(text)
+            if not segs:
+                segs = [{"index": 0, "title": source_title,
+                         "start_char": 0, "end_char": len(text),
+                         "words": len(text.split())}]
             seg_path = subj_dir / "segments.json"
             all_segs: dict = {}
             if seg_path.exists():
@@ -302,11 +552,13 @@ async def _index_source(subject_slug: str, source_slug: str,
                         "text": full, "meta": {"start_char": a, "end_char": b},
                     })
                     payloads.append(full)
-            for i in range(0, len(records), 32):
-                vecs = embed_texts(payloads[i:i+32])
-                for r, v in zip(records[i:i+32], vecs):
+            _update_status(f'indexing:embed 0/{len(records)}')
+            for i in range(0, len(records), 8):
+                _update_status(f'indexing:embed {i}/{len(records)}')
+                vecs = embed_texts(payloads[i:i+8])
+                for r, v in zip(records[i:i+8], vecs):
                     r["embedding"] = v
-                db_upsert(vec_db, "chunks", records[i:i+32])
+                db_upsert(vec_db, "chunks", records[i:i+8])
             vec_db.close()
             return len(records)
 
@@ -328,6 +580,7 @@ async def _index_source(subject_slug: str, source_slug: str,
 
 @app.post("/api/subjects")
 async def create_subject(title: str = Form(), description: str = Form(default=""),
+                          year: int = Form(default=0),
                           user: dict = Depends(admin_user)):
     slug = _slug(title)
     if not slug:
@@ -337,8 +590,8 @@ async def create_subject(title: str = Form(), description: str = Form(default=""
     try:
         now = datetime.now(timezone.utc).isoformat()
         db.execute(
-            "INSERT INTO subjects (slug,title,description,created_at,created_by) VALUES (?,?,?,?,?)",
-            (slug, title, description, now, int(user["sub"]))
+            "INSERT INTO subjects (slug,title,description,year,created_at,created_by) VALUES (?,?,?,?,?,?)",
+            (slug, title, description, year, now, int(user["sub"]))
         )
         db.commit()
     except sqlite3.IntegrityError:
@@ -352,15 +605,15 @@ async def create_subject(title: str = Form(), description: str = Form(default=""
 async def list_subjects(user: dict = Depends(current_user)):
     db = get_db()
     subjects = [dict(r) for r in db.execute(
-        "SELECT slug,title,description,created_at FROM subjects ORDER BY created_at DESC"
+        "SELECT slug,title,description,year,created_at FROM subjects ORDER BY created_at DESC"
     ).fetchall()]
     for s in subjects:
         rows = db.execute(
             "SELECT status, chunk_count FROM sources WHERE subject_slug=?", (s["slug"],)
         ).fetchall()
         s["source_count"] = len(rows)
-        s["indexed_count"] = sum(1 for r in rows if r["status"] == "indexed")
-        s["total_chunks"] = sum(r["chunk_count"] for r in rows)
+        s["active_count"] = sum(1 for r in rows if r["status"] == "active")
+        s["total_chunks"] = sum(r["chunk_count"] for r in rows if r["status"] == "active")
     db.close()
     return subjects
 
@@ -409,15 +662,14 @@ async def upload_source(slug: str, file: UploadFile = File(),
         db.execute(
             "INSERT OR REPLACE INTO sources "
             "(subject_slug,slug,filename,original_name,title,status,chunk_count,created_at) "
-            "VALUES (?,?,?,?,?,'pending',0,?)",
+            "VALUES (?,?,?,?,?,'uploaded',0,?)",
             (slug, src_slug, upload_path.name, file.filename, src_title, now)
         )
         db.commit()
     finally:
         db.close()
 
-    asyncio.create_task(_index_source(slug, src_slug, upload_path, src_title))
-    return {"ok": True, "slug": src_slug, "title": src_title, "status": "pending"}
+    return {"ok": True, "slug": src_slug, "title": src_title, "status": "uploaded"}
 
 
 @app.get("/api/subjects/{slug}/sources")
@@ -430,8 +682,79 @@ async def list_sources(slug: str, user: dict = Depends(current_user)):
     return [dict(r) for r in rows]
 
 
+@app.post("/api/subjects/{slug}/sources/{src_slug}/index")
+async def index_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+    """Запустить индексацию (конвертация + сегментация + эмбеддинги)."""
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug)
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Источник не найден")
+    if row["status"] == "indexing":
+        raise HTTPException(409, "Индексация уже идёт")
+    upload_path = subject_dir(slug) / "uploads" / row["filename"]
+    if not upload_path.exists():
+        raise HTTPException(404, "Файл не найден на сервере")
+    asyncio.create_task(_index_source(slug, src_slug, upload_path, row["title"]))
+    return {"ok": True, "message": "Индексация запущена"}
+
+
+@app.put("/api/subjects/{slug}/sources/{src_slug}/rename")
+async def rename_source(slug: str, src_slug: str, title: str = Form(),
+                         user: dict = Depends(admin_user)):
+    db = get_db()
+    db.execute("UPDATE sources SET title=? WHERE subject_slug=? AND slug=?",
+               (title.strip(), slug, src_slug))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.post("/api/subjects/{slug}/sources/{src_slug}/activate")
+async def activate_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+    """Включить источник в библиотеку (поиск и RAG)."""
+    db = get_db()
+    row = db.execute(
+        "SELECT status FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug)
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Источник не найден")
+    if row["status"] not in ("indexed", "inactive"):
+        db.close()
+        raise HTTPException(400, f"Нельзя активировать источник со статусом '{row['status']}'")
+    db.execute("UPDATE sources SET status='active' WHERE subject_slug=? AND slug=?",
+               (slug, src_slug))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.post("/api/subjects/{slug}/sources/{src_slug}/deactivate")
+async def deactivate_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+    """Отключить источник от библиотеки (индекс сохраняется)."""
+    db = get_db()
+    row = db.execute(
+        "SELECT status FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug)
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Источник не найден")
+    if row["status"] != "active":
+        db.close()
+        raise HTTPException(400, "Источник не активен")
+    db.execute("UPDATE sources SET status='inactive' WHERE subject_slug=? AND slug=?",
+               (slug, src_slug))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
 @app.delete("/api/subjects/{slug}/sources/{src_slug}")
 async def delete_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
+    """Полное удаление: файл, markdown, чанки из индекса."""
     db = get_db()
     row = db.execute(
         "SELECT * FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug)
@@ -439,30 +762,52 @@ async def delete_source(slug: str, src_slug: str, user: dict = Depends(admin_use
     if not row:
         db.close()
         raise HTTPException(404, "Источник не найден")
-    upload_path = subject_dir(slug) / "uploads" / row["filename"]
-    if upload_path.exists():
-        upload_path.unlink(missing_ok=True)
+
+    subj = subject_dir(slug)
+    # Удалить файл
+    upload_path = subj / "uploads" / row["filename"]
+    upload_path.unlink(missing_ok=True)
+    # Удалить markdown
+    md_dir = subj / "md" / src_slug
+    if md_dir.exists():
+        shutil.rmtree(md_dir, ignore_errors=True)
+    # Удалить из segments.json
+    seg_path = subj / "segments.json"
+    if seg_path.exists():
+        try:
+            all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+            all_segs.pop(src_slug, None)
+            seg_path.write_text(json.dumps(all_segs, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+    # Удалить чанки из векторного индекса
+    vec_db_path = subj / "index.db"
+    if vec_db_path.exists() and MKLIB_OK:
+        try:
+            vec_db = mk_open_db(vec_db_path)
+            vec_db.execute("DELETE FROM chunks WHERE slug=?", (src_slug,))
+            vec_db.commit()
+            vec_db.close()
+        except Exception:
+            pass
+    # Удалить из БД
     db.execute("DELETE FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug))
     db.commit()
     db.close()
     return {"ok": True}
 
 
-@app.post("/api/subjects/{slug}/reindex/{src_slug}")
-async def reindex_source(slug: str, src_slug: str, user: dict = Depends(admin_user)):
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM sources WHERE subject_slug=? AND slug=?", (slug, src_slug)
-    ).fetchone()
-    db.close()
-    if not row:
-        raise HTTPException(404, "Источник не найден")
-    upload_path = subject_dir(slug) / "uploads" / row["filename"]
-    asyncio.create_task(_index_source(slug, src_slug, upload_path, row["title"]))
-    return {"ok": True, "message": "Переиндексация запущена"}
-
-
 # ─── Stage 4: Search + Reader ─────────────────────────────────────────
+
+def _active_slugs(subject_slug: str) -> set[str]:
+    """Return set of source slugs with status='active'."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT slug FROM sources WHERE subject_slug=? AND status='active'", (subject_slug,)
+    ).fetchall()
+    db.close()
+    return {r["slug"] for r in rows}
+
 
 @app.get("/api/subjects/{slug}/search")
 async def search_subject(slug: str, q: str, k: int = 8,
@@ -472,15 +817,19 @@ async def search_subject(slug: str, q: str, k: int = 8,
     db_path = subject_dir(slug) / "index.db"
     if not db_path.exists():
         return []
+    active = _active_slugs(slug)
+    if not active:
+        return []
 
     def _search():
         vec = embed_query(q)
         vdb = mk_open_db(db_path)
-        hits = db_search(vdb, "chunks", vec, k=k)
+        hits = db_search(vdb, "chunks", vec, k=k * 3)
         vdb.close()
         return hits
 
     hits = await asyncio.to_thread(_search)
+    filtered = [h for h in hits if h["slug"] in active][:k]
     return [
         {
             "score": h["score"],
@@ -489,7 +838,7 @@ async def search_subject(slug: str, q: str, k: int = 8,
             "title": h["title"],
             "text": h["text"][:400],
         }
-        for h in hits
+        for h in filtered
     ]
 
 
@@ -541,32 +890,52 @@ async def get_segment(slug: str, src_slug: str, seg_id: int,
 import httpx as _httpx
 import base64 as _b64
 
-TIMEWEB_URL = "https://api.timeweb.cloud/api/v1/cloud-ai/chat/completions"
-CHAT_MODEL  = "gemini/gemini-3.5-flash"
+TIMEWEB_URL = _cfg("LLM_BASE_URL", "https://api.timeweb.ai/v1") + "/chat/completions"
+CHAT_MODEL  = "deepseek/deepseek-v4-pro"
+VISION_MODEL = "gemini/gemini-3.5-flash"
 
 SYSTEM_BIO = (
-    "Ты — интеллектуальный ассистент по биологии и микробиологии для студентки МГУ. "
-    "Отвечай строго по предоставленным фрагментам источников. "
+    "Ты — интеллектуальный ассистент по биологии и микробиологии для студентки 2 курса биофака МГУ. "
+    "Приоритет — предоставленные фрагменты источников. К фактам из источников добавляй провенанс в ТОЧНОМ формате: [src:SLUG#SEG | раздел: заголовок]. SLUG и SEG бери из заголовка фрагмента [N src:SLUG#SEG]. "
+    "Если в источниках нет ответа, используй свои знания по биологии, химии, биохимии — но явно укажи: «Из общих знаний:». "
     "Используй правильные латинские названия организмов. "
-    "К каждому факту добавляй провенанс в формате [источник: название | раздел: заголовок]. "
-    "Если ответа в источниках нет — скажи честно и не придумывай."
+    "Формулы пиши в LaTeX: инлайн $...$ и блочные $$...$$. "
+    "Отвечай развёрнуто, структурированно, на уровне университетского курса."
 )
 
 
 async def _rag_context(subject_slug: str, question: str, k: int = 8) -> list[dict]:
-    """Retrieve top-k relevant chunks from the subject's vector index."""
+    """Retrieve top-k relevant chunks from active sources across ALL subjects."""
     if not MKLIB_OK:
-        return []
-    db_path = subject_dir(subject_slug) / "index.db"
-    if not db_path.exists():
         return []
 
     def _fetch():
         vec = embed_query(question)
-        vdb = mk_open_db(db_path)
-        hits = db_search(vdb, "chunks", vec, k=k)
-        vdb.close()
-        return hits
+        all_hits = []
+        # Search across all subjects' indexes
+        db = get_db()
+        subjects = [r["slug"] for r in db.execute("SELECT slug FROM subjects").fetchall()]
+        db.close()
+        for subj_slug in subjects:
+            idx_path = subject_dir(subj_slug) / "index.db"
+            if not idx_path.exists():
+                continue
+            active = _active_slugs(subj_slug)
+            if not active:
+                continue
+            try:
+                vdb = mk_open_db(idx_path)
+                hits = db_search(vdb, "chunks", vec, k=k * 2)
+                vdb.close()
+                for h in hits:
+                    if h["slug"] in active:
+                        h["_subject"] = subj_slug
+                        all_hits.append(h)
+            except Exception:
+                pass
+        # Sort by score, prioritize current subject
+        all_hits.sort(key=lambda h: (-0.05 if h.get("_subject") == subject_slug else 0) - h["score"])
+        return all_hits[:k]
 
     try:
         return await asyncio.to_thread(_fetch)
@@ -581,7 +950,10 @@ def _build_messages(history: list[dict], question: str,
     if context_chunks:
         parts = []
         for i, h in enumerate(context_chunks, 1):
-            parts.append(f"[{i}] {h['text'][:600]}")
+            src_slug = h.get("slug", "")
+            seg_idx = h.get("segment", 0)
+            title = h.get("title", "")
+            parts.append(f"[{i} src:{src_slug}#{seg_idx}] «{title}»\n{h['text'][:600]}")
         ctx = "Фрагменты из источников:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_BIO}]
@@ -604,30 +976,32 @@ def _build_messages(history: list[dict], question: str,
 
 
 @app.get("/api/subjects/{slug}/chat/history")
-async def chat_history(slug: str, limit: int = 50,
+async def chat_history(slug: str, conversation_id: int = 0, limit: int = 50,
                         user: dict = Depends(current_user)):
     db = get_db()
     rows = db.execute(
         "SELECT role,content,created_at FROM chat_history "
-        "WHERE subject_slug=? AND user_id=? ORDER BY id DESC LIMIT ?",
-        (slug, int(user["sub"]), limit)
+        "WHERE subject_slug=? AND user_id=? AND conversation_id=? ORDER BY id DESC LIMIT ?",
+        (slug, int(user["sub"]), conversation_id, limit)
     ).fetchall()
     db.close()
     return list(reversed([dict(r) for r in rows]))
 
 
 @app.delete("/api/subjects/{slug}/chat/history")
-async def clear_chat_history(slug: str, user: dict = Depends(current_user)):
+async def clear_chat_history(slug: str, conversation_id: int = 0,
+                              user: dict = Depends(current_user)):
     db = get_db()
-    db.execute("DELETE FROM chat_history WHERE subject_slug=? AND user_id=?",
-               (slug, int(user["sub"])))
+    db.execute("DELETE FROM chat_history WHERE subject_slug=? AND user_id=? AND conversation_id=?",
+               (slug, int(user["sub"]), conversation_id))
     db.commit()
     db.close()
     return {"ok": True}
 
 
 @app.get("/api/subjects/{slug}/chat/stream")
-async def chat_stream(slug: str, q: str, user: dict = Depends(current_user),
+async def chat_stream(slug: str, q: str, conversation_id: int = 0,
+                       user: dict = Depends(current_user),
                        image: Optional[str] = None):
     if not TIMEWEB_API_KEY:
         raise HTTPException(503, "TIMEWEB_API_KEY не задан")
@@ -635,11 +1009,23 @@ async def chat_stream(slug: str, q: str, user: dict = Depends(current_user),
     uid = int(user["sub"])
     now = datetime.now(timezone.utc).isoformat()
 
+    # Auto-create conversation if needed
+    if conversation_id == 0:
+        db = get_db()
+        auto_title = q[:60] + ("…" if len(q) > 60 else "")
+        cur = db.execute(
+            "INSERT INTO conversations (subject_slug,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
+            (slug, uid, auto_title, now, now)
+        )
+        conversation_id = cur.lastrowid
+        db.commit()
+        db.close()
+
     db = get_db()
     history = [dict(r) for r in db.execute(
         "SELECT role,content FROM chat_history "
-        "WHERE subject_slug=? AND user_id=? ORDER BY id DESC LIMIT 20",
-        (slug, uid)
+        "WHERE subject_slug=? AND user_id=? AND conversation_id=? ORDER BY id DESC LIMIT 20",
+        (slug, uid, conversation_id)
     ).fetchall()]
     db.close()
     history = list(reversed(history))
@@ -682,18 +1068,23 @@ async def chat_stream(slug: str, q: str, user: dict = Depends(current_user),
             if answer_text:
                 save_db = get_db()
                 save_db.execute(
-                    "INSERT INTO chat_history (subject_slug,user_id,role,content,created_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (slug, uid, "user", q, now)
+                    "INSERT INTO chat_history (conversation_id,subject_slug,user_id,role,content,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (conversation_id, slug, uid, "user", q, now)
                 )
                 save_db.execute(
-                    "INSERT INTO chat_history (subject_slug,user_id,role,content,created_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (slug, uid, "assistant", answer_text,
+                    "INSERT INTO chat_history (conversation_id,subject_slug,user_id,role,content,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (conversation_id, slug, uid, "assistant", answer_text,
                      datetime.now(timezone.utc).isoformat())
+                )
+                save_db.execute(
+                    "UPDATE conversations SET updated_at=? WHERE id=?",
+                    (datetime.now(timezone.utc).isoformat(), conversation_id)
                 )
                 save_db.commit()
                 save_db.close()
+            yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream",
@@ -740,6 +1131,39 @@ async def create_ticket(slug: str, question: str = Form(),
     return {"ok": True, "id": ticket_id}
 
 
+@app.post("/api/subjects/{slug}/tickets/batch")
+async def batch_create_tickets(slug: str, questions: str = Form(),
+                                user: dict = Depends(current_user)):
+    """Пакетная загрузка вопросов — один вопрос на строку."""
+    db = get_db()
+    if not db.execute("SELECT id FROM subjects WHERE slug=?", (slug,)).fetchone():
+        db.close()
+        raise HTTPException(404, "Предмет не найден")
+    now = datetime.now(timezone.utc).isoformat()
+    lines = [q.strip() for q in questions.strip().split("\n") if q.strip()]
+    if not lines:
+        db.close()
+        raise HTTPException(400, "Список вопросов пуст")
+    # Remove numbering like "1. ", "1) ", "- "
+    import re as _re2
+    cleaned = []
+    for line in lines:
+        line = _re2.sub(r"^\d+[.)]\s*", "", line)
+        line = _re2.sub(r"^[-*]\s*", "", line)
+        if line:
+            cleaned.append(line)
+    ids = []
+    for q in cleaned:
+        cur = db.execute(
+            "INSERT INTO exam_tickets (subject_slug,question,status,created_at) VALUES (?,?,'pending',?)",
+            (slug, q, now)
+        )
+        ids.append(cur.lastrowid)
+    db.commit()
+    db.close()
+    return {"ok": True, "count": len(ids), "ids": ids}
+
+
 @app.put("/api/subjects/{slug}/tickets/{tid}")
 async def update_ticket(slug: str, tid: int, question: str = Form(),
                          user: dict = Depends(current_user)):
@@ -779,17 +1203,29 @@ async def generate_ticket_answer(slug: str, tid: int,
     context_chunks = await _rag_context(slug, question, k=10)
 
     system_prompt = (
-        "Ты — преподаватель биологии и микробиологии МГУ. "
-        "Напиши развёрнутый ответ на экзаменационный билет, используя ТОЛЬКО предоставленные источники. "
-        "Структурируй ответ: введение, основная часть с подзаголовками, заключение. "
-        "Используй правильные латинские названия. "
-        "Добавляй провенанс [источник | раздел] после каждого ключевого утверждения. "
-        "Объём: 300-600 слов."
+        "Ты — преподаватель университетского курса, готовишь студенту развёрнутый ответ на экзаменационный билет.\n\n"
+        "ФОРМАТ ОТВЕТА (строго следуй):\n"
+        "1. Начни с **определения** ключевого понятия (термин выделяй **жирным**)\n"
+        "2. Дай **классификацию** — нумерованные списки с подпунктами\n"
+        "3. Все формулы пиши в LaTeX: инлайн $...$ и блочные $$...$$\n"
+        "4. В нумерованных списках используй явные номера: 1. 2. 3. 4. (не повторяй 1.)\n"
+        "5. Если уместно — добавь таблицу в markdown (|столбец|столбец|)\n"
+        "6. Логика: определение → классификация → формулы/уравнения → вывод → следствия\n"
+        "7. Выделяй **ключевые термины** жирным при первом упоминании\n"
+        "7. Используй правильные латинские названия организмов\n"
+        "8. Добавляй провенанс в ТОЧНОМ формате [src:SLUG#SEG | раздел: заголовок] к фактам из источников. SLUG и SEG бери из заголовка фрагмента.\n"
+        "9. Если в источниках нет — используй общие знания, помечай «Из общих знаний:»\n"
+        "10. Объём: 400-800 слов, на уровне университетского курса\n"
     )
 
     ctx = ""
     if context_chunks:
-        parts = [f"[{i+1}] {h['text'][:800]}" for i, h in enumerate(context_chunks)]
+        parts = []
+        for i, h in enumerate(context_chunks):
+            src_slug = h.get("slug", "")
+            seg_idx = h.get("segment", 0)
+            title = h.get("title", "")
+            parts.append(f"[{i+1} src:{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
         ctx = "Источники:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
 
     async def generate():
@@ -839,28 +1275,227 @@ async def generate_ticket_answer(slug: str, tid: int,
                                       "X-Accel-Buffering": "no"})
 
 
+def _md_to_html(text: str) -> str:
+    """Convert markdown to HTML with support for tables, lists, bold, italic, code, formulas."""
+    if not text:
+        return ""
+    import html as _html
+    # Normalize block formulas and protect from escaping
+    text = re.sub(r"\$\$\s*\n([\s\S]*?)\n\s*\$\$", lambda m: "$$" + m.group(1).strip() + "$$", text)
+    _formulas: list[str] = []
+    def _save_formula(m):
+        _formulas.append(m.group(0))
+        return f"\x00F{len(_formulas)-1}\x00"
+    text = re.sub(r"\$\$[^$]+\$\$", _save_formula, text)
+    text = re.sub(r"\$[^$\n]+\$", _save_formula, text)
+    lines = text.split("\n")
+    out = []
+    in_table = False
+    in_list = False
+    list_type = ""
+    for line in lines:
+        stripped = line.strip()
+        # Table
+        if "|" in stripped and stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.split("|")[1:-1]]
+            if all(set(c) <= set("- :") for c in cells):
+                continue  # separator row
+            if not in_table:
+                in_table = True
+                out.append("<table>")
+                tag = "th"
+            else:
+                tag = "td"
+            out.append("<tr>" + "".join(f"<{tag}>{_html.escape(c)}</{tag}>" for c in cells) + "</tr>")
+            continue
+        if in_table:
+            in_table = False
+            out.append("</table>")
+        # Headings
+        if stripped.startswith("### "):
+            if in_list:
+                out.append(f"</{list_type}>"); in_list = False
+            out.append(f"<h3>{_html.escape(stripped[4:])}</h3>")
+            continue
+        if stripped.startswith("## "):
+            if in_list:
+                out.append(f"</{list_type}>"); in_list = False
+            out.append(f"<h2>{_html.escape(stripped[3:])}</h2>")
+            continue
+        if stripped.startswith("# "):
+            if in_list:
+                out.append(f"</{list_type}>"); in_list = False
+            out.append(f"<h2>{_html.escape(stripped[2:])}</h2>")
+            continue
+        # Numbered list
+        if re.match(r"^\d+\.\s", stripped):
+            if not in_list or list_type != "ol":
+                if in_list:
+                    out.append(f"</{list_type}>")
+                out.append("<ol>"); in_list = True; list_type = "ol"
+            content = re.sub(r"^\d+\.\s+", "", stripped)
+            out.append(f"<li>{_html.escape(content)}</li>")
+            continue
+        # Bullet list
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            if not in_list or list_type != "ul":
+                if in_list:
+                    out.append(f"</{list_type}>")
+                out.append("<ul>"); in_list = True; list_type = "ul"
+            out.append(f"<li>{_html.escape(stripped[2:])}</li>")
+            continue
+        # Close list if not continuing
+        if in_list and stripped:
+            out.append(f"</{list_type}>"); in_list = False
+        # Empty line
+        if not stripped:
+            continue
+        # Paragraph
+        out.append(f"<p>{_html.escape(stripped)}</p>")
+    if in_list:
+        out.append(f"</{list_type}>")
+    if in_table:
+        out.append("</table>")
+    result = "\n".join(out)
+    # Inline formatting (on the HTML)
+    result = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", result)
+    result = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", result)
+    result = re.sub(r"`([^`]+)`", r"<code>\1</code>", result)
+    result = re.sub(r"\[src:[a-z0-9а-яё\-]+#\d+\s*\|\s*([^\]]+)\]",
+                    r'<span style="color:#60a5fa;font-size:.85em">[📖 \1]</span>', result, flags=re.IGNORECASE)
+    result = re.sub(r"\[([^\]]+)\]", r'<span style="color:#60a5fa;font-size:.85em">[\1]</span>', result)
+    # Restore formulas — block formulas get centered div
+    def _restore(m):
+        f = _formulas[int(m.group(1))]
+        if f.startswith("$$"):
+            return f'<div style="text-align:center;margin:.8em 0">{f}</div>'
+        return f
+    result = re.sub(r"\x00F(\d+)\x00", _restore, result)
+    return result
+
+
+TICKET_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{{delimiters:[{{left:'$$',right:'$$',display:true}},{{left:'$',right:'$',display:false}},{{left:'\\(',right:'\\)',display:false}},{{left:'\\[',right:'\\]',display:true}}],throwOnError:false}})"></script>
+<style>
+:root{{--bg:#0f0f1a;--fg:#e8e8f0;--muted:#8888a0;--accent:#60a5fa;--border:rgba(255,255,255,0.12);
+  --glass-bg:rgba(255,255,255,0.06);--card-bg:rgba(255,255,255,0.08);--card-border:rgba(255,255,255,0.15)}}
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,'SF Pro Display','Inter',system-ui,sans-serif;background:linear-gradient(135deg,#0f0f1a,#1a1a2e,#16213e);
+  color:var(--fg);line-height:1.7;min-height:100vh;-webkit-font-smoothing:antialiased}}
+body::before{{content:'';position:fixed;width:500px;height:500px;top:-10%;left:-5%;border-radius:50%;
+  filter:blur(120px);opacity:0.4;z-index:-1;pointer-events:none;
+  background:radial-gradient(circle,rgba(96,165,250,0.3),transparent 70%)}}
+.container{{max-width:820px;margin:0 auto;padding:2.5rem 1.5rem}}
+h1{{font-size:1.5rem;font-weight:700;letter-spacing:-0.03em;margin-bottom:0.5rem}}
+.subtitle{{color:var(--muted);font-size:.85rem;margin-bottom:2rem}}
+.ticket{{background:var(--card-bg);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border:1px solid var(--card-border);border-radius:16px;padding:1.5rem 2rem;margin-bottom:1.5rem;
+  box-shadow:0 8px 32px rgba(0,0,0,0.3);position:relative;overflow:hidden;page-break-inside:avoid}}
+.ticket::before{{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent 10%,rgba(255,255,255,0.15) 50%,transparent 90%)}}
+.ticket-num{{font-size:.75rem;font-weight:600;color:var(--accent);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.3rem}}
+.ticket-q{{font-size:1.1rem;font-weight:600;margin-bottom:1rem;padding-bottom:.75rem;border-bottom:1px solid var(--border)}}
+.ticket-body{{font-size:.93rem;line-height:1.8}}
+.ticket-body h2{{font-size:1rem;font-weight:600;margin:1.5rem 0 .5rem;color:var(--accent)}}
+.ticket-body h3{{font-size:.93rem;font-weight:600;margin:1.2rem 0 .4rem}}
+.ticket-body p{{margin-bottom:.7rem}}
+.ticket-body strong{{color:#fff}}
+.ticket-body table{{width:100%;border-collapse:collapse;margin:.8rem 0;font-size:.88rem}}
+.ticket-body th,.ticket-body td{{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--border)}}
+.ticket-body th{{font-weight:600;font-size:.76rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}}
+.ticket-body ul,.ticket-body ol{{margin:.5rem 0 .5rem 1.5rem}}
+.ticket-body li{{margin-bottom:.3rem}}
+.ticket-body code{{font-family:'JetBrains Mono',monospace;font-size:.82rem;background:rgba(255,255,255,0.08);
+  padding:.1rem .4rem;border-radius:6px}}
+.footer{{margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border);font-size:.78rem;color:var(--muted)}}
+@media print{{body{{background:#fff;color:#1a1a2e}}body::before{{display:none}}
+  .ticket{{background:#fff;border:1px solid #ddd;box-shadow:none}}
+  .ticket::before{{display:none}}.ticket-body h2{{color:#2563eb}}
+  .ticket-body strong{{color:#000}}.footer{{color:#888}}}}
+@media(max-width:640px){{.container{{padding:1.5rem 1rem}}.ticket{{padding:1.2rem 1.2rem}}}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>{title}</h1>
+<div class="subtitle">{subtitle}</div>
+{tickets_html}
+<div class="footer">StudyLab · study.24pensi.ru · Сгенерировано {date}</div>
+</div>
+</body>
+</html>"""
+
+
 @app.get("/api/subjects/{slug}/tickets/export")
-async def export_tickets(slug: str, user: dict = Depends(current_user)):
+async def export_tickets_html(slug: str, user: dict = Depends(current_user)):
     db = get_db()
     rows = db.execute(
         "SELECT * FROM exam_tickets WHERE subject_slug=? ORDER BY id", (slug,)
     ).fetchall()
+    subject_row = db.execute("SELECT title FROM subjects WHERE slug=?", (slug,)).fetchone()
     db.close()
-    subject_row = get_db().execute(
-        "SELECT title FROM subjects WHERE slug=?", (slug,)
-    ).fetchone()
     title = subject_row["title"] if subject_row else slug
 
-    lines = [f"# Экзаменационные билеты: {title}\n"]
+    tickets_html = []
     for i, r in enumerate(rows, 1):
-        lines.append(f"\n## Билет {i}: {r['question']}\n")
-        if r["answer"]:
-            lines.append(r["answer"])
-        else:
-            lines.append("_(ответ не сгенерирован)_")
-    text = "\n".join(lines)
-    return Response(text, media_type="text/plain; charset=utf-8",
-                    headers={"Content-Disposition": f'attachment; filename="tickets_{slug}.txt"'})
+        answer_html = _md_to_html(r["answer"]) if r["answer"] else "<p><em>Ответ не сгенерирован</em></p>"
+        tickets_html.append(
+            f'<div class="ticket">'
+            f'<div class="ticket-num">Билет {i}</div>'
+            f'<div class="ticket-q">{r["question"]}</div>'
+            f'<div class="ticket-body">{answer_html}</div>'
+            f'</div>'
+        )
+
+    now = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
+    html = TICKET_HTML_TEMPLATE.format(
+        title=f"Билеты: {title}",
+        subtitle=f"{len(rows)} вопросов · {title}",
+        tickets_html="\n".join(tickets_html),
+        date=now
+    )
+    return HTMLResponse(html, headers={
+        "Content-Disposition": f'attachment; filename="tickets_{slug}.html"'
+    })
+
+
+@app.get("/api/subjects/{slug}/tickets/{tid}/export")
+async def export_single_ticket(slug: str, tid: int, user: dict = Depends(current_user)):
+    db = get_db()
+    row = db.execute("SELECT * FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)).fetchone()
+    subject_row = db.execute("SELECT title FROM subjects WHERE slug=?", (slug,)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Билет не найден")
+    title = subject_row["title"] if subject_row else slug
+
+    answer_html = _md_to_html(row["answer"]) if row["answer"] else "<p><em>Ответ не сгенерирован</em></p>"
+    ticket_html = (
+        f'<div class="ticket">'
+        f'<div class="ticket-num">Билет</div>'
+        f'<div class="ticket-q">{row["question"]}</div>'
+        f'<div class="ticket-body">{answer_html}</div>'
+        f'</div>'
+    )
+
+    now = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
+    html = TICKET_HTML_TEMPLATE.format(
+        title=row["question"],
+        subtitle=title,
+        tickets_html=ticket_html,
+        date=now
+    )
+    return HTMLResponse(html, headers={
+        "Content-Disposition": f'attachment; filename="ticket_{tid}.html"'
+    })
 
 
 # ─── Stage 7 additions ────────────────────────────────────────────────
@@ -884,12 +1519,27 @@ async def ocr_image(slug: str, file: UploadFile = File(),
         resp = await client.post(
             TIMEWEB_URL,
             headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
-            json={"model": CHAT_MODEL, "messages": messages,
+            json={"model": VISION_MODEL, "messages": messages,
                   "stream": False, "max_tokens": 2048, "temperature": 0.1}
         )
         resp.raise_for_status()
         text = resp.json()["choices"][0]["message"]["content"]
     return {"text": text}
+
+
+# ─── Static media (images from converted documents) ──────────────────
+
+from fastapi.responses import FileResponse
+import mimetypes
+
+@app.get("/api/subjects/{slug}/media/{src_slug}/{path:path}")
+async def serve_media(slug: str, src_slug: str, path: str,
+                       user: dict = Depends(current_user)):
+    file_path = subject_dir(slug) / "md" / src_slug / path
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(404, "Файл не найден")
+    mime, _ = mimetypes.guess_type(str(file_path))
+    return FileResponse(file_path, media_type=mime or "application/octet-stream")
 
 
 # ─── ROUTES END ────────────────────────────────────────────────────────
@@ -908,6 +1558,9 @@ HTML_SPA = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>StudyLab</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -1011,6 +1664,18 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .reader-content p{margin-bottom:.875em}
 .reader-content code{background:var(--glass2);padding:2px 6px;border-radius:4px;font-size:.875em}
 .reader-content pre{background:var(--glass2);padding:14px;border-radius:10px;overflow-x:auto;margin:1em 0}
+.conv-sidebar{width:260px;border-right:1px solid var(--border);display:flex;flex-direction:column;
+  background:rgba(6,6,16,.5);flex-shrink:0}
+.conv-item{padding:10px 14px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.04);
+  display:flex;align-items:center;gap:8px;transition:background .15s;position:relative}
+.conv-item:hover{background:rgba(255,255,255,.04)}
+.conv-item.active{background:rgba(129,140,248,.12)}
+.conv-title{flex:1;font-size:.8125rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv-date{font-size:.7rem;color:var(--dim);flex-shrink:0}
+.conv-del{background:none;border:none;color:var(--dim);cursor:pointer;font-size:.75rem;
+  padding:2px 4px;opacity:0;transition:opacity .15s;flex-shrink:0}
+.conv-item:hover .conv-del{opacity:1}
+.conv-del:hover{color:var(--red)}
 .chat-layout{display:flex;flex-direction:column;height:calc(100vh - 56px)}
 .chat-messages{flex:1;overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column;gap:16px}
 .msg{display:flex;gap:12px;max-width:820px}
@@ -1026,6 +1691,7 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .msg-bubble code{background:rgba(255,255,255,.1);padding:1px 5px;border-radius:3px;font-size:.875em}
 .msg-bubble h2,.msg-bubble h3{margin:.75em 0 .3em;font-size:1em;font-weight:600}
 .prov{font-size:.78em;color:var(--accent);opacity:.75}
+.math-block{text-align:center;margin:.8em 0;font-size:1.1em}
 .chat-input-area{padding:14px 24px 18px;border-top:1px solid var(--border);
   background:rgba(6,6,16,.7);backdrop-filter:blur(12px)}
 .chat-input-row{display:flex;gap:8px;align-items:flex-end}
@@ -1075,6 +1741,7 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
   .reader-sidebar{position:static;height:auto;border-right:none;border-bottom:1px solid var(--border);max-height:260px}
   .page{padding:20px 16px}
   .navbar{padding:0 16px;gap:8px}
+  .conv-sidebar{width:200px}
   .chat-messages{padding:14px 16px}
   .chat-input-area{padding:12px 16px 16px}
   .reader-content{padding:20px 18px}
@@ -1089,7 +1756,7 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 </div>
 <script>
 // ── State ──────────────────────────────────────────────────────────────
-const S = { user: null, chatES: null, pendingImg: null };
+const S = { user: null, chatES: null, pendingImg: null, chatConvId: 0 };
 
 // ── Toast ──────────────────────────────────────────────────────────────
 function toast(msg, type) {
@@ -1122,22 +1789,88 @@ function esc(s) {
 // ── Simple markdown → HTML ─────────────────────────────────────────────
 function md(text) {
   if (!text) return '';
-  let h = esc(text);
+  // Normalize block formulas: $$ on separate lines → single line $$...$$
+  var t = text.replace(/\$\$\s*\n([\s\S]*?)\n\s*\$\$/g, function(_, body) {
+    return '$$' + body.trim() + '$$';
+  });
+  // Protect LaTeX formulas from escaping
+  var formulas = [];
+  t = t.replace(/\$\$[^$]+\$\$/g, function(m) { formulas.push(m); return '\x00F' + (formulas.length - 1) + '\x00'; });
+  t = t.replace(/\$[^$\n]+\$/g, function(m) { formulas.push(m); return '\x00F' + (formulas.length - 1) + '\x00'; });
+  // Parse tables before escaping (protect cell content)
+  var tables = [];
+  t = t.replace(/((?:^\|.+\|$\n?){2,})/gm, function(block) {
+    var rows = block.trim().split('\n');
+    var html = '<table>';
+    var isFirst = true;
+    for (var ri = 0; ri < rows.length; ri++) {
+      var row = rows[ri].trim();
+      if (!row.startsWith('|')) continue;
+      var cells = row.split('|').slice(1, -1);
+      if (cells.every(function(c) { return /^[\s\-:]+$/.test(c); })) continue; // separator
+      var tag = isFirst ? 'th' : 'td';
+      html += '<tr>' + cells.map(function(c) { return '<' + tag + '>' + esc(c.trim()) + '</' + tag + '>'; }).join('') + '</tr>';
+      isFirst = false;
+    }
+    html += '</table>';
+    tables.push(html);
+    return '\x00T' + (tables.length - 1) + '\x00';
+  });
+  var h = esc(t);
   h = h.replace(/^### (.+)$/gm, '<h3>$1</h3>');
   h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
   h = h.replace(/^# (.+)$/gm, '<h2>$1</h2>');
   h = h.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
   h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Provenance links: [src:SLUG#SEG | раздел: Title] → clickable link to reader
+  h = h.replace(/\[src:([a-z0-9а-яё\-]+)#(\d+)\s*\|\s*([^\]]+)\]/gi, function(_, srcSlug, seg, rest) {
+    var subjectSlug = (location.hash.match(/\/(chat|tickets|subject|reader)\/([^/]+)/) || [])[2] || '';
+    return '<a href="#/reader/' + subjectSlug + '?src=' + srcSlug + '&seg=' + seg + '" class="prov" title="Открыть в читалке" style="cursor:pointer">[📖 ' + rest.trim() + ']</a>';
+  });
   h = h.replace(/\[([^\]]+)\]/g, '<span class="prov">[$1]</span>');
+  // Convert numbered lists with explicit numbers
+  h = h.replace(/^(\d+)\.\s+(.+)$/gm, function(_, num, content) {
+    return '<li value="' + num + '">' + content + '</li>';
+  });
+  h = h.replace(/((?:<li[^>]*>.*?<\/li>\n?)+)/g, '<ol>$1</ol>');
+  // Bullet lists
+  h = h.replace(/^[-*]\s+(.+)$/gm, '<li>$1</li>');
+  h = h.replace(/((?:<li>.*?<\/li>\n?)+)/g, function(m) {
+    if (m.includes('value=')) return m;
+    return '<ul>' + m + '</ul>';
+  });
   h = h.replace(/\n\n+/g, '</p><p>');
   h = h.replace(/\n/g, '<br>');
+  // Restore tables
+  h = h.replace(/\x00T(\d+)\x00/g, function(_, i) { return '</p>' + tables[parseInt(i)] + '<p>'; });
+  // Restore formulas — block formulas get their own div
+  h = h.replace(/\x00F(\d+)\x00/g, function(_, i) {
+    var f = formulas[parseInt(i)];
+    if (f.startsWith('$$')) return '</p><div class="math-block">' + f + '</div><p>';
+    return f;
+  });
+  h = h.replace(/<p>\s*<\/p>/g, '');
   return '<p>' + h + '</p>';
+}
+function renderMath(el) {
+  if (!el || typeof renderMathInElement !== 'function') return;
+  try {
+    renderMathInElement(el, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false},
+        {left: '\\(', right: '\\)', display: false},
+        {left: '\\[', right: '\\]', display: true}
+      ],
+      throwOnError: false
+    });
+  } catch(e) {}
 }
 
 // ── Router ─────────────────────────────────────────────────────────────
 function route() {
-  const hash = location.hash.slice(1) || '/login';
+  const hash = (location.hash.slice(1) || '/login').split('?')[0];
   const parts = hash.split('/').filter(Boolean);
   const view = parts[0] || 'login';
   const slug = parts[1] || '';
@@ -1179,8 +1912,75 @@ function updateNav(view, slug) {
     '<div class="nav-user">' +
     '<span>' + esc(S.user ? S.user.username : '') + '</span>' +
     '<span class="badge badge-blue" style="font-size:.7rem">' + esc(S.user ? S.user.role : '') + '</span>' +
+    (S.user && S.user.role !== 'admin' ? '<button class="btn btn-ghost btn-sm" onclick="showPasswordReset()" title="Сменить пароль">🔑</button>' : '') +
     '<button class="btn btn-ghost btn-sm" onclick="doLogout()">Выйти</button>' +
     '</div>';
+}
+
+async function showPasswordReset() {
+  // Check status first
+  var r = await api('/api/password-reset-status');
+  var st = await r.json();
+  if (st.has_pending) {
+    toast('Запрос уже отправлен. Ожидайте подтверждения администратора.', 'info');
+    return;
+  }
+  if (st.status === 'approved') {
+    showSetNewPassword();
+    return;
+  }
+  var ov = document.createElement('div');
+  ov.className = 'modal-overlay';
+  ov.innerHTML =
+    '<div class="glass modal">' +
+    '<div class="modal-title">Смена пароля</div>' +
+    '<p class="text-sm text-muted" style="margin-bottom:16px">Запрос на смену пароля будет отправлен администратору на почту. После подтверждения вы сможете установить новый пароль.</p>' +
+    '<div class="flex gap">' +
+    '<button class="btn btn-ghost" id="pr-cancel">Отмена</button>' +
+    '<button class="btn btn-primary" id="pr-send">Отправить запрос</button>' +
+    '</div></div>';
+  document.body.appendChild(ov);
+  ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+  document.getElementById('pr-cancel').addEventListener('click', function() { ov.remove(); });
+  document.getElementById('pr-send').addEventListener('click', async function() {
+    var r2 = await api('/api/request-password-reset', {method:'POST'});
+    if (r2.ok) { toast('Запрос отправлен администратору', 'success'); }
+    else { var err = await r2.json(); toast(err.detail || 'Ошибка', 'error'); }
+    ov.remove();
+  });
+}
+
+function showSetNewPassword() {
+  var ov = document.createElement('div');
+  ov.className = 'modal-overlay';
+  ov.innerHTML =
+    '<div class="glass modal">' +
+    '<div class="modal-title">Установка нового пароля</div>' +
+    '<p class="text-sm" style="color:var(--green);margin-bottom:16px">Администратор одобрил смену пароля</p>' +
+    '<form id="new-pw-form">' +
+    '<div class="form-group"><label class="form-label">Новый пароль</label>' +
+    '<input type="password" id="new-pw" placeholder="Минимум 8 символов, заглавная, спецсимвол"></div>' +
+    '<div class="form-group"><label class="form-label">Повторите пароль</label>' +
+    '<input type="password" id="new-pw2"></div>' +
+    '<div id="pw-err" class="form-error hidden"></div>' +
+    '<div class="flex gap" style="margin-top:8px">' +
+    '<button type="button" class="btn btn-ghost" id="pw-cancel">Отмена</button>' +
+    '<button type="submit" class="btn btn-primary">Сохранить</button>' +
+    '</div></form></div>';
+  document.body.appendChild(ov);
+  ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+  document.getElementById('pw-cancel').addEventListener('click', function() { ov.remove(); });
+  document.getElementById('new-pw-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var pw = document.getElementById('new-pw').value;
+    var pw2 = document.getElementById('new-pw2').value;
+    var errEl = document.getElementById('pw-err');
+    if (pw !== pw2) { errEl.textContent = 'Пароли не совпадают'; errEl.classList.remove('hidden'); return; }
+    var fd = new FormData(); fd.append('new_password', pw);
+    var r = await api('/api/set-new-password', {method:'POST', body:fd});
+    if (r.ok) { toast('Пароль изменён', 'success'); ov.remove(); }
+    else { var err = await r.json(); errEl.textContent = err.detail || 'Ошибка'; errEl.classList.remove('hidden'); }
+  });
 }
 
 async function doLogout() {
@@ -1203,7 +2003,13 @@ function vLogin(main) {
     '<input type="password" id="p" autocomplete="current-password"></div>' +
     '<div id="lerr" class="form-error hidden"></div>' +
     '<button type="submit" class="btn btn-primary" style="width:100%;margin-top:8px;justify-content:center">Войти</button>' +
-    '</form></div></div>';
+    '</form>' +
+    '<div style="text-align:center;margin-top:16px">' +
+    '<button class="btn btn-ghost btn-sm" style="font-size:.8rem;color:var(--muted)" id="btn-forgot">Забыла пароль</button>' +
+    '</div></div></div>';
+  document.getElementById('btn-forgot').addEventListener('click', function() {
+    toast('Войдите в аккаунт, затем запросите смену пароля в меню', 'info');
+  });
   document.getElementById('login-form').addEventListener('submit', async function(e) {
     e.preventDefault();
     const fd = new FormData();
@@ -1253,12 +2059,12 @@ async function vDashboard(main) {
       return;
     }
     grid.innerHTML = list.map(function(s) {
-      const pct = s.source_count ? Math.round(s.indexed_count / s.source_count * 100) : 0;
+      const pct = s.source_count ? Math.round(s.active_count / s.source_count * 100) : 0;
       return '<div class="glass subject-card" onclick="location.hash=\'#/subject/' + s.slug + '\'">' +
-        '<div class="card-title">' + esc(s.title) + '</div>' +
+        '<div class="card-title">' + esc(s.title) + (s.year ? ' <span class="badge badge-blue" style="font-size:.65rem;vertical-align:middle">' + s.year + ' курс</span>' : '') + '</div>' +
         '<div class="card-meta">' + s.source_count + ' источников · ' + s.total_chunks + ' чанков</div>' +
         '<div class="progress"><div class="progress-bar" style="width:' + pct + '%"></div></div>' +
-        '<div class="card-meta" style="margin-top:6px">' + s.indexed_count + '/' + s.source_count + ' проиндексировано</div>' +
+        '<div class="card-meta" style="margin-top:6px">' + s.active_count + '/' + s.source_count + ' активных</div>' +
         '</div>';
     }).join('');
   } catch(e) { toast('Ошибка загрузки', 'error'); }
@@ -1275,6 +2081,8 @@ function showAddSubject() {
     '<input type="text" id="ns-title" placeholder="Микробиология" required></div>' +
     '<div class="form-group"><label class="form-label">Описание</label>' +
     '<textarea id="ns-desc" rows="2" placeholder="Краткое описание…"></textarea></div>' +
+    '<div class="form-group"><label class="form-label">Курс</label>' +
+    '<select id="ns-year" style="padding:8px 12px"><option value="0">—</option><option value="1">1 курс</option><option value="2">2 курс</option><option value="3">3 курс</option><option value="4">4 курс</option><option value="5">5 курс</option><option value="6">6 курс</option></select></div>' +
     '<div class="flex gap" style="margin-top:4px">' +
     '<button type="button" class="btn btn-ghost" id="ns-cancel">Отмена</button>' +
     '<button type="submit" class="btn btn-primary">Создать</button>' +
@@ -1287,6 +2095,7 @@ function showAddSubject() {
     const fd = new FormData();
     fd.append('title', document.getElementById('ns-title').value);
     fd.append('description', document.getElementById('ns-desc').value);
+    fd.append('year', document.getElementById('ns-year').value);
     const r = await api('/api/subjects', {method:'POST', body:fd});
     if (r.ok) {
       toast('Предмет создан', 'success');
@@ -1388,7 +2197,7 @@ async function loadSources(slug) {
     html += '</div>';
     el.innerHTML = html;
     if (isAdmin) setupDrop(slug);
-    if (srcs.some(function(s) { return s.status === 'pending' || s.status === 'processing'; })) {
+    if (srcs.some(function(s) { return s.status.startsWith('indexing'); })) {
       setTimeout(function() { loadSources(slug); }, 3000);
     }
   } catch(e) { el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>'; }
@@ -1397,20 +2206,60 @@ async function loadSources(slug) {
 function renderSrc(s, slug, isAdmin) {
   const extIcon = {pdf:'📄', docx:'📝', doc:'📝', txt:'📄', md:'📋'};
   const ext = (s.original_name || '').split('.').pop().toLowerCase();
-  const statusBadge = {
-    indexed: '<span class="badge badge-green">✓ готов</span>',
-    processing: '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> обработка</span>',
-    error: '<span class="badge badge-red">⚠ ошибка</span>',
-    pending: '<span class="badge badge-blue">⏳ ожидание</span>'
-  }[s.status] || '<span class="badge badge-blue">' + esc(s.status) + '</span>';
+  var statusBadge;
+  if (s.status.startsWith('indexing:')) {
+    var parts = s.status.split(':')[1].split(' ');
+    var phase = parts[0];
+    var phaseLabel = {convert:'конвертация',segment:'сегментация',embed:'эмбеддинг'}[phase] || phase;
+    if (phase === 'embed' && parts[1]) {
+      var nums = parts[1].split('/');
+      var done = parseInt(nums[0]) || 0;
+      var total = parseInt(nums[1]) || 1;
+      var pct = Math.round(done / total * 100);
+      statusBadge = '<span class="badge badge-yellow" style="display:inline-flex;align-items:center;gap:6px;min-width:140px">' +
+        '<span class="spinner" style="width:10px;height:10px"></span>' +
+        '<span style="flex:1"><div class="progress" style="margin:0;height:6px;background:rgba(255,255,255,.1)"><div class="progress-bar" style="width:' + pct + '%;background:var(--yellow)"></div></div></span>' +
+        '<span style="font-size:.7rem">' + done + '/' + total + '</span></span>';
+    } else {
+      statusBadge = '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> ' + phaseLabel + '</span>';
+    }
+  } else {
+    statusBadge = {
+      uploaded: '<span class="badge badge-blue">📥 загружен</span>',
+      indexing: '<span class="badge badge-yellow"><span class="spinner" style="width:10px;height:10px"></span> индексация</span>',
+      indexed: '<span class="badge badge-blue">🔍 проиндексирован</span>',
+      active: '<span class="badge badge-green">✓ активен</span>',
+      inactive: '<span class="badge" style="background:rgba(255,255,255,.08);color:var(--dim)">⏸ отключён</span>',
+      error: '<span class="badge badge-red">⚠ ошибка</span>'
+    }[s.status] || '<span class="badge badge-blue">' + esc(s.status) + '</span>';
+  }
+  var actions = '';
+  if (isAdmin) {
+    if (s.status === 'uploaded' || s.status === 'error') {
+      actions += '<button class="btn btn-primary btn-sm" onclick="srcAction(\'' + slug + '\',\'' + s.slug + '\',\'index\')">⚡ Индексировать</button>';
+    }
+    if (s.status === 'indexed' || s.status === 'inactive') {
+      actions += '<button class="btn btn-primary btn-sm" onclick="srcAction(\'' + slug + '\',\'' + s.slug + '\',\'activate\')">▶ Активировать</button>';
+    }
+    if (s.status === 'active') {
+      actions += '<button class="btn btn-ghost btn-sm" onclick="srcAction(\'' + slug + '\',\'' + s.slug + '\',\'deactivate\')">⏸ Отключить</button>';
+    }
+    if (s.status === 'indexed' || s.status === 'inactive' || s.status === 'active') {
+      actions += '<button class="btn btn-ghost btn-sm" onclick="srcAction(\'' + slug + '\',\'' + s.slug + '\',\'index\')" title="Переиндексировать">🔄</button>';
+    }
+    actions += '<button class="btn btn-ghost btn-sm" onclick="renameSrc(\'' + slug + '\',\'' + s.slug + '\',\'' + esc(s.title).replace(/'/g,'\\&#39;') + '\')" title="Переименовать">✏️</button>';
+    actions += '<button class="btn btn-danger btn-sm" onclick="delSrc(\'' + slug + '\',\'' + s.slug + '\')" title="Удалить">✕</button>';
+  }
+  var readerLink = (s.status === 'active' || s.status === 'indexed' || s.status === 'inactive') ?
+    '<a href="#/reader/' + slug + '" class="btn btn-ghost btn-sm" title="Открыть в читалке" style="text-decoration:none">📖</a>' : '';
   return '<div class="glass2 source-item" id="si-' + s.slug + '">' +
     '<div class="source-icon">' + (extIcon[ext] || '📄') + '</div>' +
     '<div class="source-info">' +
     '<div class="source-name">' + esc(s.title) + '</div>' +
-    '<div class="source-meta">' + esc(s.original_name) + ' · ' + s.chunk_count + ' чанков</div>' +
+    '<div class="source-meta">' + esc(s.original_name) + (s.chunk_count ? ' · ' + s.chunk_count + ' чанков' : '') + '</div>' +
     '</div>' +
-    statusBadge +
-    (isAdmin ? '<button class="btn btn-danger btn-sm" onclick="delSrc(\'' + slug + '\',\'' + s.slug + '\')">✕</button>' : '') +
+    statusBadge + readerLink +
+    '<div class="flex gap" style="flex-shrink:0">' + actions + '</div>' +
     '</div>';
 }
 
@@ -1431,22 +2280,59 @@ async function uploadFiles(slug, files) {
     const fd = new FormData();
     fd.append('file', file);
     fd.append('title', file.name.replace(/\.[^.]+$/, ''));
-    toast('Загрузка: ' + file.name + '…', 'info');
+    // Show upload progress bar
+    var progEl = document.createElement('div');
+    progEl.className = 'toast toast-info';
+    progEl.style.minWidth = '240px';
+    progEl.innerHTML = '<div style="margin-bottom:4px;font-size:.8125rem">' + esc(file.name) + '</div>' +
+      '<div class="progress" style="height:6px;margin:0"><div class="progress-bar" id="up-prog-' + i + '" style="width:0%"></div></div>';
+    document.getElementById('toasts').appendChild(progEl);
     try {
-      const r = await api('/api/subjects/' + slug + '/upload', {method:'POST', body:fd});
-      if (r.ok) {
-        toast(file.name + ' загружен, индексирование…', 'success');
-        setTimeout(function() { loadSources(slug); }, 600);
+      var xhr = new XMLHttpRequest();
+      await new Promise(function(resolve, reject) {
+        xhr.upload.onprogress = function(e) {
+          if (e.lengthComputable) {
+            var pct = Math.round(e.loaded / e.total * 100);
+            var bar = document.getElementById('up-prog-' + i);
+            if (bar) bar.style.width = pct + '%';
+          }
+        };
+        xhr.onload = function() { resolve(); };
+        xhr.onerror = function() { reject(new Error('Ошибка сети')); };
+        xhr.open('POST', '/api/subjects/' + slug + '/upload');
+        xhr.withCredentials = true;
+        xhr.send(fd);
+      });
+      progEl.remove();
+      if (xhr.status === 200) {
+        toast(file.name + ' загружен', 'success');
+        loadSources(slug);
       } else {
-        const err = await r.json();
-        toast(err.detail || 'Ошибка загрузки', 'error');
+        try { var err = JSON.parse(xhr.responseText); toast(err.detail || 'Ошибка', 'error'); }
+        catch(e2) { toast('Ошибка загрузки', 'error'); }
       }
-    } catch(e) { toast('Ошибка сети', 'error'); }
+    } catch(e) { progEl.remove(); toast('Ошибка сети', 'error'); }
   }
 }
 
+async function srcAction(slug, srcSlug, action) {
+  const labels = {index:'Индексация запущена', activate:'Источник активирован', deactivate:'Источник отключён'};
+  const r = await api('/api/subjects/' + slug + '/sources/' + srcSlug + '/' + action, {method:'POST'});
+  if (r.ok) { toast(labels[action] || 'Готово', 'success'); loadSources(slug); }
+  else { const err = await r.json(); toast(err.detail || 'Ошибка', 'error'); }
+}
+
+async function renameSrc(slug, srcSlug, currentTitle) {
+  var newTitle = prompt('Новое название:', currentTitle);
+  if (!newTitle || newTitle === currentTitle) return;
+  var fd = new FormData(); fd.append('title', newTitle);
+  var r = await api('/api/subjects/' + slug + '/sources/' + srcSlug + '/rename', {method:'PUT', body:fd});
+  if (r.ok) { toast('Переименовано', 'success'); loadSources(slug); }
+  else { var err = await r.json(); toast(err.detail || 'Ошибка', 'error'); }
+}
+
 async function delSrc(slug, srcSlug) {
-  if (!confirm('Удалить источник и его индекс?')) return;
+  if (!confirm('Удалить источник, файл и индекс с сервера?')) return;
   const r = await api('/api/subjects/' + slug + '/sources/' + srcSlug, {method:'DELETE'});
   if (r.ok) { toast('Источник удалён', 'success'); loadSources(slug); }
   else toast('Ошибка удаления', 'error');
@@ -1475,13 +2361,24 @@ async function vReader(main, slug) {
       const src = segs[srcSlug];
       html += '<div class="toc-group-label">' + esc(src.title || srcSlug) + '</div>';
       (src.segments || []).forEach(function(seg) {
-        html += '<div class="toc-item" onclick="loadSeg(\'' + slug + '\',\'' + srcSlug + '\',' + seg.index + ',this)">' +
+        html += '<div class="toc-item" data-src="' + srcSlug + '" data-seg="' + seg.index + '" onclick="loadSeg(\'' + slug + '\',\'' + srcSlug + '\',' + seg.index + ',this)">' +
           '<span class="toc-num">' + (seg.index + 1) + '</span>' +
           '<span>' + esc(seg.title) + '</span>' +
           '</div>';
       });
     }
     toc.innerHTML = html;
+    // Auto-open segment from query params: ?src=SLUG&seg=N
+    var qm = location.hash.indexOf('?');
+    if (qm > -1) {
+      var params = new URLSearchParams(location.hash.slice(qm + 1));
+      var autoSrc = params.get('src');
+      var autoSeg = params.get('seg');
+      if (autoSrc) {
+        var target = document.querySelector('.toc-item[data-src="' + autoSrc + '"][data-seg="' + (autoSeg || '0') + '"]');
+        if (target) target.click();
+      }
+    }
   } catch(e) {
     const toc = document.getElementById('toc');
     if (toc) toc.innerHTML = '<p style="color:var(--red);padding:0 16px;font-size:.875rem">Ошибка загрузки TOC</p>';
@@ -1501,6 +2398,7 @@ async function loadSeg(slug, srcSlug, segId, tocEl) {
       '<h2 style="margin-bottom:12px">' + esc(seg.title) + '</h2>' +
       '<p class="text-muted text-sm" style="margin-bottom:20px">' + esc(seg.source_title) + ' · ' + seg.words + ' слов</p>' +
       '<div style="white-space:pre-wrap">' + esc(seg.text) + '</div>';
+    renderMath(content);
   } catch(e) {
     content.innerHTML = '<p style="color:var(--red)">Ошибка загрузки сегмента</p>';
   }
@@ -1509,10 +2407,22 @@ async function loadSeg(slug, srcSlug, segId, tocEl) {
 // ── Chat ───────────────────────────────────────────────────────────────
 async function vChat(main, slug) {
   S.pendingImg = null;
+  S.chatConvId = 0;
   main.innerHTML =
-    '<div class="chat-layout">' +
+    '<div style="display:flex;height:calc(100vh - 56px)">' +
+    '<div class="conv-sidebar" id="conv-sidebar">' +
+    '<div style="padding:12px 14px;border-bottom:1px solid var(--border)">' +
+    '<button class="btn btn-primary btn-sm" style="width:100%" id="btn-new-conv">+ Новая беседа</button>' +
+    '<input type="text" id="conv-search" placeholder="Поиск по беседам…" style="margin-top:8px;padding:6px 10px;font-size:.8125rem">' +
+    '</div>' +
+    '<div id="conv-list" style="flex:1;overflow-y:auto;padding:6px 0"></div>' +
+    '<div style="padding:8px 14px;border-top:1px solid var(--border)">' +
+    '<button class="btn btn-danger btn-sm" style="width:100%;font-size:.75rem" id="btn-del-all-conv">Удалить все беседы</button>' +
+    '</div>' +
+    '</div>' +
+    '<div class="chat-layout" style="flex:1">' +
     '<div class="chat-messages" id="chat-msgs">' +
-    '<div class="text-muted text-sm" style="text-align:center;padding:20px"><div class="spinner"></div></div>' +
+    '<p class="text-muted text-sm" style="text-align:center;padding:20px">Выберите беседу или начните новую</p>' +
     '</div>' +
     '<div class="chat-input-area">' +
     '<div id="img-bar" class="img-preview-bar hidden"></div>' +
@@ -1523,86 +2433,94 @@ async function vChat(main, slug) {
     '<button class="btn btn-primary" id="btn-send" style="flex-shrink:0">↑</button>' +
     '</div>' +
     '<div class="chat-hint">' +
-    '<span>Shift+Enter — отправить · Enter — новая строка</span>' +
-    '<button class="btn btn-ghost btn-sm" id="btn-clr" style="font-size:.75rem;padding:3px 8px">🗑 Очистить</button>' +
-    '</div></div></div>';
+    '<span>Shift+Enter — отправить</span>' +
+    '</div></div></div></div>';
 
-  const msgsEl = document.getElementById('chat-msgs');
-  const inpEl = document.getElementById('chat-inp');
+  await loadConvList(slug);
 
-  // Load history
-  try {
-    const r = await api('/api/subjects/' + slug + '/chat/history');
-    const hist = await r.json();
-    msgsEl.innerHTML = '';
-    if (!hist.length) {
-      msgsEl.innerHTML = '<p class="text-muted text-sm" style="text-align:center;padding:20px">Новый чат · Задайте вопрос по материалам предмета</p>';
-    } else {
-      hist.forEach(function(m) { appendMsg(m.role, m.content); });
-      msgsEl.scrollTop = msgsEl.scrollHeight;
-    }
-  } catch(e) {
-    msgsEl.innerHTML = '<p class="text-muted text-sm" style="text-align:center;padding:20px">Новый чат</p>';
-  }
+  document.getElementById('btn-new-conv').addEventListener('click', function() {
+    S.chatConvId = 0;
+    document.querySelectorAll('.conv-item').forEach(function(el) { el.classList.remove('active'); });
+    var msgsEl = document.getElementById('chat-msgs');
+    msgsEl.innerHTML = '<p class="text-muted text-sm" style="text-align:center;padding:20px">Новая беседа · Задайте вопрос</p>';
+  });
+
+  var searchTimer = null;
+  document.getElementById('conv-search').addEventListener('input', function() {
+    clearTimeout(searchTimer);
+    var q = this.value;
+    searchTimer = setTimeout(function() { loadConvList(slug, q); }, 300);
+  });
+
+  document.getElementById('btn-del-all-conv').addEventListener('click', async function() {
+    if (!confirm('Удалить все беседы по этому предмету?')) return;
+    await api('/api/subjects/' + slug + '/conversations', {method:'DELETE'});
+    S.chatConvId = 0;
+    toast('Все беседы удалены', 'success');
+    loadConvList(slug);
+    document.getElementById('chat-msgs').innerHTML = '<p class="text-muted text-sm" style="text-align:center;padding:20px">Новая беседа</p>';
+  });
 
   // Photo OCR
   document.getElementById('btn-photo').addEventListener('click', function() {
     document.getElementById('photo-inp').click();
   });
   document.getElementById('photo-inp').addEventListener('change', async function(e) {
-    const file = e.target.files[0];
+    var file = e.target.files[0];
     if (!file) return;
     toast('Распознавание текста на фото…', 'info');
     try {
-      const fd = new FormData();
-      fd.append('file', file);
-      const r = await api('/api/subjects/' + slug + '/chat/ocr-image', {method:'POST', body:fd});
+      var fd = new FormData(); fd.append('file', file);
+      var r = await api('/api/subjects/' + slug + '/chat/ocr-image', {method:'POST', body:fd});
       if (r.ok) {
-        const data = await r.json();
-        const bar = document.getElementById('img-bar');
-        bar.innerHTML =
-          '<span class="badge badge-blue" style="font-size:.75rem">📷 OCR</span>' +
+        var data = await r.json();
+        var bar = document.getElementById('img-bar');
+        bar.innerHTML = '<span class="badge badge-blue" style="font-size:.75rem">📷 OCR</span>' +
           '<span class="text-sm text-muted" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(data.text.slice(0, 80)) + '…</span>' +
           '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" onclick="clearOcr()">✕</button>';
         bar.classList.remove('hidden');
         S.pendingImg = data.text;
-        inpEl.placeholder = 'OCR добавлен. Уточните вопрос или отправьте как есть…';
         toast('Текст распознан', 'success');
       } else { toast('Ошибка OCR', 'error'); }
     } catch(err) { toast('Ошибка распознавания', 'error'); }
   });
 
   async function sendMsg() {
-    const q = inpEl.value.trim();
+    var inpEl = document.getElementById('chat-inp');
+    var q = inpEl.value.trim();
     if (!q && !S.pendingImg) return;
-    const fullQ = S.pendingImg ? 'Содержимое конспекта:\n' + S.pendingImg + (q ? '\n\nВопрос: ' + q : '') : q;
-    inpEl.value = '';
-    inpEl.style.height = '';
+    var fullQ = S.pendingImg ? 'Содержимое конспекта:\n' + S.pendingImg + (q ? '\n\nВопрос: ' + q : '') : q;
+    inpEl.value = ''; inpEl.style.height = '';
     clearOcr();
 
-    const msgsDiv = document.getElementById('chat-msgs');
-    msgsDiv.querySelector('.text-muted.text-sm') && (msgsDiv.innerHTML = '');
+    var msgsDiv = document.getElementById('chat-msgs');
+    var placeholder = msgsDiv.querySelector('.text-muted.text-sm');
+    if (placeholder) msgsDiv.innerHTML = '';
     appendMsg('user', fullQ);
     msgsDiv.scrollTop = msgsDiv.scrollHeight;
 
-    const msgEl = appendMsg('assistant', '');
-    const bubble = msgEl.querySelector('.msg-bubble');
+    var msgEl = appendMsg('assistant', '');
+    var bubble = msgEl.querySelector('.msg-bubble');
     bubble.innerHTML = '<div class="spinner"></div>';
 
-    let full = '';
-    const es = new EventSource('/api/subjects/' + slug + '/chat/stream?q=' + encodeURIComponent(fullQ));
+    var full = '';
+    var url = '/api/subjects/' + slug + '/chat/stream?q=' + encodeURIComponent(fullQ) + '&conversation_id=' + S.chatConvId;
+    var es = new EventSource(url);
     S.chatES = es;
 
     es.onmessage = function(ev) {
       if (ev.data === '[DONE]') {
         es.close(); S.chatES = null;
         bubble.innerHTML = md(full);
+        renderMath(bubble);
         msgsDiv.scrollTop = msgsDiv.scrollHeight;
+        loadConvList(slug);
         return;
       }
       try {
-        const d = JSON.parse(ev.data);
+        var d = JSON.parse(ev.data);
         if (d.error) { bubble.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; es.close(); return; }
+        if (d.conversation_id) { S.chatConvId = d.conversation_id; }
         if (d.content) {
           full += d.content;
           bubble.innerHTML = md(full) + '<span class="spinner" style="width:10px;height:10px;margin-left:4px"></span>';
@@ -1612,24 +2530,73 @@ async function vChat(main, slug) {
     };
     es.onerror = function() {
       es.close(); S.chatES = null;
-      if (!full) bubble.innerHTML = '<span style="color:var(--red)">Ошибка соединения. Проверьте подключение.</span>';
+      if (!full) bubble.innerHTML = '<span style="color:var(--red)">Ошибка соединения</span>';
     };
   }
 
   document.getElementById('btn-send').addEventListener('click', sendMsg);
-  inpEl.addEventListener('keydown', function(e) {
+  document.getElementById('chat-inp').addEventListener('keydown', function(e) {
     if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); sendMsg(); }
   });
-  inpEl.addEventListener('input', function() {
-    inpEl.style.height = 'auto';
-    inpEl.style.height = Math.min(inpEl.scrollHeight, 120) + 'px';
+  document.getElementById('chat-inp').addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
   });
-  document.getElementById('btn-clr').addEventListener('click', async function() {
-    if (!confirm('Очистить историю чата?')) return;
-    await api('/api/subjects/' + slug + '/chat/history', {method:'DELETE'});
-    document.getElementById('chat-msgs').innerHTML = '<p class="text-muted text-sm" style="text-align:center;padding:20px">История очищена</p>';
-    toast('История очищена', 'success');
+}
+
+async function loadConvList(slug, q) {
+  var el = document.getElementById('conv-list');
+  if (!el) return;
+  var url = '/api/subjects/' + slug + '/conversations';
+  if (q) url += '?q=' + encodeURIComponent(q);
+  try {
+    var r = await api(url);
+    var convs = await r.json();
+    if (!convs.length) {
+      el.innerHTML = '<p class="text-muted text-sm" style="padding:12px 14px">Бесед пока нет</p>';
+      return;
+    }
+    el.innerHTML = convs.map(function(c) {
+      var active = c.id === S.chatConvId ? ' active' : '';
+      var dt = c.updated_at ? c.updated_at.slice(0, 10) : '';
+      return '<div class="conv-item' + active + '" data-id="' + c.id + '" onclick="openConv(\'' + slug + '\',' + c.id + ')">' +
+        '<div class="conv-title">' + esc(c.title) + '</div>' +
+        '<div class="conv-date">' + dt + '</div>' +
+        '<button class="conv-del" onclick="event.stopPropagation();delConv(\'' + slug + '\',' + c.id + ')" title="Удалить">✕</button>' +
+        '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
+async function openConv(slug, cid) {
+  S.chatConvId = cid;
+  document.querySelectorAll('.conv-item').forEach(function(el) {
+    el.classList.toggle('active', Number(el.dataset.id) === cid);
   });
+  var msgsEl = document.getElementById('chat-msgs');
+  msgsEl.innerHTML = '<div class="text-muted text-sm" style="text-align:center;padding:20px"><div class="spinner"></div></div>';
+  try {
+    var r = await api('/api/subjects/' + slug + '/chat/history?conversation_id=' + cid);
+    var hist = await r.json();
+    msgsEl.innerHTML = '';
+    if (!hist.length) {
+      msgsEl.innerHTML = '<p class="text-muted text-sm" style="text-align:center;padding:20px">Пустая беседа</p>';
+    } else {
+      hist.forEach(function(m) { appendMsg(m.role, m.content); });
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+  } catch(e) { msgsEl.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>'; }
+}
+
+async function delConv(slug, cid) {
+  if (!confirm('Удалить беседу?')) return;
+  await api('/api/subjects/' + slug + '/conversations/' + cid, {method:'DELETE'});
+  if (S.chatConvId === cid) {
+    S.chatConvId = 0;
+    document.getElementById('chat-msgs').innerHTML = '<p class="text-muted text-sm" style="text-align:center;padding:20px">Выберите беседу</p>';
+  }
+  toast('Беседа удалена', 'success');
+  loadConvList(slug);
 }
 
 function clearOcr() {
@@ -1648,6 +2615,7 @@ function appendMsg(role, content) {
     '<div class="msg-avatar">' + (role === 'user' ? '👤' : '🔬') + '</div>' +
     '<div class="msg-bubble">' + (content ? md(content) : '') + '</div>';
   msgsEl.appendChild(div);
+  if (content) renderMath(div.querySelector('.msg-bubble'));
   return div;
 }
 
@@ -1661,9 +2629,10 @@ async function vTickets(main, slug) {
     '<h1 class="section-title">Билеты: ' + esc(subject.title) + '</h1>' +
     '<a href="/api/subjects/' + slug + '/tickets/export" class="btn btn-ghost btn-sm" target="_blank">⬇ Экспорт</a>' +
     '</div>' +
-    '<div style="display:flex;gap:10px;margin-bottom:24px">' +
+    '<div style="display:flex;gap:10px;margin-bottom:16px">' +
     '<input type="text" id="new-q" placeholder="Новый вопрос для билета… (Enter)">' +
     '<button class="btn btn-primary btn-sm" style="flex-shrink:0" id="btn-add-t">+ Добавить</button>' +
+    '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-batch-t">📋 Пакетная загрузка</button>' +
     '</div>' +
     '<div id="t-list"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
     '</div>';
@@ -1682,6 +2651,39 @@ async function vTickets(main, slug) {
   document.getElementById('new-q').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') addTicket();
   });
+  document.getElementById('btn-batch-t').addEventListener('click', function() {
+    var ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    ov.innerHTML =
+      '<div class="glass modal" style="max-width:560px">' +
+      '<div class="modal-title">Пакетная загрузка вопросов</div>' +
+      '<p class="text-sm text-muted" style="margin-bottom:12px">Один вопрос на строку. Нумерация (1. 2. 3.) удаляется автоматически.</p>' +
+      '<form id="batch-form">' +
+      '<div class="form-group"><textarea id="batch-q" rows="10" placeholder="1. Первый закон термодинамики\n2. Закон Гесса\n3. Энтропия как функция состояния" style="font-size:.875rem"></textarea></div>' +
+      '<div class="flex gap" style="margin-top:4px">' +
+      '<button type="button" class="btn btn-ghost" id="batch-cancel">Отмена</button>' +
+      '<button type="submit" class="btn btn-primary">Загрузить</button>' +
+      '</div></form></div>';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+    document.getElementById('batch-cancel').addEventListener('click', function() { ov.remove(); });
+    document.getElementById('batch-form').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      var fd = new FormData();
+      fd.append('questions', document.getElementById('batch-q').value);
+      var r = await api('/api/subjects/' + slug + '/tickets/batch', {method:'POST', body:fd});
+      if (r.ok) {
+        var data = await r.json();
+        toast(data.count + ' вопросов загружено', 'success');
+        ov.remove();
+        loadTickets(slug);
+      } else {
+        var err = await r.json();
+        toast(err.detail || 'Ошибка', 'error');
+      }
+    });
+    setTimeout(function() { document.getElementById('batch-q').focus(); }, 50);
+  });
   await loadTickets(slug);
 }
 
@@ -1696,18 +2698,32 @@ async function loadTickets(slug) {
       return;
     }
     el.innerHTML = tickets.map(function(t) {
+      var hasAnswer = t.answer && t.answer.length > 0;
       return '<div class="glass ticket-item" id="tk-' + t.id + '">' +
         '<div style="display:flex;align-items:flex-start;gap:10px">' +
+        (hasAnswer ? '<button class="btn btn-ghost btn-sm toggle-answer" onclick="toggleAnswer(this)" style="flex-shrink:0;padding:4px 8px;font-size:1rem" title="Развернуть/свернуть">▶</button>' : '') +
         '<div class="ticket-q" style="flex:1">' + esc(t.question) + '</div>' +
         '<div class="flex gap" style="flex-shrink:0">' +
         '<button class="btn btn-primary btn-sm" onclick="genTicket(\'' + slug + '\',' + t.id + ')">' +
         (t.status === 'generated' ? '🔄' : '⚡') + ' Ответить</button>' +
+        (hasAnswer ? '<a href="/api/subjects/' + slug + '/tickets/' + t.id + '/export" class="btn btn-ghost btn-sm" target="_blank" title="Скачать HTML">📄</a>' : '') +
         '<button class="btn btn-danger btn-sm" onclick="delTicket(\'' + slug + '\',' + t.id + ')">✕</button>' +
         '</div></div>' +
-        (t.answer ? '<div class="ticket-answer">' + md(t.answer) + '</div>' : '') +
+        (hasAnswer ? '<div class="ticket-answer" style="display:none">' + md(t.answer) + '</div>' : '') +
         '</div>';
     }).join('');
+    renderMath(el);
   } catch(e) { el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>'; }
+}
+
+function toggleAnswer(btn) {
+  var ticket = btn.closest('.ticket-item');
+  var answer = ticket.querySelector('.ticket-answer');
+  if (!answer) return;
+  var hidden = answer.style.display === 'none';
+  answer.style.display = hidden ? '' : 'none';
+  btn.textContent = hidden ? '▼' : '▶';
+  if (hidden) renderMath(answer);
 }
 
 async function genTicket(slug, tid) {
@@ -1723,7 +2739,7 @@ async function genTicket(slug, tid) {
   let full = '';
   const es = new EventSource('/api/subjects/' + slug + '/tickets/' + tid + '/generate');
   es.onmessage = function(ev) {
-    if (ev.data === '[DONE]') { es.close(); ansEl.innerHTML = md(full); return; }
+    if (ev.data === '[DONE]') { es.close(); loadTickets(slug); return; }
     try {
       const d = JSON.parse(ev.data);
       if (d.error) { ansEl.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; es.close(); return; }
