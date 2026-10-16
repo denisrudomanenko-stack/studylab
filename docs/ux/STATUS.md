@@ -67,5 +67,5 @@
 - `docs/ux/tasks/` — задания 01–12 и `backlog.md`.
 - `docs/ux/design-system.md`, `copy.md`, `pr-checklist.md`, `dev-setup.md` — дизайн-система, тексты, чек-лист PR, локальный запуск.
 - `docs/ux/prompts/ticket-answer.md` — промпт ответа на билет.
-- `docs/ux/fixtures/` — тестовые списки билетов.
+- `docs/ux/fixtures/` — тестовые списки билетов и `answer-quality-cases.md` (проверки качества ответа для задачи 04).
 - `docs/ux/ux-map.html` — UX-карта; опубликована и как артефакт в claude.ai.
