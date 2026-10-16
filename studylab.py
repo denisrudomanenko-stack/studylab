@@ -588,6 +588,20 @@ async def _index_source(subject_slug: str, source_slug: str,
                 if seg_path.exists():
                     try:
                         all_segs = json.loads(seg_path.read_text(encoding="utf-8"))
+                        # Save only THIS source's previous segments (don't overwrite other sources' prev data)
+                        if source_slug in all_segs:
+                            prev_path = subj_dir / "segments.prev.json"
+                            prev_data: dict = {}
+                            if prev_path.exists():
+                                try:
+                                    prev_data = json.loads(prev_path.read_text(encoding="utf-8"))
+                                except Exception:
+                                    prev_data = {}
+                            prev_data[source_slug] = all_segs[source_slug]
+                            prev_path.write_text(
+                                json.dumps(prev_data, ensure_ascii=False, indent=1),
+                                encoding="utf-8"
+                            )
                     except Exception:
                         all_segs = {}
                 all_segs[source_slug] = {"title": source_title, "segments": segs,
@@ -1322,6 +1336,15 @@ async def search_subject(slug: str, q: str, k: int = 8,
 
     hits = await asyncio.to_thread(_search)
     filtered = [h for h in hits if h["slug"] in active][:k]
+    # Fetch source titles for results
+    db2 = get_db()
+    src_titles: dict[str, str] = {
+        r["slug"]: r["title"]
+        for r in db2.execute(
+            "SELECT slug, title FROM sources WHERE subject_slug=?", (slug,)
+        ).fetchall()
+    }
+    db2.close()
     return [
         {
             "score": h["score"],
@@ -1329,6 +1352,8 @@ async def search_subject(slug: str, q: str, k: int = 8,
             "segment": h["segment"],
             "title": h["title"],
             "text": h["text"][:400],
+            "source_title": src_titles.get(h["slug"], h["slug"]),
+            "subject": slug,
         }
         for h in filtered
     ]
@@ -1341,6 +1366,17 @@ async def list_segments(slug: str, user: dict = Depends(current_user)):
         return {}
     try:
         return json.loads(seg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@app.get("/api/subjects/{slug}/segments-prev")
+async def list_segments_prev(slug: str, user: dict = Depends(current_user)):
+    prev_path = subject_dir(slug) / "segments.prev.json"
+    if not prev_path.exists():
+        return {}
+    try:
+        return json.loads(prev_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -1388,7 +1424,7 @@ VISION_MODEL = "gemini/gemini-3.5-flash"
 
 SYSTEM_BIO = (
     "Ты — интеллектуальный ассистент по биологии и микробиологии для студентки 2 курса биофака МГУ. "
-    "Приоритет — предоставленные фрагменты источников. К фактам из источников добавляй провенанс в ТОЧНОМ формате: [src:SLUG#SEG | раздел: заголовок]. SLUG и SEG бери из заголовка фрагмента [N src:SLUG#SEG]. "
+    "Приоритет — предоставленные фрагменты источников. К фактам из источников добавляй провенанс в ТОЧНОМ формате: [src:SUBJECT/SLUG#SEG | раздел: заголовок]. SUBJECT, SLUG и SEG бери из заголовка фрагмента [N src:SUBJECT/SLUG#SEG]. "
     "Если в источниках нет ответа, используй свои знания по биологии, химии, биохимии — но явно укажи: «Из общих знаний:». "
     "Используй правильные латинские названия организмов. "
     "Формулы пиши в LaTeX: инлайн $...$ и блочные $$...$$. "
@@ -1460,7 +1496,8 @@ def _build_messages(history: list[dict], question: str,
             src_slug = h.get("slug", "")
             seg_idx = h.get("segment", 0)
             title = h.get("title", "")
-            parts.append(f"[{i} src:{src_slug}#{seg_idx}] «{title}»\n{h['text'][:600]}")
+            subject = h.get("_subject", h.get("topic", ""))
+            parts.append(f"[{i} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:600]}")
         ctx = "Фрагменты из источников:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_BIO}]
@@ -1938,7 +1975,7 @@ async def generate_ticket_answer(slug: str, tid: int,
         "6. Логика: определение → классификация → формулы/уравнения → вывод → следствия\n"
         "7. Выделяй **ключевые термины** жирным при первом упоминании\n"
         "7. Используй правильные латинские названия организмов\n"
-        "8. Добавляй провенанс в ТОЧНОМ формате [src:SLUG#SEG | раздел: заголовок] к фактам из источников. SLUG и SEG бери из заголовка фрагмента.\n"
+        "8. Добавляй провенанс в ТОЧНОМ формате [src:SUBJECT/SLUG#SEG | раздел: заголовок] к фактам из источников. SUBJECT, SLUG и SEG бери из заголовка фрагмента.\n"
         "9. Если в источниках нет — используй общие знания, помечай «Из общих знаний:»\n"
         "10. Объём: 400-800 слов, на уровне университетского курса\n"
     )
@@ -1950,7 +1987,8 @@ async def generate_ticket_answer(slug: str, tid: int,
             src_slug = h.get("slug", "")
             seg_idx = h.get("segment", 0)
             title = h.get("title", "")
-            parts.append(f"[{i+1} src:{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
+            subject = h.get("_subject", h.get("topic", ""))
+            parts.append(f"[{i+1} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
         ctx = "Источники:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
 
     async def generate():
@@ -2086,8 +2124,22 @@ def _md_to_html(text: str) -> str:
     result = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", result)
     result = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", result)
     result = re.sub(r"`([^`]+)`", r"<code>\1</code>", result)
-    result = re.sub(r"\[src:[a-z0-9а-яё\-]+#\d+\s*\|\s*([^\]]+)\]",
-                    r'<span style="color:#60a5fa;font-size:.85em">[📖 \1]</span>', result, flags=re.IGNORECASE)
+    # Provenance links (both new SUBJECT/SLUG#SEG and old SLUG#SEG formats) → readable label for offline HTML
+    def _prov_label(m: re.Match) -> str:
+        raw = m.group(2).strip()
+        title = re.sub(r"^раздел:\s*", "", raw, flags=re.IGNORECASE)
+        title = title[:40] + ("…" if len(title) > 40 else "")
+        return f'<span style="color:#60a5fa;font-size:.85em">[Раздел: {_html.escape(title)}]</span>'
+    result = re.sub(
+        r"\[src:[^/\#|\]]+/[^/\#|\]]+#(\d+)\s*\|\s*([^\]]+)\]",
+        _prov_label,
+        result, flags=re.IGNORECASE
+    )
+    result = re.sub(
+        r"\[src:[^/\#|\]]+#(\d+)\s*\|\s*([^\]]+)\]",
+        _prov_label,
+        result, flags=re.IGNORECASE
+    )
     result = re.sub(r"\[([^\]]+)\]", r'<span style="color:#60a5fa;font-size:.85em">[\1]</span>', result)
     # Restore formulas — block formulas get centered div
     def _restore(m):
@@ -2616,7 +2668,7 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 /* ── Читалка ────────────────────────────────────────────────────────── */
 .three-col{display:grid;grid-template-columns:280px 1fr}
 .reader-sidebar{border-right:1px solid var(--border);height:calc(100vh - var(--nav-h));
-  height:calc(100dvh - var(--nav-h));overflow-y:auto;position:sticky;top:var(--nav-h)}
+  height:calc(100dvh - var(--nav-h));overflow-y:auto;position:sticky;top:var(--nav-h);flex-shrink:0}
 .reader-sidebar-inner{padding:16px 0}
 .toc-group-label{padding:8px 16px 4px;font-size:.75rem;font-weight:600;color:var(--dim);
   text-transform:uppercase;letter-spacing:.06em}
@@ -2625,13 +2677,26 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .toc-item:hover{background:var(--glass2);color:var(--text)}
 .toc-item.active{background:var(--glass2);color:var(--accent);font-weight:600}
 .toc-num{font-size:.75rem;color:var(--dim);flex-shrink:0;margin-top:2px}
-.reader-content{padding:32px 40px;max-width:760px;line-height:1.8;font-size:1rem}
+.reader-main-col{min-width:0;overflow-x:hidden}
+.reader-content{padding:32px 40px;max-width:48rem;line-height:1.8;font-size:1rem}
 .reader-content h1,.reader-content h2,.reader-content h3{margin:1.5em 0 .5em;font-weight:600}
 .reader-content h2{font-family:var(--font-d);font-weight:500;font-size:1.125rem}
 .reader-content h3{font-size:1rem;color:var(--muted)}
+.reader-body{font-weight:400;line-height:1.7}
+.reader-body h2,.reader-body h3{font-weight:600}
 .reader-content p{margin-bottom:.875em}
 .reader-content code{background:var(--glass2);padding:2px 6px;border-radius:4px;font-size:.875em}
 .reader-content pre{background:var(--glass2);padding:14px;border-radius:var(--r-s);overflow-x:auto;margin:1em 0}
+.reader-content img{max-width:100%;border-radius:var(--r-s);margin:.75em 0;cursor:zoom-in}
+.reader-content figure{margin:.75em 0;text-align:center}
+.reader-content figcaption{font-size:.85rem;color:var(--muted);margin-top:4px}
+.reader-content table{width:100%;border-collapse:collapse;margin:.8em 0;font-size:.9375rem}
+.reader-content th,.reader-content td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--border)}
+.reader-content th{font-weight:600;font-size:.8125rem;color:var(--muted)}
+.math-block{overflow-x:auto;overflow-y:hidden;padding:.4em 0}
+.reader-nav{display:flex;justify-content:space-between;gap:12px;padding:24px 40px 40px;max-width:48rem;flex-wrap:wrap}
+.reader-nav .btn{font-size:.875rem}
+.reader-notfound{padding:32px 40px;max-width:48rem;color:var(--muted)}
 
 /* ── Чат ────────────────────────────────────────────────────────────── */
 .chat-shell{display:flex;position:relative;height:calc(100vh - var(--nav-h));height:calc(100dvh - var(--nav-h))}
@@ -2737,15 +2802,27 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}.toast{animation:none}}
 
 /* ── Узкие экраны ───────────────────────────────────────────────────── */
+@media(max-width:820px){
+  .three-col{grid-template-columns:1fr;position:relative}
+  .reader-sidebar{position:fixed;top:var(--nav-h);left:0;bottom:0;z-index:200;width:min(300px,86%);
+    background:var(--bg);border-right:1px solid var(--border);overflow-y:auto;
+    -webkit-transform:translateX(-102%);transform:translateX(-102%);transition:transform .22s;height:auto;max-height:none}
+  .reader-sidebar.open{-webkit-transform:none;transform:none;box-shadow:4px 0 32px rgba(0,0,0,.45)}
+  .reader-scrim{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:190;background:rgba(0,0,0,.45)}
+  .reader-toc-toggle{display:flex}
+  .reader-content{padding:20px 16px}
+  .reader-nav{padding:16px 16px 32px}
+}
+@media(min-width:821px){
+  .reader-toc-toggle{display:none!important}
+  .reader-scrim{display:none!important}
+}
 @media(max-width:768px){
-  .three-col{grid-template-columns:1fr}
-  .reader-sidebar{position:static;height:auto;border-right:none;border-bottom:1px solid var(--border);max-height:260px}
   .page{padding:20px 16px 40px}
   .navbar{padding:0 12px;gap:8px}
   .section-title{font-size:1.375rem}
   .chat-messages{padding:16px}
   .chat-input-area{padding:10px 16px 16px}
-  .reader-content{padding:20px 16px}
   .msg{max-width:100%}
   .source-actions{margin-left:0;width:100%}
   .toast-container{left:16px;right:16px;bottom:16px}
@@ -2875,6 +2952,15 @@ function md(text) {
     tables.push(html);
     return '\x00T' + (tables.length - 1) + '\x00';
   });
+  // Protect images from esc() — save them and restore after
+  var images = [];
+  t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(_, alt, src) {
+    // Security: only /api/ paths, no quotes/angles/spaces/newlines, then esc() output
+    if (!/^\/api\/[A-Za-z0-9_\-.а-яА-ЯёЁ\/%]+$/.test(src)) return '';
+    var tag = '<img src="' + esc(src) + '" alt="' + esc(alt) + '" style="max-width:100%;border-radius:8px;margin:.5em 0">';
+    images.push(tag);
+    return '\x00I' + (images.length - 1) + '\x00';
+  });
   var h = esc(t);
   h = h.replace(/^### (.+)$/gm, '<h3>$1</h3>');
   h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
@@ -2882,10 +2968,18 @@ function md(text) {
   h = h.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
   h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Provenance links: [src:SLUG#SEG | раздел: Title] → clickable link to reader
-  h = h.replace(/\[src:([a-z0-9а-яё\-]+)#(\d+)\s*\|\s*([^\]]+)\]/gi, function(_, srcSlug, seg, rest) {
-    var subjectSlug = (location.hash.match(/\/(chat|tickets|subject|reader)\/([^/]+)/) || [])[2] || '';
-    return '<a href="#/reader/' + subjectSlug + '?src=' + srcSlug + '&seg=' + seg + '" class="prov" title="Открыть в читалке" style="cursor:pointer">[📖 ' + rest.trim() + ']</a>';
+  // Provenance links — two formats:
+  // New: [src:SUBJECT/SLUG#SEG | раздел: Title] — subject is explicit
+  // Old: [src:SLUG#SEG | раздел: Title] — subject taken from current page context
+  h = h.replace(/\[src:([^\/\#|\]]+)\/([^\/\#|\]]+)#(\d+)\s*\|\s*([^\]]+)\]/gi, function(_, subj, srcSlug, seg, rest) {
+    var title = encodeURIComponent(rest.trim().replace(/^раздел:\s*/i, ''));
+    return '<a href="#/reader/' + subj + '?src=' + srcSlug + '&seg=' + seg + '&t=' + title + '" class="prov" title="Открыть в читалке" style="cursor:pointer">[📖 ' + rest.trim() + ']</a>';
+  });
+  h = h.replace(/\[src:([^\/\#|\]]+)#(\d+)\s*\|\s*([^\]]+)\]/gi, function(_, srcSlug, seg, rest) {
+    // Old format — extract subject from current page context
+    var subjectSlug = (location.hash.match(/\/(chat|tickets|subject|reader)\/([^/?#]+)/) || [])[2] || '';
+    var title = encodeURIComponent(rest.trim().replace(/^раздел:\s*/i, ''));
+    return '<a href="#/reader/' + subjectSlug + '?src=' + srcSlug + '&seg=' + seg + '&t=' + title + '" class="prov" title="Открыть в читалке" style="cursor:pointer">[📖 ' + rest.trim() + ']</a>';
   });
   h = h.replace(/\[([^\]]+)\]/g, '<span class="prov">[$1]</span>');
   // Convert numbered lists with explicit numbers
@@ -2908,6 +3002,11 @@ function md(text) {
     var f = formulas[parseInt(i)];
     if (f.startsWith('$$')) return '</p><div class="math-block">' + f + '</div><p>';
     return f;
+  });
+  h = h.replace(/<p>\s*<\/p>/g, '');
+  // Restore images
+  h = h.replace(/\x00I(\d+)\x00/g, function(_, i) {
+    return '</p>' + images[parseInt(i)] + '<p>';
   });
   h = h.replace(/<p>\s*<\/p>/g, '');
   return '<p>' + h + '</p>';
@@ -3000,7 +3099,7 @@ function updateNav(view, slug) {
   const sep = '<span class="sep" aria-hidden="true">/</span>';
   var crumb;
   if (slug && view !== 'dashboard') {
-    var title = esc(S.titles[slug] || slug);
+    var title = esc(S.titles[slug] || (function() { try { return decodeURIComponent(slug); } catch(e) { return slug; } })());
     crumb = sep + '<a href="#/dashboard">Предметы</a>' + sep +
       (view === 'subject' ? '<b>' + title + '</b>' :
         '<a href="#/subject/' + slug + '">' + title + '</a>' + sep + '<b>' + (labels[view] || view) + '</b>');
@@ -3474,12 +3573,28 @@ function setupSearch(slug) {
       if (!hits.length) { res.innerHTML = '<p class="text-muted text-sm">Ничего не найдено.</p>'; return; }
       res.innerHTML = '<div style="display:flex;flex-direction:column;gap:10px">' +
         hits.map(function(h) {
-          return '<div class="glass2 search-hit">' +
+          var readerHref = '#/reader/' + esc(h.subject || slug) + '?src=' + esc(h.slug) + '&seg=' + h.segment + '&t=' + encodeURIComponent(h.title);
+          // Clean snippet: remove technical prefix "Предмет: … Источник: … Раздел: …\n\n"
+          var snippet = h.text || '';
+          var prefixEnd = snippet.indexOf('\n\n');
+          if (prefixEnd > -1 && /Раздел:/i.test(snippet.slice(0, prefixEnd))) {
+            snippet = snippet.slice(prefixEnd + 2);
+          }
+          // Remove markdown image tags ![...](media/...)
+          snippet = snippet.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
+          // Trim to reasonable length
+          snippet = snippet.trim().slice(0, 280);
+          return '<a class="glass2 search-hit" href="' + readerHref + '" style="display:block;text-decoration:none;color:inherit">' +
+            '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">' +
             '<span class="search-score">Совпадение ' + Math.round(h.score * 100) + '%</span>' +
+            '<span class="text-muted" style="font-size:.8125rem">' + esc(h.source_title || h.slug) + '</span>' +
+            '</div>' +
             '<div class="search-title">' + esc(h.title) + '</div>' +
-            '<div class="search-text">' + esc(h.text) + '</div>' +
-            '</div>';
+            '<div class="search-text">' + esc(snippet) + '</div>' +
+            '<div style="margin-top:8px"><span class="btn btn-ghost btn-sm" style="pointer-events:none">Открыть в читалке →</span></div>' +
+            '</a>';
         }).join('') + '</div>';
+      renderMath(res);
     } catch(e2) {
       res.innerHTML = '<p class="text-sm" style="color:var(--red)">Ошибка поиска</p>';
     }
@@ -3678,18 +3793,43 @@ async function delSrc(slug, srcSlug) {
 }
 
 // ── Reader ─────────────────────────────────────────────────────────────
+// _readerSegs stores {srcSlug: {title, segments:[{index,title,...}]}} for current reader
+var _readerSegs = {};
+
+function _readerSideOpen() {
+  var sb = document.getElementById('reader-sidebar');
+  var sc = document.getElementById('reader-scrim');
+  if (sb) sb.classList.add('open');
+  if (sc) sc.style.display = 'block';
+}
+function _readerSideClose() {
+  var sb = document.getElementById('reader-sidebar');
+  var sc = document.getElementById('reader-scrim');
+  if (sb) sb.classList.remove('open');
+  if (sc) sc.style.display = 'none';
+}
+
 async function vReader(main, slug) {
+  _readerSegs = {};
   main.innerHTML =
     '<div class="three-col" style="min-height:calc(100vh - var(--nav-h))">' +
-    '<div class="reader-sidebar"><div class="reader-sidebar-inner">' +
+    '<div class="reader-sidebar" id="reader-sidebar"><div class="reader-sidebar-inner">' +
     '<div class="toc-group-label">Содержание</div>' +
     '<div id="toc"></div>' +
     '</div></div>' +
+    '<div class="reader-scrim" id="reader-scrim" onclick="_readerSideClose()"></div>' +
+    '<div class="reader-main-col">' +
+    '<div style="padding:8px 16px 0;border-bottom:1px solid var(--border)">' +
+    '<button class="btn btn-ghost btn-sm reader-toc-toggle" type="button" onclick="_readerSideOpen()" style="gap:6px">' + ic(IC.menu, 16) + 'Содержание</button>' +
+    '</div>' +
     '<div id="rcontent" class="reader-content"><p class="text-muted">Выберите раздел слева.</p></div>' +
+    '<div id="reader-nav-bar" class="reader-nav hidden"></div>' +
+    '</div>' +
     '</div>';
   try {
     const r = await api('/api/subjects/' + slug + '/segments');
     const segs = await r.json();
+    _readerSegs = segs;
     const toc = document.getElementById('toc');
     if (!toc || !Object.keys(segs).length) {
       if (toc) toc.innerHTML = '<p class="text-muted text-sm" style="padding:0 16px">Источников нет или индекс ещё не готов.</p>';
@@ -3700,22 +3840,23 @@ async function vReader(main, slug) {
       const src = segs[srcSlug];
       html += '<div class="toc-group-label">' + esc(src.title || srcSlug) + '</div>';
       (src.segments || []).forEach(function(seg) {
-        html += '<div class="toc-item" data-src="' + srcSlug + '" data-seg="' + seg.index + '" onclick="loadSeg(\'' + slug + '\',\'' + srcSlug + '\',' + seg.index + ',this)">' +
+        html += '<div class="toc-item" data-src="' + esc(srcSlug) + '" data-seg="' + seg.index + '" data-title="' + esc(seg.title) + '" onclick="loadSeg(\'' + slug + '\',\'' + srcSlug + '\',' + seg.index + ',this)">' +
           '<span class="toc-num">' + (seg.index + 1) + '</span>' +
           '<span>' + esc(seg.title) + '</span>' +
           '</div>';
       });
     }
     toc.innerHTML = html;
-    // Auto-open segment from query params: ?src=SLUG&seg=N
+    // Auto-open segment from query params: ?src=SLUG&seg=N&t=TITLE
     var qm = location.hash.indexOf('?');
     if (qm > -1) {
       var params = new URLSearchParams(location.hash.slice(qm + 1));
       var autoSrc = params.get('src');
-      var autoSeg = params.get('seg');
+      var autoSeg = parseInt(params.get('seg') || '0', 10);
+      var autoTitle = '';
+      try { autoTitle = params.get('t') || ''; } catch(e) { autoTitle = ''; }
       if (autoSrc) {
-        var target = document.querySelector('.toc-item[data-src="' + autoSrc + '"][data-seg="' + (autoSeg || '0') + '"]');
-        if (target) target.click();
+        _openReaderSeg(slug, autoSrc, autoSeg, autoTitle);
       }
     }
   } catch(e) {
@@ -3724,23 +3865,237 @@ async function vReader(main, slug) {
   }
 }
 
+function _openReaderSeg(slug, srcSlug, segId, expectedTitle) {
+  // Find TOC item — verify title if provided (Section D: survive re-indexing)
+  var srcData = _readerSegs[srcSlug];
+  if (!srcData) {
+    // Source doesn't exist
+    var content = document.getElementById('rcontent');
+    if (content) content.innerHTML = '<div class="reader-notfound"><p>Этого фрагмента больше нет: источник удалён или изменён.</p></div>';
+    return;
+  }
+  var targetSegId = segId;
+  var segments = srcData.segments || [];
+  if (expectedTitle) {
+    // Try to find segment with matching seg id first
+    var directMatch = segments.find(function(s) { return s.index === segId; });
+    if (directMatch && directMatch.title === expectedTitle) {
+      targetSegId = segId; // perfect match
+    } else {
+      // Title mismatch — search by title in current segments
+      var byTitle = segments.find(function(s) { return s.title === expectedTitle; });
+      if (byTitle) {
+        targetSegId = byTitle.index;
+      } else {
+        // Not found in current segments — try segments.prev.json to get old segment text start
+        api('/api/subjects/' + slug + '/segments-prev').then(function(r) {
+          if (!r.ok) { _openReaderSegFallback(); return; }
+          return r.json().then(function(prevData) {
+            var srcPrev = prevData[srcSlug];
+            if (!srcPrev) { _openReaderSegFallback(); return; }
+            var prevSegs = srcPrev.segments || [];
+            var oldSeg = prevSegs.find(function(s) { return s.index === segId; });
+            if (!oldSeg) { _openReaderSegFallback(); return; }
+            // Match by old title or first ~60 chars of text stored in index
+            var matchByOldTitle = segments.find(function(s) { return s.title === oldSeg.title; });
+            if (matchByOldTitle) {
+              _doOpenSeg(slug, srcSlug, matchByOldTitle.index);
+            } else {
+              _openReaderSegFallback();
+            }
+          });
+        }).catch(function() { _openReaderSegFallback(); });
+        return;
+      }
+    }
+  }
+  function _openReaderSegFallback() {
+    var content = document.getElementById('rcontent');
+    if (content) content.innerHTML =
+      '<div class="reader-notfound">' +
+      '<p style="color:var(--yellow)">Раздел переименован после обновления источника. Выберите раздел в оглавлении слева.</p>' +
+      '</div>';
+  }
+  function _doOpenSeg(sl, ss, sid) {
+    var target = document.querySelector('.toc-item[data-src="' + ss + '"][data-seg="' + sid + '"]');
+    if (target) {
+      target.click();
+      setTimeout(function() { target.scrollIntoView({block:'nearest'}); }, 100);
+    } else {
+      _openReaderSegFallback();
+    }
+  }
+  _doOpenSeg(slug, srcSlug, targetSegId);
+}
+
+function _reassembleParagraphs(text) {
+  var lines = text.split('\n');
+  var result = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    // Remove orphaned image fragments: lines that are only "filename.ext)" pattern
+    if (/^[A-Za-z0-9_\-]+\.[a-zA-Z]{2,5}\)$/.test(line.trim())) continue;
+    // Detect protected line types (should NOT be joined with previous)
+    var isProtected = /^\s*(\$\$|[|]|[-*]\s|[#]|!\[|\d+\.\s)/.test(line);
+    // Empty line: pass through as-is
+    if (line.trim() === '') {
+      result.push('');
+      continue;
+    }
+    if (result.length === 0) {
+      result.push(line);
+      continue;
+    }
+    var prev = result[result.length - 1];
+    // Don't join if this line is a protected type
+    if (isProtected) {
+      result.push(line);
+      continue;
+    }
+    // Don't join if previous line is empty or protected
+    if (prev.trim() === '' || /^\s*(\$\$|[|]|[-*]\s|[#]|!\[|\d+\.\s)/.test(prev)) {
+      result.push(line);
+      continue;
+    }
+    // Check if previous line ends with sentence-terminating punctuation
+    var prevTrimmed = prev.trimEnd();
+    var endsWithStop = /[.!?:;]$/.test(prevTrimmed);
+    if (endsWithStop) {
+      result.push(line);
+      continue;
+    }
+    // Handle hyphenation: previous line ends with '-', join without space
+    if (prevTrimmed.endsWith('-')) {
+      result[result.length - 1] = prevTrimmed.slice(0, -1) + line.trimStart();
+      continue;
+    }
+    // Current line starts with lowercase or doesn't start with list/heading/table/image marker → join
+    var firstChar = line.trimStart().charAt(0);
+    var startsLower = firstChar >= 'a' && firstChar <= 'z' || firstChar >= 'а' && firstChar <= 'я' || firstChar === 'ё';
+    if (startsLower) {
+      result[result.length - 1] = prevTrimmed + ' ' + line.trimStart();
+      continue;
+    }
+    result.push(line);
+  }
+  // Collapse 2+ consecutive empty lines into 1
+  var out = result.join('\n').replace(/\n{3,}/g, '\n\n');
+  return out;
+}
+
+function renderSegment(text, slug, srcSlug) {
+  // Fix hard line breaks from PDF extraction
+  var t = _reassembleParagraphs(text);
+  // Rewrite image URLs: ![](media/X) → /api/subjects/{slug}/media/{srcSlug}/X
+  t = t.replace(/!\[([^\]]*)\]\(media\/([^)]+)\)/g, function(_, alt, src) {
+    var url = '/api/subjects/' + slug + '/media/' + srcSlug + '/media/' + src;
+    return '!['+ alt + '](' + url + ')';
+  });
+  // Use md() for general rendering
+  return md(t);
+}
+
+function _highlightInReader(container, query) {
+  if (!query || !container) return;
+  var body = container.querySelector('.reader-body');
+  if (!body) return;
+  // Walk text nodes and wrap first occurrence
+  var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, null, false);
+  var node;
+  var lq = query.toLowerCase();
+  while ((node = walker.nextNode())) {
+    var idx = node.nodeValue.toLowerCase().indexOf(lq);
+    if (idx >= 0) {
+      var before = document.createTextNode(node.nodeValue.slice(0, idx));
+      var mark = document.createElement('mark');
+      mark.textContent = node.nodeValue.slice(idx, idx + query.length);
+      var after = document.createTextNode(node.nodeValue.slice(idx + query.length));
+      var parent = node.parentNode;
+      parent.insertBefore(before, node);
+      parent.insertBefore(mark, node);
+      parent.insertBefore(after, node);
+      parent.removeChild(node);
+      setTimeout(function() { mark.scrollIntoView({block:'center', behavior:'smooth'}); }, 120);
+      break;
+    }
+  }
+}
+
+function _showImgModal(src, alt) {
+  var overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.82);z-index:9000;display:flex;align-items:center;justify-content:center;cursor:zoom-out;padding:20px';
+  var img = document.createElement('img');
+  img.src = src;
+  img.alt = alt || '';
+  img.style.cssText = 'max-width:100%;max-height:100%;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6)';
+  overlay.appendChild(img);
+  overlay.addEventListener('click', function() { document.body.removeChild(overlay); });
+  document.body.appendChild(overlay);
+}
+
 async function loadSeg(slug, srcSlug, segId, tocEl) {
+  _readerSideClose();
   document.querySelectorAll('.toc-item').forEach(function(t) { t.classList.remove('active'); });
-  tocEl.classList.add('active');
+  if (tocEl) {
+    tocEl.classList.add('active');
+    tocEl.scrollIntoView({block:'nearest'});
+  }
   const content = document.getElementById('rcontent');
+  const navBar = document.getElementById('reader-nav-bar');
   if (!content) return;
-  content.innerHTML = '<div class="text-muted text-sm"><div class="spinner"></div> Загрузка…</div>';
+  content.innerHTML = '<div class="text-muted text-sm" style="padding:20px"><div class="spinner"></div> Загрузка…</div>';
+  if (navBar) navBar.classList.add('hidden');
   try {
     const r = await api('/api/subjects/' + slug + '/segments/' + srcSlug + '/' + segId);
+    if (!r.ok) {
+      content.innerHTML = '<div class="reader-notfound"><p>Этого фрагмента больше нет: источник удалён или изменён.</p></div>';
+      return;
+    }
     const seg = await r.json();
+    // Render with md() for proper markdown
     content.innerHTML =
-      '<h2 style="margin-bottom:12px">' + esc(seg.title) + '</h2>' +
+      '<h2 style="margin-bottom:8px">' + esc(seg.title) + '</h2>' +
       '<p class="text-muted text-sm" style="margin-bottom:20px">' + esc(seg.source_title) + ' · ' + seg.words + ' слов</p>' +
-      '<div style="white-space:pre-wrap">' + esc(seg.text) + '</div>';
+      '<div class="reader-body">' + renderSegment(seg.text, slug, srcSlug) + '</div>';
     renderMath(content);
+    // Highlight query text if &q= present in URL
+    var qm = location.hash.indexOf('?');
+    if (qm > -1) {
+      var qParams = new URLSearchParams(location.hash.slice(qm + 1));
+      var qText = qParams.get('q') || '';
+      if (qText) {
+        try { qText = decodeURIComponent(qText); } catch(e) {}
+        _highlightInReader(content, qText);
+      }
+    }
+    // Wire click-to-enlarge on images
+    content.querySelectorAll('.reader-body img').forEach(function(img) {
+      img.style.cursor = 'zoom-in';
+      img.addEventListener('click', function() { _showImgModal(img.src, img.alt); });
+    });
+    // Navigation buttons
+    if (navBar) {
+      var srcData = _readerSegs[srcSlug];
+      var segments = srcData ? (srcData.segments || []) : [];
+      var prevSeg = segments.find(function(s) { return s.index === segId - 1; });
+      var nextSeg = segments.find(function(s) { return s.index === segId + 1; });
+      var prevBtn = prevSeg
+        ? '<button class="btn btn-ghost" onclick="loadSegById(\'' + slug + '\',\'' + srcSlug + '\',' + prevSeg.index + ')">← ' + esc(prevSeg.title.slice(0, 30)) + '</button>'
+        : '<span></span>';
+      var nextBtn = nextSeg
+        ? '<button class="btn btn-ghost" onclick="loadSegById(\'' + slug + '\',\'' + srcSlug + '\',' + nextSeg.index + ')">→ ' + esc(nextSeg.title.slice(0, 30)) + '</button>'
+        : '<span></span>';
+      navBar.innerHTML = prevBtn + nextBtn;
+      navBar.classList.remove('hidden');
+    }
   } catch(e) {
-    content.innerHTML = '<p style="color:var(--red)">Ошибка загрузки сегмента</p>';
+    content.innerHTML = '<p style="color:var(--red);padding:20px">Ошибка загрузки сегмента</p>';
   }
+}
+
+function loadSegById(slug, srcSlug, segId) {
+  var tocEl = document.querySelector('.toc-item[data-src="' + srcSlug + '"][data-seg="' + segId + '"]');
+  loadSeg(slug, srcSlug, segId, tocEl);
 }
 
 // ── Chat ───────────────────────────────────────────────────────────────
