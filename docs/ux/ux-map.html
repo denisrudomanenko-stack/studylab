@@ -1,0 +1,517 @@
+<title>UX-карта StudyLab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geologica:wght@400;500;600&family=Unbounded:wght@500;700&display=swap">
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0c0b14; --surface:#16142a; --surface2:#1e1b36; --line:#2c2946;
+  --text:#ecebf5; --muted:#a3a1ba; --accent:#a99bff; --accent-ink:#14102b;
+  --ok:#6ee7a8; --warn:#fbbf5b; --bad:#ff8f8f;
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
+  color-scheme:light;
+  --bg:#f4f3fa; --surface:#ffffff; --surface2:#ecebf6; --line:#d9d6ec;
+  --text:#17152b; --muted:#5a5873; --accent:#5b45e0; --accent-ink:#ffffff;
+  --ok:#0b7a47; --warn:#8a5a00; --bad:#b42318;
+  --shadow:0 10px 30px rgba(40,30,100,.12);
+}}
+:root[data-theme="light"]{
+  color-scheme:light;
+  --bg:#f4f3fa; --surface:#ffffff; --surface2:#ecebf6; --line:#d9d6ec;
+  --text:#17152b; --muted:#5a5873; --accent:#5b45e0; --accent-ink:#ffffff;
+  --ok:#0b7a47; --warn:#8a5a00; --bad:#b42318;
+  --shadow:0 10px 30px rgba(40,30,100,.12);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:400 16px/1.6 Geologica,-apple-system,system-ui,sans-serif;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));-webkit-text-size-adjust:100%}
+.wrap{max-width:1120px;margin:0 auto}
+h1,h2,h3{font-family:Unbounded,Geologica,sans-serif;font-weight:700;line-height:1.2;margin:0;text-wrap:balance}
+h1{font-size:clamp(1.7rem,5vw,2.8rem);letter-spacing:-.01em}
+h2{font-size:clamp(1.25rem,3.4vw,1.7rem)}
+h3{font-size:1.02rem}
+p{margin:0}
+.eyebrow{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600}
+header.hero{padding-block:48px 28px;display:grid;gap:18px}
+.lead{font-size:1.08rem;color:var(--muted);max-width:66ch}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:color-mix(in srgb,var(--bg) 88%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line);margin-inline:calc(-1*max(16px,env(safe-area-inset-left,0px)));padding-inline:max(16px,env(safe-area-inset-left,0px));overflow-x:auto;white-space:nowrap}
+nav.toc a{display:inline-block;padding:12px 12px;font-size:.84rem;color:var(--muted);text-decoration:none}
+nav.toc a:hover{color:var(--text)}
+section{padding-block:44px 8px;display:grid;gap:20px;scroll-margin-top:52px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:20px;min-width:0}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:16px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:16px}
+.muted{color:var(--muted)}
+.small{font-size:.88rem}
+.tag{display:inline-block;font-size:.72rem;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--surface2);color:var(--muted);border:1px solid var(--line)}
+.tag.ok{color:var(--ok)} .tag.warn{color:var(--warn)} .tag.bad{color:var(--bad)} .tag.acc{color:var(--accent)}
+ul.clean{margin:8px 0 0;padding-left:1.1em;display:grid;gap:6px}
+.big-num{font-family:Unbounded,sans-serif;font-size:1.6rem;color:var(--accent)}
+.principles{counter-reset:p;display:grid;gap:12px}
+.principles .card{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start}
+.principles .card::before{counter-increment:p;content:counter(p);font-family:Unbounded,sans-serif;font-size:1.3rem;color:var(--accent);min-width:1.4em}
+.focus-card{border:1px solid var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--surface))}
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(200px,100%),1fr));gap:12px;counter-reset:f}
+.flow .card{display:grid;gap:6px;align-content:start}
+.flow .card::before{counter-increment:f;content:counter(f);font-family:Unbounded,sans-serif;color:var(--accent);font-size:1.2rem}
+.check{list-style:none;padding:0;margin:8px 0 0;display:grid;gap:8px}
+.check li{padding-left:26px;position:relative}
+.check li::before{content:"";position:absolute;left:0;top:.35em;width:14px;height:14px;border-radius:5px;border:2px solid var(--ok)}
+
+/* CJM */
+.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:18px;background:var(--surface);-webkit-overflow-scrolling:touch}
+table.cjm{border-collapse:separate;border-spacing:0;table-layout:fixed;min-width:1240px;width:100%;font-size:.84rem;line-height:1.5}
+table.cjm th,table.cjm td{padding:12px;vertical-align:top;border-bottom:1px solid var(--line);border-right:1px solid var(--line);text-align:left}
+table.cjm tr:last-child td,table.cjm tr:last-child th{border-bottom:0}
+table.cjm td:last-child,table.cjm thead th:last-child{border-right:0}
+table.cjm th.rowh{width:104px;position:sticky;left:0;background:var(--surface2);font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);z-index:1;font-weight:600}
+table.cjm thead th{background:var(--surface2);font-family:Unbounded,sans-serif;font-size:.82rem;color:var(--text)}
+table.cjm thead th small{display:block;font:500 .68rem Geologica,sans-serif;color:var(--accent);letter-spacing:.1em;margin-bottom:4px}
+table.cjm td.curve{padding:6px 0;background:var(--bg)}
+table.cjm td.pain b{color:var(--bad);font-weight:600}
+table.cjm td.fix b{color:var(--ok);font-weight:600}
+.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:.82rem;color:var(--muted)}
+.legend i{display:inline-block;width:22px;height:0;border-top:3px solid;vertical-align:middle;margin-right:6px}
+.tree{font:500 .86rem/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;overflow-x:auto;margin:10px 0 0;color:var(--text)}
+.tree .n{color:var(--accent)} .tree .d{color:var(--muted)} .tree .g{color:var(--ok)}
+
+/* screens (laptop / tablet) */
+.screens{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,500px),1fr));gap:26px}
+.sc{display:grid;gap:10px;align-content:start;min-width:0}
+.dev{border:2px solid var(--line);border-radius:16px;background:var(--bg);box-shadow:var(--shadow);overflow:hidden;font-size:.74rem;line-height:1.4}
+.dev .top{display:flex;gap:5px;padding:8px 10px;border-bottom:1px solid var(--line);background:var(--surface2)}
+.dev .top i{width:8px;height:8px;border-radius:50%;background:var(--line)}
+.dev .body{display:grid;grid-template-columns:78px 1fr;min-height:330px}
+.rail{border-right:1px solid var(--line);padding:10px 8px;display:grid;gap:6px;align-content:start;color:var(--muted);font-size:.66rem;background:var(--surface)}
+.rail b{color:var(--accent);font-weight:600}
+.rail .lg{font-family:Unbounded,sans-serif;color:var(--text);font-size:.7rem;margin-bottom:6px}
+.main{padding:12px;display:grid;gap:9px;align-content:start;min-width:0}
+.main.two{grid-template-columns:1.25fr 1fr;gap:12px}
+.col{display:grid;gap:8px;align-content:start;min-width:0}
+.h{font-family:Unbounded,sans-serif;font-weight:700;font-size:.92rem;line-height:1.2}
+.box{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:9px 10px;display:grid;gap:5px}
+.box.hl{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--surface))}
+.btn{background:var(--accent);color:var(--accent-ink);border-radius:10px;padding:8px 10px;text-align:center;font-family:Unbounded,sans-serif;font-weight:500;font-size:.68rem}
+.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-family:Geologica,sans-serif;font-weight:500}
+.row{display:flex;gap:6px;align-items:center;justify-content:space-between;min-width:0}
+.row>span:first-child{min-width:0}
+.pill{font-size:.62rem;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:var(--ok)} .pill.warn{color:var(--warn);border-color:var(--warn)} .pill.acc{color:var(--accent);border-color:var(--accent)} .pill.bad{color:var(--bad);border-color:var(--bad)}
+.prog{height:6px;border-radius:99px;background:var(--surface2);overflow:hidden}
+.prog>i{display:block;height:100%;background:var(--accent);border-radius:99px}
+.seg{display:flex;background:var(--surface2);border-radius:10px;padding:3px;gap:2px}
+.seg span{flex:1;text-align:center;padding:5px 2px;border-radius:8px;color:var(--muted);font-size:.64rem}
+.seg span.on{background:var(--surface);color:var(--text);font-weight:600}
+.chip{display:inline-block;font-size:.62rem;padding:1px 7px;border-radius:7px;background:var(--surface2);color:var(--accent);border:1px solid var(--line);margin-left:2px}
+.inp{border:1px solid var(--line);border-radius:9px;padding:6px 9px;color:var(--muted);background:var(--surface)}
+.cap{font-size:.82rem;color:var(--muted)}
+.cap b{color:var(--text)}
+@media (max-width:560px){.dev .body{grid-template-columns:1fr}.rail{display:none}.main.two{grid-template-columns:1fr}}
+
+table.plain{width:100%;border-collapse:collapse;font-size:.88rem}
+table.plain th,table.plain td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+table.plain th{color:var(--muted);font-weight:600;font-size:.74rem;letter-spacing:.08em;text-transform:uppercase}
+.prio{display:grid;gap:12px}
+.prio .card{display:grid;gap:8px}
+.prio .head{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.phones{display:flex;flex-wrap:wrap;gap:22px;justify-content:center}
+.pcol{width:250px;display:grid;gap:10px;align-content:start}
+.ph{border:2px solid var(--line);border-radius:28px;background:var(--bg);box-shadow:var(--shadow);padding:12px;display:grid;gap:8px;font-size:.72rem;line-height:1.4}
+.ph .bar{display:flex;justify-content:space-between;color:var(--muted);font-size:.64rem}
+.ph .tabs{display:flex;justify-content:space-around;border-top:1px solid var(--line);padding-top:8px;color:var(--muted);font-size:.64rem}
+.ph .tabs b{color:var(--accent);font-weight:600}
+.me{justify-self:end;max-width:85%;background:var(--accent);color:var(--accent-ink);border-radius:12px 12px 3px 12px;padding:7px 10px}
+footer{padding-block:40px 56px;color:var(--muted);font-size:.85rem}
+@media (max-width:520px){header.hero{padding-block:32px 20px} .card{padding:16px}}
+</style>
+
+<div class="wrap">
+<header class="hero">
+  <div class="eyebrow">StudyLab · UX-проект · версия 3 · октябрь 2026</div>
+  <h1>Один раз загрузила материалы — получила ответы на все билеты</h1>
+  <p class="lead">Тома сегодня готовится в DeepSeek: загружает материалы и просит конспект ответа, билет за билетом, каждый раз заново. StudyLab должен быть лучше именно в этом: материалы предмета загружаются один раз, ответы на 30–50 билетов готовятся пачкой, и каждому тезису можно доверять, потому что рядом его источник. Ниже: кто пользуется, путь Томы (CJM), структура, экраны для ноутбука и планшета и план.</p>
+  <div class="grid3">
+    <div class="card"><div class="big-num">1 раз</div><p class="small muted">загрузить материалы предмета, а не в каждый чат</p></div>
+    <div class="card"><div class="big-num">30–50</div><p class="small muted">билетов предмета получают ответы одной очередью, а не по одному</p></div>
+    <div class="card"><div class="big-num">1 клик</div><p class="small muted">от тезиса в ответе до места в её конспекте</p></div>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Разделы">
+  <a href="#focus">Приоритет</a><a href="#people">Люди</a><a href="#cjm">CJM Томы</a><a href="#admin">Денис</a><a href="#ia">Структура</a><a href="#screens">Экраны</a><a href="#principles">Принципы</a><a href="#plan">План</a><a href="#backlog">Бэклог</a><a href="#questions">Вопросы</a>
+</nav>
+
+<section id="focus">
+  <div><div class="eyebrow">Главный приоритет</div><h2>От источников к идеальному ответу на билет</h2></div>
+  <div class="card focus-card">
+    <p class="lead" style="color:var(--text)">Вся ценность StudyLab в одном результате: <b>по вопросу билета Тома получает готовый конспект ответа, собранный только из её материалов и с источником у каждого тезиса.</b> Она загружает материалы сама, предметов больше десяти, билетов в каждом 30–50, поэтому путь должен быть быстрым и массовым. Остальное (повторение, экспорт, «Сегодня») усиливает продукт после него.</p>
+  </div>
+  <div class="flow">
+    <div class="card"><h3>Материалы загружены</h3><p class="small muted">Тома сама создаёт предмет, ставит дату экзамена, загружает файлы и видит понятный статус: «прочитан», «частично», «не распознан».</p></div>
+    <div class="card"><h3>Список билетов</h3><p class="small muted">Вставляет все вопросы разом (30–50 строк). Система разбирает их на отдельные билеты.</p></div>
+    <div class="card"><h3>Что нашлось</h3><p class="small muted">Перед генерацией: «Нашла в 3 источниках, 7 фрагментов» и чего не хватает. Лишнее можно отключить.</p></div>
+    <div class="card"><h3>Ответ</h3><p class="small muted">Конспект нужной глубины с чипами источников и блоком «чего нет в материалах». Для всех билетов подряд очередью в фоне.</p></div>
+    <div class="card"><h3>Доработка</h3><p class="small muted">«Дополнить: …», «Короче», «Подробнее». Устраивает — фиксируем как эталон билета.</p></div>
+  </div>
+  <div class="grid2">
+    <div class="card"><span class="tag ok">Критерии</span><h3 style="margin:8px 0 0">Что считаем идеальным ответом</h3>
+      <ul class="check small">
+        <li><b>Конспект, а не простыня:</b> тезисы с логикой билета (определение → строение или механизм → значение → примеры).</li>
+        <li><b>Глубина по выбору.</b> Требования всегда разные, поэтому формат задаёт Тома: Кратко, Стандарт или Подробно, плюс поле «Пожелания к ответу» (например, «как у Иванова: с классификацией и схемой»).</li>
+        <li><b>Каждый тезис с источником:</b> чип «Лекция 4, §2» открывает читалку на этом месте.</li>
+        <li><b>Только из материалов:</b> чего нет, то названо в блоке «в материалах не найдено», а не выдумано.</li>
+        <li><b>Точность терминов:</b> латинские названия, формулы и таблицы отображаются корректно.</li>
+        <li><b>Можно доработать</b> комментарием с сохранением версий.</li>
+      </ul></div>
+    <div class="card"><span class="tag acc">Лучше, чем DeepSeek</span><h3 style="margin:8px 0 0">Чем StudyLab должен выиграть</h3>
+      <div class="scroll" style="margin-top:10px;border-radius:12px"><table class="plain" style="min-width:420px;font-size:.82rem">
+        <thead><tr><th></th><th>Сегодня</th><th>StudyLab</th></tr></thead>
+        <tbody>
+          <tr><td>Материалы</td><td>Грузит заново в каждый чат</td><td>Один раз на предмет</td></tr>
+          <tr><td>Объём</td><td>Билет за билетом вручную</td><td>Очередь на все билеты</td></tr>
+          <tr><td>Доверие</td><td>Нет ссылок на место в конспекте</td><td>Чип → читалка</td></tr>
+          <tr><td>Хранение</td><td>Теряется в истории чатов</td><td>По билетам, со статусом</td></tr>
+          <tr><td>Качество</td><td>На глаз</td><td>Покрытие и блок пробелов</td></tr>
+        </tbody></table></div>
+      <p class="small muted" style="margin-top:12px"><b style="color:var(--text)">Как поймём, что получилось:</b> время от загрузки материалов до готовых ответов на все билеты предмета; доля тезисов с источником (цель 100%); доля ответов, принятых без правок.</p></div>
+  </div>
+</section>
+
+<section id="people">
+  <div><div class="eyebrow">01 · Люди и задача</div><h2>Для кого и зачем</h2></div>
+  <div class="grid2">
+    <div class="card">
+      <span class="tag acc">Основной пользователь</span>
+      <h3 style="margin:10px 0 6px">Тома, 2 курс, микробиология</h3>
+      <p class="small muted">Учится на ноутбуке и планшете; с телефона только читает готовые билеты и общается с ассистентом. Предметов больше десяти, в каждом 30–50 билетов, иногда больше. Даты экзаменов известны заранее. Материалы загружает сама. Сегодня делает это в DeepSeek: загружает материалы и просит конспект ответа.</p>
+      <p class="small" style="margin-top:10px"><b>Задача (JTBD):</b> «Когда до экзамена остаются недели, я хочу один раз загрузить материалы и получить конспекты ответов на все билеты, которым я могу верить, чтобы прийти на экзамен без белых пятен».</p>
+      <ul class="clean small"><li>Не хочет терять время на повторную загрузку и ручные запросы</li><li>Боится пропустить билет и не заметить этого</li><li>Не доверяет ответам без источника</li></ul>
+    </div>
+    <div class="card">
+      <span class="tag">Администратор</span>
+      <h3 style="margin:10px 0 6px">Денис</h3>
+      <p class="small muted">На этапе тестирования проверяет путь и поддерживает: подтверждает смену пароля, следит за ресурсами сервера. Материалы не загружает: это делает Тома.</p>
+      <p class="small" style="margin-top:10px"><b>Задача (JTBD):</b> «Пока идёт тестирование, я хочу быстро увидеть, где Тома застревает, и не дать серверу упасть от нагрузки».</p>
+      <ul class="clean small"><li>Нужны подсказки, где путь ломается</li><li>Нужны лимиты и видимость нагрузки</li></ul>
+    </div>
+  </div>
+  <div class="card small muted"><b style="color:var(--text)">Допущения.</b> Оценки эмоций в CJM — моя экспертная оценка, не замеры. Что в интерфейсе загрузка и индексация показываются только администратору, видно в коде (проверить, так ли это и на сервере). Остальное, что про код, помечено «проверить».</div>
+</section>
+
+<section id="cjm">
+  <div><div class="eyebrow">02 · Путь Томы</div><h2>CJM: от входа до вечера перед экзаменом</h2></div>
+  <p class="lead">Семь стадий. Красная линия — как путь ощущается сейчас, зелёная — каким должен стать. Таблицу можно листать вбок.</p>
+  <div class="legend"><span><i style="border-color:var(--bad)"></i>сейчас (оценка)</span><span><i style="border-color:var(--ok)"></i>цель</span></div>
+  <div class="scroll"><table class="cjm">
+    <thead><tr>
+      <th class="rowh"></th>
+      <th><small>1</small>Старт</th>
+      <th><small>2</small>Подготовка предмета</th>
+      <th><small>3 · ПРИОРИТЕТ</small>Ответ на билет</th>
+      <th><small>4 · ПРИОРИТЕТ</small>Проверить и уточнить</th>
+      <th><small>5 · ПРИОРИТЕТ</small>Пройти весь список</th>
+      <th><small>6</small>Повторить</th>
+      <th><small>7</small>Накануне</th>
+    </tr></thead>
+    <tbody>
+      <tr><th class="rowh">Эмоции</th><td class="curve" colspan="7">
+        <svg viewBox="0 0 700 150" width="100%" role="img" aria-label="Кривая эмоций: сейчас ниже, чем должна быть, провал на подготовке предмета">
+          <g stroke="currentColor" style="color:var(--line)" stroke-width="1">
+            <line x1="0" y1="25" x2="700" y2="25"/><line x1="0" y1="75" x2="700" y2="75" stroke-dasharray="4 5"/><line x1="0" y1="125" x2="700" y2="125"/>
+            <g stroke-dasharray="2 6"><line x1="100" y1="0" x2="100" y2="150"/><line x1="200" y1="0" x2="200" y2="150"/><line x1="300" y1="0" x2="300" y2="150"/><line x1="400" y1="0" x2="400" y2="150"/><line x1="500" y1="0" x2="500" y2="150"/><line x1="600" y1="0" x2="600" y2="150"/></g>
+          </g>
+          <g font-size="10" style="fill:var(--muted)" font-family="Geologica,sans-serif"><text x="4" y="20">доволен</text><text x="4" y="143">раздражён</text></g>
+          <polyline fill="none" style="stroke:var(--ok)" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" points="50,36 150,36 250,23 350,36 450,36 550,36 650,36"/>
+          <polyline fill="none" style="stroke:var(--bad)" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" points="50,75 150,114 250,75 350,88 450,101 550,101 650,88"/>
+          <g style="fill:var(--ok)"><circle cx="50" cy="36" r="5"/><circle cx="150" cy="36" r="5"/><circle cx="250" cy="23" r="5"/><circle cx="350" cy="36" r="5"/><circle cx="450" cy="36" r="5"/><circle cx="550" cy="36" r="5"/><circle cx="650" cy="36" r="5"/></g>
+          <g style="fill:var(--bad)"><circle cx="50" cy="75" r="5"/><circle cx="150" cy="114" r="5"/><circle cx="250" cy="75" r="5"/><circle cx="350" cy="88" r="5"/><circle cx="450" cy="101" r="5"/><circle cx="550" cy="101" r="5"/><circle cx="650" cy="88" r="5"/></g>
+        </svg>
+      </td></tr>
+      <tr><th class="rowh">Цель</th>
+        <td>Понять, на каком предмете сосредоточиться</td><td>Один раз загрузить всё и получить рабочую базу</td><td>Получить конспект ответа, как раньше в DeepSeek, но надёжнее</td><td>Убедиться в ответе и добить пробелы</td><td>Закрыть все 30–50 билетов и не потеряться</td><td>Закрепить и видеть прогресс</td><td>Иметь всё под рукой в нужном виде</td></tr>
+      <tr><th class="rowh">Делает</th>
+        <td>Открывает StudyLab на ноутбуке, смотрит предметы</td><td>Создаёт предмет, ставит дату, перетаскивает файлы, ждёт индексации, вставляет список билетов</td><td>Открывает билет, выбирает глубину, жмёт «Составить ответ»</td><td>Сверяет с конспектом, спрашивает ассистента, дорабатывает</td><td>Идёт по списку, запускает ответы по очереди</td><td>Перечитывает ответы, отмечает «знаю / ещё раз»</td><td>Выгружает билеты предмета, читает или печатает</td></tr>
+      <tr><th class="rowh">Думает</th>
+        <td>«Какой экзамен ближе? Где я отстаю?»</td><td>«Прочиталось ли всё? Не потерялись ли формулы и таблицы?»</td><td>«Это из моих материалов? Достаточно ли подробно для этого преподавателя?»</td><td>«Где это в лекции? Чего не хватает?»</td><td>«Сколько осталось? Что я пропустила?»</td><td>«Что я уже знаю, а что нет?»</td><td>«Только бы всё открылось и выглядело нормально»</td></tr>
+      <tr><th class="rowh">Боли сейчас</th>
+        <td class="pain"><b>Предметов больше десяти</b>, а список без дат экзаменов и прогресса подготовки; неясно, с чего начать</td>
+        <td class="pain"><b>Загрузка и индексация в интерфейсе доступны только админу</b> (проверить права); статус технический: чанки, эмбеддинг; билеты добавляются по одному или спрятанной пакетной вставкой</td>
+        <td class="pain"><b>Один формат ответа,</b> нельзя задать глубину; не видно, на чём стоит ответ до генерации; ожидание без шагов</td>
+        <td class="pain"><b>Ссылка на источник</b> — текст (открывается ли читалка на месте — проверить в коде); чат отдельно от билета; формулы в таблицах</td>
+        <td class="pain"><b>Ответы по одному вручную,</b> очереди нет; при 10+ предметах и сотнях билетов не обозреть, где что готово</td>
+        <td class="pain"><b>Нет режима повторения</b> и отметок «знаю / ещё раз»; прогресс не накапливается</td>
+        <td class="pain"><b>Экспорт</b> скачивается отдельным файлом в другом оформлении; формулы в таблицах</td></tr>
+      <tr><th class="rowh">Решение</th>
+        <td class="fix"><b>Предметы по дате экзамена:</b> «через 12 дней · 18 из 40», поиск, архив прошедших</td>
+        <td class="fix"><b>Мастер в 3 шага:</b> предмет и дата → материалы со статусом «прочитан / частично / не распознан» → вставить список билетов, разобрать автоматически</td>
+        <td class="fix"><b>Глубина:</b> Кратко · Стандарт · Подробно + поле «Пожелания». Панель покрытия до генерации. Шаги «ищу → читаю → пишу»</td>
+        <td class="fix"><b>Двухколоночный экран:</b> слева ответ, справа читалка с подсветкой по клику на чип; «Дополнить» там же; блок «чего нет в материалах»; «Зафиксировать»</td>
+        <td class="fix"><b>«Подготовить ответы на все без ответа (23)»</b> очередью в фоне, с прогрессом; фильтры, поиск, статусы</td>
+        <td class="fix"><b>Режим «Повторение»:</b> вопрос → «Показать ответ» → «Знаю» / «Ещё раз». Хорошо подходит для телефона. Напоминания позже</td>
+        <td class="fix"><b>Экспорт в стиле приложения:</b> все или только «Ещё раз», PDF для печати</td></tr>
+      <tr><th class="rowh">Метрика</th>
+        <td>До нужного предмета ≤ 1 клик</td><td>Время от создания предмета до списка билетов</td><td>Доля ответов, принятых без правок</td><td>Доля тезисов с открытым источником</td><td>Время от списка билетов до ответов на все</td><td>Повторений в неделю</td><td>Экспортов за 3 дня до экзамена</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="admin">
+  <div><div class="eyebrow">03 · Денис</div><h2>Администратор: три задачи</h2></div>
+  <div class="grid3">
+    <div class="card"><span class="tag">1</span><h3 style="margin:8px 0">Тестирование</h3>
+      <p class="small muted">Проходит путь Томы и ищет, где ломается.</p>
+      <ul class="clean small"><li><b style="color:var(--ok)">Решение:</b> видит те же экраны, что Тома, и отдельный журнал ошибок генерации и индексации в профиле</li></ul></div>
+    <div class="card"><span class="tag">2</span><h3 style="margin:8px 0">Поддержка</h3>
+      <p class="small muted">Подтверждает смену пароля.</p>
+      <ul class="clean small"><li><b style="color:var(--bad)">Боль:</b> письмо, потом ссылка Томе: два ручных шага</li><li><b style="color:var(--ok)">Решение:</b> плашка «Запрос на смену пароля» с кнопкой «Подтвердить»</li></ul></div>
+    <div class="card"><span class="tag">3</span><h3 style="margin:8px 0">Ресурсы</h3>
+      <p class="small muted">Сервер маленький: 2 процессора, 2 ГБ памяти, 16 ГБ диска (по CLAUDE.md).</p>
+      <ul class="clean small"><li><b style="color:var(--bad)">Риск:</b> 10 предметов × 40 билетов × материалы, очередь генерации и индексация одновременно</li><li><b style="color:var(--ok)">Решение:</b> очередь с ограничением по параллелизму, видимый расход места, лимиты запросов к модели</li></ul></div>
+  </div>
+</section>
+
+<section id="ia">
+  <div><div class="eyebrow">04 · Структура</div><h2>Навигация для ноутбука и планшета</h2></div>
+  <div class="grid2">
+    <div class="card"><span class="tag bad">Сейчас</span>
+<pre class="tree"><span class="n">Предметы</span> <span class="d">(сетка карточек)</span>
+ └ <span class="n">Предмет</span>
+    ├ вкладка Источники <span class="d">(админ)</span>
+    ├ вкладка Поиск
+    └ кнопки <span class="d">Читалка · Чат · Билеты</span>
+       <span class="d">(отдельные страницы)</span></pre>
+      <p class="small muted" style="margin-top:10px">Организовано по устройству системы. При 10+ предметах и 40 билетах на предмет Томе трудно обозреть, где что готово.</p></div>
+    <div class="card"><span class="tag ok">Станет</span>
+<pre class="tree"><span class="n">Предметы</span> <span class="d">← по дате экзамена</span>
+ └ <span class="n">Предмет</span>
+    ├ <span class="g">Билеты</span> <span class="d">(по умолчанию, список + ответ)</span>
+    ├ Материалы <span class="d">(загрузка, статусы)</span>
+    └ Читать
+<span class="n">Спросить</span> <span class="d">← вопрос по всем предметам</span>
+<span class="n">Профиль</span> <span class="d">(тема, пароль, выход)</span></pre>
+      <p class="small muted" style="margin-top:10px">Слева узкая колонка навигации. На планшете в портрете она превращается в верхнюю панель. Внутри предмета переключатель «Билеты · Материалы · Читать». На телефоне остаются «Билеты» и «Спросить».</p></div>
+  </div>
+  <div class="grid3">
+    <div class="card"><h3>Билеты — основа</h3><p class="small muted" style="margin-top:6px">Билет — единица подготовки. Читалка, чат и источники служат билету, а не живут рядом с ним.</p></div>
+    <div class="card"><h3>Материалы у студентки</h3><p class="small muted" style="margin-top:6px">Создание предмета и загрузка файлов доступны Томе, а не только админу. Нужно изменить права на сервере.</p></div>
+    <div class="card"><h3>Масштаб</h3><p class="small muted" style="margin-top:6px">Поиск и сортировка предметов, фильтры и поиск по билетам, групповые действия: иначе 400+ билетов не обозреть.</p></div>
+  </div>
+</section>
+
+<section id="screens">
+  <div><div class="eyebrow">05 · Экраны</div><h2>Четыре ключевых экрана (схемы для ноутбука и планшета)</h2></div>
+  <p class="lead">Это схемы расположения, а не финальная графика. Цвета и шрифты из «Ночного атласа». Подписи — предложение по тексту интерфейса.</p>
+  <div class="screens">
+
+    <div class="sc">
+      <div class="dev"><div class="top"><i></i><i></i><i></i></div><div class="body">
+        <div class="rail"><div class="lg">StudyLab</div><b>Предметы</b><span>Спросить</span><span>Профиль</span></div>
+        <div class="main">
+          <div class="row"><div class="h">Предметы</div><span class="inp" style="flex:1;max-width:150px">Поиск…</span></div>
+          <div class="seg"><span class="on">Ближайшие</span><span>Все</span><span>Прошедшие</span></div>
+          <div class="box hl"><div class="row"><b>Микробиология</b><span class="pill warn">через 12 дней</span></div><div class="prog"><i style="width:45%"></i></div><div class="row"><span class="muted">18 из 40 билетов · 23 без ответа</span><span class="pill acc">Продолжить</span></div></div>
+          <div class="box"><div class="row"><b>Биохимия</b><span class="pill">через 19 дней</span></div><div class="prog"><i style="width:20%"></i></div><div class="row"><span class="muted">8 из 45 билетов</span><span class="pill acc">Продолжить</span></div></div>
+          <div class="box"><div class="row"><b>Цитология</b><span class="pill">через 27 дней</span></div><div class="prog"><i style="width:0%"></i></div><div class="row"><span class="muted">Материалы не загружены</span><span class="pill bad">Подготовить</span></div></div>
+          <div class="btn ghost">+ Новый предмет</div>
+        </div>
+      </div></div>
+      <div class="cap"><b>1. Предметы.</b> Сортировка по дате экзамена, прогресс у каждого, понятная следующая кнопка.</div>
+    </div>
+
+    <div class="sc">
+      <div class="dev"><div class="top"><i></i><i></i><i></i></div><div class="body">
+        <div class="rail"><div class="lg">StudyLab</div><b>Предметы</b><span>Спросить</span><span>Профиль</span></div>
+        <div class="main">
+          <div class="row"><div class="h">Новый предмет</div><span class="muted">Шаг 2 из 3</span></div>
+          <div class="prog"><i style="width:66%"></i></div>
+          <div class="box" style="border-style:dashed;text-align:center;padding:14px"><b>Перетащите файлы сюда</b><span class="muted">PDF, DOCX, TXT, MD · можно сразу много</span></div>
+          <div class="box"><div class="row"><span>Лекция 4.pdf</span><span class="pill ok">прочитан</span></div><div class="row"><span>Учебник.pdf</span><span class="pill warn">частично · 3 стр.</span></div><div class="row"><span>Конспект фото.jpg</span><span class="pill bad">не распознан</span></div></div>
+          <div class="muted">«Частично» значит, что часть страниц не прочиталась. <u>Показать какие</u></div>
+          <div class="row"><div class="btn ghost" style="flex:1">Назад</div><div class="btn" style="flex:2">Дальше: список билетов</div></div>
+        </div>
+      </div></div>
+      <div class="cap"><b>2. Подготовка предмета.</b> Мастер из трёх шагов: предмет и дата → материалы → билеты. Статусы на человеческом языке.</div>
+    </div>
+
+    <div class="sc">
+      <div class="dev"><div class="top"><i></i><i></i><i></i></div><div class="body">
+        <div class="rail"><div class="lg">StudyLab</div><b>Предметы</b><span>Спросить</span><span>Профиль</span></div>
+        <div class="main">
+          <div class="row"><div class="h">Микробиология</div><span class="pill warn">через 12 дней</span></div>
+          <div class="seg"><span class="on">Билеты</span><span>Материалы</span><span>Читать</span></div>
+          <div class="row"><span class="inp" style="flex:1">Поиск по билетам…</span><span class="pill acc">Без ответа 23</span></div>
+          <div class="box hl"><div class="row"><b>Подготовить ответы на все без ответа (23)</b></div><div class="prog"><i style="width:35%"></i></div><div class="muted">Готово 8 из 23 · можно закрыть страницу</div></div>
+          <div class="box"><div class="row"><span><b>19.</b> Строение грамположительной клетки</span><span class="pill ok">готов</span></div></div>
+          <div class="box"><div class="row"><span><b>18.</b> Спорообразование</span><span class="pill ok">знаю</span></div></div>
+          <div class="box"><div class="row"><span><b>17.</b> Плазмиды</span><span class="pill">в очереди</span></div></div>
+        </div>
+      </div></div>
+      <div class="cap"><b>3. Билеты предмета.</b> 40 строк с поиском и фильтрами. Одна кнопка запускает очередь на все билеты без ответа.</div>
+    </div>
+
+    <div class="sc">
+      <div class="dev"><div class="top"><i></i><i></i><i></i></div><div class="body">
+        <div class="rail"><div class="lg">StudyLab</div><b>Предметы</b><span>Спросить</span><span>Профиль</span></div>
+        <div class="main two">
+          <div class="col">
+            <div class="row"><div class="h">19. Строение грамположительной клетки</div></div>
+            <div class="seg"><span>Кратко</span><span class="on">Стандарт</span><span>Подробно</span></div>
+            <div class="box">
+              <div><b>Определение.</b> Окрашиваются по Граму в фиолетовый <span class="chip">Лекция 4</span></div>
+              <div><b>Клеточная стенка.</b> Толстый слой пептидогликана <span class="chip">Лекция 4, §2</span></div>
+              <div><b>Тейхоевые кислоты</b> связывают слои с мембраной <span class="chip">Учебник, гл. 3</span></div>
+              <div class="muted">Не найдено в материалах: примеры бактерий</div>
+            </div>
+            <div class="inp">Пожелания: как у Иванова, с классификацией…</div>
+            <div class="row"><div class="btn ghost" style="flex:1">Дополнить</div><div class="btn" style="flex:1">Зафиксировать</div></div>
+          </div>
+          <div class="col">
+            <div class="box hl"><b>Источники ответа</b>
+              <div class="row"><span>Лекция 4 · §2</span><span class="pill ok">сильно</span></div>
+              <div class="row"><span>Учебник · гл. 3</span><span class="pill ok">сильно</span></div>
+              <div class="row"><span>Конспект · стр. 12</span><span class="pill warn">слабо</span></div></div>
+            <div class="box"><b>Читалка</b><div class="muted">Лекция 4, §2</div><div style="background:color-mix(in srgb,var(--warn) 22%,transparent);padding:4px 6px;border-radius:6px">…клеточная стенка содержит толстый слой пептидогликана…</div></div>
+          </div>
+        </div>
+      </div></div>
+      <div class="cap"><b>4. Билет.</b> Слева конспект ответа, справа источники и читалка. Тап по чипу подсвечивает фрагмент. На планшете в портрете колонки встают друг под другом.</div>
+    </div>
+
+  </div>
+
+  <div style="margin-top:12px"><span class="tag acc">Телефон</span>
+    <h3 style="margin:10px 0 6px">С телефона: только готовые билеты и ассистент</h3>
+    <p class="small muted" style="max-width:70ch">Подготовка предмета, загрузка материалов, вставка списка и генерация ответов остаются на ноутбуке и планшете. На телефоне Тома читает готовые билеты, повторяет их и общается с ассистентом. Вкладки «Материалы» и «Новый предмет» там не показываем, вместо них подсказка «Это удобнее сделать на ноутбуке».</p></div>
+  <div class="phones">
+    <div class="pcol">
+      <div class="ph">
+        <div class="bar"><span>‹ Предметы</span><span>через 12 дней</span></div>
+        <div class="h">Микробиология</div>
+        <div class="prog"><i style="width:45%"></i></div>
+        <div class="row"><span class="muted">18 из 40 готовы</span><span class="pill acc">Без ответа 23</span></div>
+        <div class="box"><div class="row"><span><b>19.</b> Строение грамположительной клетки</span><span class="pill ok">готов</span></div></div>
+        <div class="box"><div class="row"><span><b>18.</b> Спорообразование</span><span class="pill ok">знаю</span></div></div>
+        <div class="box"><div class="row"><span><b>17.</b> Плазмиды</span><span class="pill warn">ещё раз</span></div></div>
+        <div class="muted" style="text-align:center">Новые ответы готовятся на ноутбуке</div>
+        <div class="tabs"><b>Билеты</b><span>Спросить</span><span>Профиль</span></div>
+      </div>
+      <div class="cap"><b>Билеты.</b> Только то, что уже готово. Фильтр «Ещё раз» для быстрого повторения.</div>
+    </div>
+    <div class="pcol">
+      <div class="ph">
+        <div class="bar"><span>‹ Билеты</span><span>19 из 40</span></div>
+        <div class="h">Строение грамположительной клетки</div>
+        <div class="seg"><span>Кратко</span><span class="on">Стандарт</span><span>Подробно</span></div>
+        <div class="box">
+          <div><b>Клеточная стенка.</b> Толстый слой пептидогликана <span class="chip">Лекция 4, §2</span></div>
+          <div><b>Тейхоевые кислоты</b> связывают слои с мембраной <span class="chip">Учебник, гл. 3</span></div>
+          <div class="muted">Тап по чипу покажет фрагмент снизу</div>
+        </div>
+        <div class="row"><div class="btn ghost" style="flex:1">Ещё раз</div><div class="btn" style="flex:1">Знаю</div></div>
+        <div class="btn ghost">Спросить про этот билет</div>
+      </div>
+      <div class="cap"><b>Чтение ответа.</b> Без правки и пересоздания. Источник открывается нижней шторкой, не уводя со страницы.</div>
+    </div>
+    <div class="pcol">
+      <div class="ph">
+        <div class="bar"><span>Спросить</span><span></span></div>
+        <div class="box"><span class="muted">Ищу по всем предметам, в активных источниках</span></div>
+        <div class="me">Чем отличаются тейхоевые и липотейхоевые кислоты?</div>
+        <div class="box"><div>Тейхоевые кислоты связаны с пептидогликаном, липотейхоевые закреплены в мембране <span class="chip">Лекция 4, §2</span></div></div>
+        <div class="inp">Задайте вопрос…</div>
+        <div class="tabs"><span>Билеты</span><b>Спросить</b><span>Профиль</span></div>
+      </div>
+      <div class="cap"><b>Ассистент.</b> Короткие вопросы по материалам. Чипы источников работают так же, как на ноутбуке.</div>
+    </div>
+  </div>
+</section>
+
+<section id="principles">
+  <div><div class="eyebrow">06 · Принципы</div><h2>Шесть правил, по которым принимаем решения</h2></div>
+  <div class="principles">
+    <div class="card"><div><h3>Один раз и массово</h3><p class="small muted" style="margin-top:4px">Всё, что можно сделать один раз на предмет или разом на все билеты, не просим делать по одному. Это главное отличие от DeepSeek.</p></div></div>
+    <div class="card"><div><h3>Доверие: источник в один клик</h3><p class="small muted" style="margin-top:4px">Любой тезис ответа связан с местом в материалах. Если источника нет, ответ помечен «без источника».</p></div></div>
+    <div class="card"><div><h3>Глубина задаёт студентка</h3><p class="small muted" style="margin-top:4px">Требования у преподавателей разные, поэтому формат ответа настраивается: Кратко, Стандарт, Подробно, плюс свободные пожелания.</p></div></div>
+    <div class="card"><div><h3>Всегда видно, где ты и сколько осталось</h3><p class="small muted" style="margin-top:4px">Прогресс по билетам и дата экзамена у каждого предмета; шаги генерации вместо спиннера; очередь с прогрессом.</p></div></div>
+    <div class="card"><div><h3>Каждому устройству своя роль</h3><p class="small muted" style="margin-top:4px">Ноутбук и планшет: подготовка и работа с ответами, две колонки, цели нажатия от 44 пикселей. Телефон: чтение готовых билетов, повторение и ассистент. Ничего тяжёлого на телефоне не просим.</p></div></div>
+    <div class="card"><div><h3>Забота в словах</h3><p class="small muted" style="margin-top:4px">Тон спокойный и конкретный: «Осталось 22 билета», а не «Вы отстаёте». Ошибки объясняют, что делать дальше: «Три страницы не прочитались, загрузите файл в другом формате».</p></div></div>
+  </div>
+</section>
+
+<section id="plan">
+  <div><div class="eyebrow">07 · План внедрения</div><h2>Что делать в каком порядке</h2></div>
+  <div class="prio">
+    <div class="card"><div class="head"><span class="tag ok">P0 · главный путь</span><b>Источники → идеальный ответ</b></div>
+      <ul class="clean small">
+        <li><b>Права:</b> Тома создаёт предметы и загружает материалы сама (проверить роли в коде и на сервере)</li>
+        <li><b>Дата экзамена</b> у предмета; предметы отсортированы по ней, с поиском</li>
+        <li><b>Список билетов:</b> вставка 30–50 вопросов разом с автоматическим разбором</li>
+        <li><b>Формат ответа:</b> Кратко · Стандарт · Подробно и поле «Пожелания»; конспектная структура и блок «чего нет в материалах» в системном промпте</li>
+        <li><b>Чипы источников</b> кликабельны и ведут в читалку на нужный фрагмент (сначала проверить, как сейчас формируются ссылки)</li>
+        <li><b>Панель покрытия</b> перед генерацией и шаги «ищу → читаю → пишу»</li>
+        <li><b>Статусы материалов</b> на человеческом языке: прочитан, частично, не распознан</li>
+      </ul></div>
+    <div class="card"><div class="head"><span class="tag warn">P1 · нужен бэкенд</span><b>Масштаб: очередь, версии, прогресс</b></div>
+      <ul class="clean small">
+        <li><b>Очередь генерации</b> «ответы на все билеты без ответа» в фоне, с прогрессом и ограничением по параллелизму (сервер маленький)</li>
+        <li><b>Версии ответа:</b> зафиксированный эталон, перегенерация с комментарием</li>
+        <li><b>Прогресс билетов:</b> статус (новый, знаю, ещё раз, проверить), время просмотра</li>
+        <li>Двухколоночный экран билета и новая навигация</li>
+        <li>Режим «Повторение»</li>
+        <li><b>Телефонный режим:</b> адаптивный интерфейс только для готовых билетов, повторения и ассистента, без загрузки и генерации</li>
+      </ul></div>
+    <div class="card"><div class="head"><span class="tag acc">P2 · потом</span><b>Развитие</b></div>
+      <ul class="clean small">
+        <li>Импорт списка билетов из файла или фото</li>
+        <li>Экспорт в стиле приложения, PDF, выбор «только ещё раз»</li>
+        <li>Умная очередь повторения (интервалы)</li>
+        <li>Плашка подтверждения пароля у админа</li>
+        <li>Установка на экран «Домой» и офлайн-режим</li>
+      </ul></div>
+  </div>
+  <div class="card small muted"><b style="color:var(--text)">Риск, который нужно учесть заранее:</b> 10 предметов × 40 билетов × ответ с поиском по материалам, это сотни обращений к модели, плюс индексация на сервере с 2 ГБ памяти. Нужны лимиты и очередь, иначе массовая генерация положит сервис или упрётся в расход.</div>
+  <div class="scroll"><table class="plain" style="min-width:560px">
+    <thead><tr><th>Как поймём, что стало лучше</th><th>Метрика</th><th>Цель</th></tr></thead>
+    <tbody>
+      <tr><td>Быстрее, чем в DeepSeek</td><td>Время от загрузки материалов до готовых ответов на все билеты</td><td>минуты, а не часы</td></tr>
+      <tr><td>Доверяет ответам</td><td>Доля тезисов с источником</td><td>100%</td></tr>
+      <tr><td>Ответ подходит с первого раза</td><td>Доля ответов, принятых без правок</td><td>≥ 60%</td></tr>
+      <tr><td>Не теряется среди предметов</td><td>Клики от входа до нужного билета</td><td>≤ 2</td></tr>
+      <tr><td>Подготовка предмета не пугает</td><td>Доля созданных предметов, дошедших до списка билетов</td><td>≥ 90%</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="backlog">
+  <div><div class="eyebrow">08 · Бэклог</div><h2>Не сейчас: проверка ответа и напоминания</h2></div>
+  <div class="grid2">
+    <div class="card"><span class="tag">Версия 2</span><h3 style="margin:8px 0">Проверка ответа студента</h3>
+      <p class="small muted">Сначала Тома готовит ответ сама, потом разбирает его с ассистентом, и только после этого видит идеальный вариант.</p>
+      <ul class="clean small"><li><b>Свой ответ:</b> текстом или фото конспекта (распознавание уже есть); эталон скрыт</li><li><b>Разбор:</b> что верно, что пропущено, где ошибка, со ссылками на источники</li><li><b>Эталон:</b> показывается после попытки; для режима «разобраться» можно открыть сразу</li><li><b>Сравнение:</b> что добавить; статус билета ставится по итогам</li></ul></div>
+    <div class="card"><span class="tag">Позже</span><h3 style="margin:8px 0">Напоминания</h3>
+      <p class="small muted">Желательны, но не в первых версиях. Привязаны к датам экзаменов и очереди повторения.</p>
+      <ul class="clean small"><li>Уведомление «Через 12 дней экзамен, осталось 22 билета»</li><li>Тихие часы и ручное отключение: не должны раздражать</li><li>Канал выбираем позже: почта, браузер или установленное приложение</li></ul></div>
+  </div>
+  <div class="card"><h3>Что учесть уже сейчас, чтобы не мешать версии 2</h3>
+    <ul class="clean small">
+      <li>Эталон ответа хранить отдельно от будущего «ответа студента» и «разбора»</li>
+      <li>Экран билета делать с двумя режимами в основании («Эталон» сейчас, «Моя попытка» потом)</li>
+      <li>В статусах билета оставить место под «Свой ответ написан»</li>
+      <li>Чипы источников и подсветка в читалке делаем сразу: разбор в версии 2 опирается на них</li>
+    </ul></div>
+</section>
+
+<section id="questions">
+  <div><div class="eyebrow">09 · Что нужно уточнить</div><h2>Открытые вопросы</h2></div>
+  <p class="lead">Часть вопросов закрыта вашими ответами. Остались те, что влияют на архитектуру и расход.</p>
+  <div class="grid2">
+    <div class="card"><ol class="clean small" style="padding-left:1.2em"><li>Какие материалы Тома загружает обычно: сколько файлов на предмет и какого размера? Есть ли сканы и фото конспектов?</li><li>Что она делает с конспектом из DeepSeek: читает с экрана, распечатывает, переписывает от руки? От этого зависит формат экспорта.</li><li>Откуда берётся список билетов: файл от преподавателя, фото, текст? Хватит ли вставки текста?</li></ol></div>
+    <div class="card"><ol class="clean small" style="padding-left:1.2em" start="4"><li>Нужен ли общий шаблон конспекта на все предметы или достаточно «Пожеланий» к каждому предмету и билету?</li><li>Какие лимиты у доступа к модели (Timeweb): сколько запросов и какая стоимость при массовой генерации сотен ответов?</li><li>Можно ли показать Томе страницу или провести 20-минутное наблюдение, как она готовит один билет в DeepSeek? Это точнее любых моих допущений.</li></ol></div>
+  </div>
+</section>
+
+<footer>Страница собрана по описанию продукта, CLAUDE.md репозитория и вашим ответам. Метки «проверить» стоят там, где я не сверялся с кодом.</footer>
+</div>
