@@ -2682,6 +2682,8 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .reader-content h1,.reader-content h2,.reader-content h3{margin:1.5em 0 .5em;font-weight:600}
 .reader-content h2{font-family:var(--font-d);font-weight:500;font-size:1.125rem}
 .reader-content h3{font-size:1rem;color:var(--muted)}
+.reader-body{font-weight:400;line-height:1.7}
+.reader-body h2,.reader-body h3{font-weight:600}
 .reader-content p{margin-bottom:.875em}
 .reader-content code{background:var(--glass2);padding:2px 6px;border-radius:4px;font-size:.875em}
 .reader-content pre{background:var(--glass2);padding:14px;border-radius:var(--r-s);overflow-x:auto;margin:1em 0}
@@ -3572,16 +3574,27 @@ function setupSearch(slug) {
       res.innerHTML = '<div style="display:flex;flex-direction:column;gap:10px">' +
         hits.map(function(h) {
           var readerHref = '#/reader/' + esc(h.subject || slug) + '?src=' + esc(h.slug) + '&seg=' + h.segment + '&t=' + encodeURIComponent(h.title);
+          // Clean snippet: remove technical prefix "Предмет: … Источник: … Раздел: …\n\n"
+          var snippet = h.text || '';
+          var prefixEnd = snippet.indexOf('\n\n');
+          if (prefixEnd > -1 && /Раздел:/i.test(snippet.slice(0, prefixEnd))) {
+            snippet = snippet.slice(prefixEnd + 2);
+          }
+          // Remove markdown image tags ![...](media/...)
+          snippet = snippet.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
+          // Trim to reasonable length
+          snippet = snippet.trim().slice(0, 280);
           return '<a class="glass2 search-hit" href="' + readerHref + '" style="display:block;text-decoration:none;color:inherit">' +
             '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">' +
             '<span class="search-score">Совпадение ' + Math.round(h.score * 100) + '%</span>' +
             '<span class="text-muted" style="font-size:.8125rem">' + esc(h.source_title || h.slug) + '</span>' +
             '</div>' +
             '<div class="search-title">' + esc(h.title) + '</div>' +
-            '<div class="search-text">' + esc(h.text) + '</div>' +
+            '<div class="search-text">' + esc(snippet) + '</div>' +
             '<div style="margin-top:8px"><span class="btn btn-ghost btn-sm" style="pointer-events:none">Открыть в читалке →</span></div>' +
             '</a>';
         }).join('') + '</div>';
+      renderMath(res);
     } catch(e2) {
       res.innerHTML = '<p class="text-sm" style="color:var(--red)">Ошибка поиска</p>';
     }
@@ -3915,9 +3928,66 @@ function _openReaderSeg(slug, srcSlug, segId, expectedTitle) {
   _doOpenSeg(slug, srcSlug, targetSegId);
 }
 
+function _reassembleParagraphs(text) {
+  var lines = text.split('\n');
+  var result = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    // Remove orphaned image fragments: lines that are only "filename.ext)" pattern
+    if (/^[A-Za-z0-9_\-]+\.[a-zA-Z]{2,5}\)$/.test(line.trim())) continue;
+    // Detect protected line types (should NOT be joined with previous)
+    var isProtected = /^\s*(\$\$|[|]|[-*]\s|[#]|!\[|\d+\.\s)/.test(line);
+    // Empty line: pass through as-is
+    if (line.trim() === '') {
+      result.push('');
+      continue;
+    }
+    if (result.length === 0) {
+      result.push(line);
+      continue;
+    }
+    var prev = result[result.length - 1];
+    // Don't join if this line is a protected type
+    if (isProtected) {
+      result.push(line);
+      continue;
+    }
+    // Don't join if previous line is empty or protected
+    if (prev.trim() === '' || /^\s*(\$\$|[|]|[-*]\s|[#]|!\[|\d+\.\s)/.test(prev)) {
+      result.push(line);
+      continue;
+    }
+    // Check if previous line ends with sentence-terminating punctuation
+    var prevTrimmed = prev.trimEnd();
+    var endsWithStop = /[.!?:;]$/.test(prevTrimmed);
+    if (endsWithStop) {
+      result.push(line);
+      continue;
+    }
+    // Handle hyphenation: previous line ends with '-', join without space
+    if (prevTrimmed.endsWith('-')) {
+      result[result.length - 1] = prevTrimmed.slice(0, -1) + line.trimStart();
+      continue;
+    }
+    // Current line starts with lowercase or doesn't start with list/heading/table/image marker → join
+    var firstChar = line.trimStart().charAt(0);
+    var startsLower = firstChar >= 'a' && firstChar <= 'z' || firstChar >= 'а' && firstChar <= 'я' || firstChar === 'ё';
+    if (startsLower) {
+      result[result.length - 1] = prevTrimmed + ' ' + line.trimStart();
+      continue;
+    }
+    result.push(line);
+  }
+  // Collapse 2+ consecutive empty lines into 1
+  var out = result.join('\n').replace(/\n{3,}/g, '\n\n');
+  return out;
+}
+
 function renderSegment(text, slug, srcSlug) {
+  // Fix hard line breaks from PDF extraction
+  var t = _reassembleParagraphs(text);
   // Rewrite image URLs: ![](media/X) → /api/subjects/{slug}/media/{srcSlug}/X
-  var t = text.replace(/!\[([^\]]*)\]\(media\/([^)]+)\)/g, function(_, alt, src) {
+  t = t.replace(/!\[([^\]]*)\]\(media\/([^)]+)\)/g, function(_, alt, src) {
     var url = '/api/subjects/' + slug + '/media/' + srcSlug + '/media/' + src;
     return '!['+ alt + '](' + url + ')';
   });
