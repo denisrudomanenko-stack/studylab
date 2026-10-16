@@ -1439,31 +1439,41 @@ async def bulk_delete_tickets(slug: str, request: Request,
                                user: dict = Depends(current_user)):
     """Удаляет несколько билетов по списку id."""
     body = await request.json()
-    ids = body.get("ids", [])
-    if not ids:
+    raw_ids = body.get("ids", [])
+    if not raw_ids:
         raise HTTPException(400, "Список id пуст")
+    try:
+        ids = [int(i) for i in raw_ids]
+    except (ValueError, TypeError):
+        raise HTTPException(400, "Все id должны быть числами")
     db = get_db()
     placeholders = ",".join("?" * len(ids))
-    db.execute(
+    cur = db.execute(
         f"DELETE FROM exam_tickets WHERE subject_slug=? AND id IN ({placeholders})",
-        [slug] + list(ids)
+        [slug] + ids
     )
+    deleted = cur.rowcount
     db.commit()
     db.close()
-    return {"ok": True, "deleted": len(ids)}
+    return {"ok": True, "deleted": deleted}
 
 
 @app.put("/api/subjects/{slug}/tickets/{tid}")
 async def update_ticket(slug: str, tid: int, question: str = Form(),
                          user: dict = Depends(current_user)):
+    new_q = question.strip()
     db = get_db()
+    row = db.execute("SELECT question FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)).fetchone()
+    if row and row["question"].strip() == new_q:
+        db.close()
+        return {"ok": True, "changed": False}
     db.execute(
         "UPDATE exam_tickets SET question=?, status='pending', answer='' WHERE id=? AND subject_slug=?",
-        (question.strip(), tid, slug)
+        (new_q, tid, slug)
     )
     db.commit()
     db.close()
-    return {"ok": True}
+    return {"ok": True, "changed": True}
 
 
 @app.delete("/api/subjects/{slug}/tickets/{tid}")
