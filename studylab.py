@@ -171,6 +171,8 @@ def init_db():
         "ALTER TABLE subjects ADD COLUMN semester INTEGER DEFAULT 0",
         "ALTER TABLE subjects ADD COLUMN exam_date TEXT DEFAULT ''",
         "ALTER TABLE exam_tickets ADD COLUMN position INTEGER DEFAULT 0",
+        "ALTER TABLE exam_tickets ADD COLUMN depth TEXT DEFAULT 'standard'",
+        "ALTER TABLE exam_tickets ADD COLUMN wishes TEXT DEFAULT ''",
     ]:
         try:
             db.execute(migration)
@@ -1418,9 +1420,10 @@ async def get_segment(slug: str, src_slug: str, seg_id: int,
 import httpx as _httpx
 import base64 as _b64
 
-TIMEWEB_URL = _cfg("LLM_BASE_URL", "https://api.timeweb.ai/v1") + "/chat/completions"
-CHAT_MODEL  = "deepseek/deepseek-v4-pro"
+TIMEWEB_URL  = _cfg("LLM_BASE_URL", "https://api.timeweb.ai/v1") + "/chat/completions"
+CHAT_MODEL   = "deepseek/deepseek-v4-pro"
 VISION_MODEL = "gemini/gemini-3.5-flash"
+FAKE_LLM     = os.environ.get("STUDYLAB_FAKE_LLM", "") == "1"
 
 SYSTEM_BIO = (
     "Ты — интеллектуальный ассистент по биологии и микробиологии для студентки 2 курса биофака МГУ. "
@@ -1432,19 +1435,28 @@ SYSTEM_BIO = (
 )
 
 
-async def _rag_context(subject_slug: str, question: str, k: int = 8) -> list[dict]:
-    """Retrieve top-k relevant chunks from active sources across ALL subjects."""
+async def _rag_context(subject_slug: str, question: str, k: int = 8,
+                       only_subject: bool = False) -> dict:
+    """Retrieve top-k relevant chunks from active sources.
+
+    Returns dict with keys:
+      'text'   — list of text chunks (meta.type != 'image')
+      'images' — list of image chunk candidates (meta.type == 'image', not hidden)
+    When only_subject=True, search only in subject_slug's index (used for tickets).
+    """
     if not MKLIB_OK:
-        return []
+        return {"text": [], "images": []}
 
     def _fetch():
         vec = embed_query(question)
         all_hits = []
-        # Search across all subjects' indexes
         db = get_db()
-        subjects = [r["slug"] for r in db.execute("SELECT slug FROM subjects").fetchall()]
+        if only_subject:
+            subjects_to_search = [subject_slug]
+        else:
+            subjects_to_search = [r["slug"] for r in db.execute("SELECT slug FROM subjects").fetchall()]
         db.close()
-        for subj_slug in subjects:
+        for subj_slug in subjects_to_search:
             idx_path = subject_dir(subj_slug) / "index.db"
             if not idx_path.exists():
                 continue
@@ -1461,30 +1473,38 @@ async def _rag_context(subject_slug: str, question: str, k: int = 8) -> list[dic
                         all_hits.append(h)
             except Exception:
                 pass
-        # Filter out image chunks where the image is hidden
+
+        # Separate text vs image chunks; filter hidden images
         img_db = get_db()
-        visible_hits = []
+        text_hits = []
+        image_hits = []
         for h in all_hits:
             meta = h.get("meta") or {}
             if isinstance(meta, dict) and meta.get("type") == "image":
                 img_id = meta.get("image_id")
+                hidden = False
                 if img_id is not None:
                     img_row = img_db.execute(
                         "SELECT hidden FROM images WHERE id=?", (img_id,)
                     ).fetchone()
                     if img_row and img_row["hidden"]:
-                        continue
-            visible_hits.append(h)
+                        hidden = True
+                if not hidden:
+                    image_hits.append(h)
+            else:
+                text_hits.append(h)
         img_db.close()
-        # Sort by score, prioritize current subject
-        visible_hits.sort(key=lambda h: (-0.05 if h.get("_subject") == subject_slug else 0) - h["score"])
-        return visible_hits[:k]
+
+        # Sort text hits by score, prioritize current subject
+        text_hits.sort(key=lambda h: (-0.05 if h.get("_subject") == subject_slug else 0) - h["score"])
+        image_hits.sort(key=lambda h: (-0.05 if h.get("_subject") == subject_slug else 0) - h["score"])
+        return {"text": text_hits[:k], "images": image_hits[:5]}
 
     try:
         return await asyncio.to_thread(_fetch)
     except Exception as e:
         print(f"[rag error] {e}", flush=True)
-        return []
+        return {"text": [], "images": []}
 
 
 def _build_messages(history: list[dict], question: str,
@@ -1574,7 +1594,8 @@ async def chat_stream(slug: str, q: str, conversation_id: int = 0,
     db.close()
     history = list(reversed(history))
 
-    context_chunks = await _rag_context(slug, q)
+    rag_result = await _rag_context(slug, q, only_subject=False)
+    context_chunks = rag_result["text"]
 
     async def generate():
         full_answer = []
@@ -1948,10 +1969,137 @@ async def delete_ticket(slug: str, tid: int, user: dict = Depends(current_user))
     return {"ok": True}
 
 
+_DEPTH_RULES = {
+    "short":    "Кратко: только тезисы для быстрого повторения, 100–200 слов, без развёрнутых пояснений.",
+    "standard": "Стандарт: конспект ответа на 3–4 минуты устного ответа, 350–600 слов.",
+    "full":     "Подробно: полный разбор с определениями, классификацией, формулами и примерами, 700–1100 слов.",
+}
+# DeepSeek V4 Pro: reasoning_tokens + content_tokens both count toward max_tokens
+# Reasoning typically uses 200-800 tokens. Add large buffer.
+# DeepSeek reasoning can use 1000-3000 tokens. Add generous buffer.
+_DEPTH_MAX_TOKENS = {"short": 8192, "standard": 12288, "full": 16384}
+_DEPTH_MAX_IMG    = {"short": 1,    "standard": 3,    "full": 5}
+_DEPTH_K          = {"short": 10,   "standard": 10,   "full": 14}
+# Score distribution: case1=0.725 (relevant), case3=0.448 (irrelevant), case12=0.425 (relevant)
+# Threshold 0.50 catches case3 but loses case12. Use 0.50 with secondary check:
+# if max score in top-3 < 0.50 BUT >= 0.40, pass to LLM with warning in prompt
+_RELEVANCE_THRESHOLD = 0.50
+_RELEVANCE_SOFT_THRESHOLD = 0.40
+
+_NOT_FOUND_ANSWER = (
+    "В материалах по этому вопросу ничего не найдено\n\n"
+    "## Не найдено в материалах\n"
+    "Основные пункты по этой теме не найдены в загруженных источниках."
+)
+
+_FORBIDDEN_PHRASES = [
+    "из общих знаний",
+    "как известно",
+    "обычно считается",
+]
+
+
+def _validate_answer(
+    answer_text: str,
+    context_triples: set[tuple[str, str, int]],
+    image_candidates: list[int],
+    max_img: int,
+) -> tuple[str, list[str]]:
+    """Validate and clean LLM answer. Returns (cleaned_text, warnings).
+    context_triples: set of (subject_slug, source_slug, segment_index) from RAG."""
+    warnings: list[str] = []
+    cleaned = answer_text
+
+    # C5: Strip unwanted model openings
+    for prefix in ["Конечно!", "С радостью!", "Отлично!", "С удовольствием!"]:
+        if cleaned.lstrip().startswith(prefix):
+            cleaned = cleaned.lstrip()[len(prefix):].lstrip()
+            warnings.append(f"Отрезано вступление: «{prefix}»")
+
+    # C4: Forbidden phrases counter (log only, don't remove)
+    forbidden_count = 0
+    for phrase in _FORBIDDEN_PHRASES:
+        for line in cleaned.split("\n"):
+            if phrase.lower() in line.lower():
+                if not re.search(r"\[src:[^\]]+\]", line, re.IGNORECASE):
+                    forbidden_count += 1
+                    warnings.append(f"Запрещённая фраза без ссылки: «{phrase}» в строке: {line[:80]}")
+    if forbidden_count:
+        warnings.append(f"Всего запрещённых фраз: {forbidden_count}")
+
+    # C1: Check [src:SUBJECT/SLUG#SEG | ...] by triple, remove invalid
+    context_slug_set = {(s, sl) for s, sl, _ in context_triples}  # for fallback
+    def _check_src(m: re.Match) -> str:
+        full_ref = m.group(0)
+        inner = m.group(1)  # e.g. SUBJECT/SLUG#SEG | раздел: ...
+        ref_part = inner.split("|")[0].strip()
+        # Parse SUBJECT/SLUG#SEG or SLUG#SEG
+        parts = ref_part.split("/")
+        if len(parts) >= 2:
+            subj = parts[0].strip()
+            slug_seg = parts[1].strip()
+        else:
+            subj = ""
+            slug_seg = parts[0].strip()
+        slug_part = slug_seg.split("#")[0].strip()
+        seg_part = slug_seg.split("#")[1].strip() if "#" in slug_seg else "0"
+        try:
+            seg_num = int(seg_part)
+        except ValueError:
+            seg_num = -1
+        # Check triple
+        if subj and (subj, slug_part, seg_num) in context_triples:
+            return full_ref
+        # Fallback: check (subject, slug) pair
+        if subj and (subj, slug_part) in context_slug_set:
+            return full_ref
+        # Old format: just slug
+        if not subj and any(slug_part == sl for _, sl in context_slug_set):
+            return full_ref
+        warnings.append(f"Удалена ссылка вне контекста: {full_ref[:80]}")
+        return ""
+
+    cleaned = re.sub(r"\[src:([^\]]+)\]", _check_src, cleaned, flags=re.IGNORECASE)
+
+    # C3: Check ## Не найдено в материалах block
+    if "не найдено в материалах" not in cleaned.lower():
+        cleaned += "\n\n## Не найдено в материалах\nБлок не сформирован моделью."
+        warnings.append("Отсутствует блок «Не найдено» — дописан")
+
+    # C2: Check [img:ID] — remove if no candidates, over limit, or not in list
+    img_candidate_ids = {str(cid) for cid in image_candidates}
+    found_imgs = list(re.finditer(r"\[img:(\d+)\]", cleaned, re.IGNORECASE))
+    seen_img_count = 0
+    for m in reversed(found_imgs):  # reverse to preserve positions
+        img_id = m.group(1)
+        should_remove = False
+        if not img_candidate_ids:
+            should_remove = True
+            warnings.append(f"Удалён [img:{img_id}] — нет кандидатов")
+        elif img_id not in img_candidate_ids:
+            should_remove = True
+            warnings.append(f"Удалён [img:{img_id}] — не в списке кандидатов")
+        elif seen_img_count >= max_img:
+            should_remove = True
+            warnings.append(f"Удалён [img:{img_id}] — сверх лимита {max_img}")
+        if should_remove:
+            cleaned = cleaned[:m.start()] + cleaned[m.end():]
+        else:
+            seen_img_count += 1
+
+    return cleaned, warnings
+
+
 @app.get("/api/subjects/{slug}/tickets/{tid}/generate")
-async def generate_ticket_answer(slug: str, tid: int,
-                                   user: dict = Depends(current_user)):
-    if not TIMEWEB_API_KEY:
+async def generate_ticket_answer(
+    slug: str, tid: int,
+    depth:   str = Query(default="standard", pattern="^(short|standard|full)$"),
+    wishes:  str = Query(default=""),
+    scope:   str = Query(default="subject", pattern="^(subject|all)$"),
+    exclude: str = Query(default=""),
+    user: dict = Depends(current_user),
+):
+    if not TIMEWEB_API_KEY and not FAKE_LLM:
         raise HTTPException(503, "TIMEWEB_API_KEY не задан")
     db = get_db()
     row = db.execute(
@@ -1961,73 +2109,205 @@ async def generate_ticket_answer(slug: str, tid: int,
     if not row:
         raise HTTPException(404, "Билет не найден")
 
+    wishes = wishes[:500]  # enforce max length
     question = row["question"]
-    context_chunks = await _rag_context(slug, question, k=10)
+
+    # Issue 1: reject garbage questions (< 5 chars)
+    # Reject garbage: must have at least 2 letters (allows "ДНК", "РНК")
+    import unicodedata
+    letter_count = sum(1 for c in question if c.isalpha())
+    if letter_count < 2:
+        async def _no_context_gen():
+            yield f"data: {json.dumps({'content': _NOT_FOUND_ANSWER})}\n\n"
+            save_db = get_db()
+            save_db.execute(
+                "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, "
+                "depth=?, wishes=? WHERE id=?",
+                (_NOT_FOUND_ANSWER, datetime.now(timezone.utc).isoformat(), depth, wishes, tid)
+            )
+            save_db.commit()
+            save_db.close()
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_no_context_gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    k = _DEPTH_K.get(depth, 10)
+    only_subject = (scope == "subject")
+    max_tokens = _DEPTH_MAX_TOKENS.get(depth, 2500)
+    max_img = _DEPTH_MAX_IMG.get(depth, 3)
+    depth_rule = _DEPTH_RULES.get(depth, _DEPTH_RULES["standard"])
+    wishes_text = wishes if wishes else "нет"
+
+    rag_result = await _rag_context(slug, question, k=k, only_subject=only_subject)
+    text_chunks = rag_result["text"]
+    image_chunks = rag_result["images"]
+
+    # Filter excluded source slugs
+    if exclude:
+        ex_slugs = {s.strip() for s in exclude.split(",") if s.strip()}
+        text_chunks = [h for h in text_chunks if h.get("slug") not in ex_slugs]
+        image_chunks = [h for h in image_chunks if h.get("slug") not in ex_slugs]
+
+    # Issue 1: if ALL text fragments are below relevance threshold, skip LLM
+    # Log scores for threshold tuning
+    if text_chunks:
+        scores = [h.get("score", 0) for h in text_chunks]
+        print(f"[rag scores] {slug}/{question[:40]}: max={max(scores):.3f} avg={sum(scores)/len(scores):.3f} top3={sorted(scores,reverse=True)[:3]}", flush=True)
+    # Low relevance: no chunks, or top-3 all below soft threshold
+    top3_scores = sorted([h.get("score", 0) for h in text_chunks], reverse=True)[:3] if text_chunks else []
+    max_score = max(top3_scores) if top3_scores else 0
+    low_relevance = not text_chunks or max_score < _RELEVANCE_SOFT_THRESHOLD
+    weak_relevance = not low_relevance and max_score < _RELEVANCE_THRESHOLD
+    if low_relevance:
+        async def _low_relevance_gen():
+            yield f"data: {json.dumps({'content': _NOT_FOUND_ANSWER})}\n\n"
+            save_db = get_db()
+            save_db.execute(
+                "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, "
+                "depth=?, wishes=? WHERE id=?",
+                (_NOT_FOUND_ANSWER, datetime.now(timezone.utc).isoformat(), depth, wishes, tid)
+            )
+            save_db.commit()
+            save_db.close()
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_low_relevance_gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     system_prompt = (
-        "Ты — преподаватель университетского курса, готовишь студенту развёрнутый ответ на экзаменационный билет.\n\n"
-        "ФОРМАТ ОТВЕТА (строго следуй):\n"
-        "1. Начни с **определения** ключевого понятия (термин выделяй **жирным**)\n"
-        "2. Дай **классификацию** — нумерованные списки с подпунктами\n"
-        "3. Все формулы пиши в LaTeX: инлайн $...$ и блочные $$...$$\n"
-        "4. В нумерованных списках используй явные номера: 1. 2. 3. 4. (не повторяй 1.)\n"
-        "5. Если уместно — добавь таблицу в markdown (|столбец|столбец|)\n"
-        "6. Логика: определение → классификация → формулы/уравнения → вывод → следствия\n"
-        "7. Выделяй **ключевые термины** жирным при первом упоминании\n"
-        "7. Используй правильные латинские названия организмов\n"
-        "8. Добавляй провенанс в ТОЧНОМ формате [src:SUBJECT/SLUG#SEG | раздел: заголовок] к фактам из источников. SUBJECT, SLUG и SEG бери из заголовка фрагмента.\n"
-        "9. Если в источниках нет — используй общие знания, помечай «Из общих знаний:»\n"
-        "10. Объём: 400-800 слов, на уровне университетского курса\n"
+        "Ты помогаешь студентке подготовить конспект ответа на экзаменационный билет.\n"
+        "Работаешь ТОЛЬКО по приведённым фрагментам источников. Свои знания не добавляй и ничего не выдумывай.\n\n"
+        "ПРАВИЛА\n"
+        "1. Каждый факт из источника сопровождай ссылкой в ТОЧНОМ формате [src:SUBJECT/SLUG#SEG | раздел: заголовок].\n"
+        "   SUBJECT, SLUG и SEG бери из заголовка фрагмента [N src:SUBJECT/SLUG#SEG]. Ссылки на несуществующие фрагменты запрещены.\n"
+        "2. Если по какому-то пункту в источниках нет информации, не заполняй его от себя. Перечисли такие пункты в самом конце.\n"
+        "3. Пиши конспектом: короткие тезисы, списки, ключевые термины **жирным** при первом упоминании. Не пиши сплошным текстом.\n"
+        "4. Структура: определение → основное содержание (классификация, строение или механизм) → формулы и уравнения → значение и примеры.\n"
+        "   Опускай разделы, для которых в источниках ничего нет.\n"
+        "5. Формулы пиши в LaTeX: инлайн $...$, блочные $$...$$. В нумерованных списках используй явные номера.\n"
+        "6. Таблицы — в markdown. Латинские названия организмов пиши правильно и курсивом.\n"
+        f"7. Иллюстрации. Тебе даны кандидаты в блоке «Иллюстрации» в формате [img:ID | подпись | тип | описание]. Вставляй маркер [img:ID] отдельной строкой в то место ответа, к которому картинка относится, не более {max_img} за ответ и ТОЛЬКО из предложенных. Не выдумывай ID, не описывай картинку своими словами, не вставляй ту же дважды. Если ни одна не подходит, не вставляй ничего.\n"
+        "8. Конец ответа ВСЕГДА: заголовок «## Не найдено в материалах» и список пунктов, которые обычно входят в такой ответ, но не найдены во фрагментах.\n"
+        "   Если всё найдено, напиши одной строкой: «Все ключевые пункты найдены в материалах».\n\n"
+        f"ГЛУБИНА: {depth_rule}\n"
+        f"ПОЖЕЛАНИЯ СТУДЕНТКИ (учитывай, если не противоречат правилам выше): {wishes_text}"
     )
+    if weak_relevance:
+        system_prompt += (
+            "\n\nВНИМАНИЕ: фрагменты могут быть слабо связаны с вопросом. "
+            "Используй ТОЛЬКО те, которые ТОЧНО относятся к вопросу. "
+            "Если ни один фрагмент не подходит, ответь «В материалах по этому вопросу ничего не найдено» "
+            "и перечисли пункты в блоке «Не найдено в материалах»."
+        )
 
-    ctx = ""
-    if context_chunks:
+    # Build user message
+    if text_chunks:
         parts = []
-        for i, h in enumerate(context_chunks):
+        for i, h in enumerate(text_chunks, 1):
             src_slug = h.get("slug", "")
-            seg_idx = h.get("segment", 0)
-            title = h.get("title", "")
-            subject = h.get("_subject", h.get("topic", ""))
-            parts.append(f"[{i+1} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
+            seg_idx  = h.get("segment", 0)
+            title    = h.get("title", "")
+            subject  = h.get("_subject", h.get("topic", ""))
+            parts.append(f"[{i} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
         ctx = "Источники:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
+        # Image candidates block (task 11 placeholder — no images filled yet)
+        if image_chunks:
+            img_lines = []
+            for h in image_chunks[:max_img * 2]:
+                meta = h.get("meta") or {}
+                img_id   = meta.get("image_id", "")
+                caption  = meta.get("caption", "")
+                kind     = meta.get("kind", "")
+                context  = meta.get("context", "")
+                img_lines.append(f"[img:{img_id} | {caption} | {kind} | {context}]")
+            ctx += "Иллюстрации:\n" + "\n".join(img_lines) + "\n\n"
+        else:
+            ctx += "Иллюстрации: нет\n\n"
+        user_message = ctx + f"Вопрос экзаменационного билета: {question}"
+    else:
+        user_message = f"Вопрос экзаменационного билета: {question}"
+
+    # Build sets for validator (Issue 2)
+    context_triples = {
+        (h.get("_subject", h.get("topic", "")), h.get("slug", ""), h.get("segment", 0))
+        for h in text_chunks if h.get("slug")
+    }
+    image_candidate_ids = []
+    if image_chunks:
+        for h in image_chunks[:max_img * 2]:
+            meta = h.get("meta") or {}
+            img_id = meta.get("image_id", "")
+            if img_id:
+                image_candidate_ids.append(str(img_id))
 
     async def generate():
-        full_answer = []
+        full_answer: list[str] = []
+        stream_complete = False  # Issue 3: only save on full stream completion
         try:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": ctx + "Вопрос экзаменационного билета: " + question}
-            ]
-            async with _httpx.AsyncClient(timeout=180) as client:
-                async with client.stream(
-                    "POST", TIMEWEB_URL,
-                    headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
-                    json={"model": CHAT_MODEL, "messages": messages,
-                          "stream": True, "max_tokens": 4096, "temperature": 0.3}
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        raw = line[6:].strip()
-                        if raw == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(raw)
-                            delta = chunk["choices"][0]["delta"].get("content", "")
-                            if delta:
-                                full_answer.append(delta)
-                                yield f"data: {json.dumps({'content': delta})}\n\n"
-                        except Exception:
-                            pass
+            if FAKE_LLM:
+                fake = (
+                    f"**Определение**: (тестовый ответ, depth={depth})\n\n"
+                    "## Не найдено в материалах\n"
+                    "Все ключевые пункты найдены в материалах."
+                )
+                for word in fake.split(" "):
+                    full_answer.append(word + " ")
+                    yield f"data: {json.dumps({'content': word + ' '})}\n\n"
+                    await asyncio.sleep(0.02)
+                stream_complete = True
+            else:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message},
+                ]
+                async with _httpx.AsyncClient(timeout=300) as client:
+                    async with client.stream(
+                        "POST", TIMEWEB_URL,
+                        headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+                        json={"model": CHAT_MODEL, "messages": messages,
+                              "stream": True, "max_tokens": max_tokens, "temperature": 0.3}
+                    ) as resp:
+                        truncated = False
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            raw = line[6:].strip()
+                            if raw == "[DONE]":
+                                stream_complete = True
+                                break
+                            try:
+                                chunk = json.loads(raw)
+                                choice = chunk["choices"][0]
+                                # Check finish_reason=length (truncated)
+                                fr = choice.get("finish_reason", "")
+                                if fr == "length":
+                                    truncated = True
+                                    stream_complete = False
+                                    yield f"data: {json.dumps({'error': 'Ответ не уложился в объём. Попробуйте другую глубину.'})}\n\n"
+                                    break
+                                delta = choice.get("delta", {}).get("content", "")
+                                if delta:
+                                    full_answer.append(delta)
+                                    yield f"data: {json.dumps({'content': delta})}\n\n"
+                            except Exception:
+                                pass
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
         finally:
             answer_text = "".join(full_answer)
-            if answer_text:
+            # Issue 3: only save when stream completed successfully
+            if stream_complete and answer_text:
+                # Issue 2: validate and clean answer before saving
+                cleaned, val_warnings = _validate_answer(
+                    answer_text, context_triples, image_candidate_ids, max_img
+                )
+                if val_warnings:
+                    print(f"[validate_answer tid={tid}] warnings: {val_warnings}", flush=True)
                 save_db = get_db()
                 save_db.execute(
-                    "UPDATE exam_tickets SET answer=?, status='generated', generated_at=? WHERE id=?",
-                    (answer_text, datetime.now(timezone.utc).isoformat(), tid)
+                    "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, "
+                    "depth=?, wishes=? WHERE id=?",
+                    (cleaned, datetime.now(timezone.utc).isoformat(),
+                     depth, wishes, tid)
                 )
                 save_db.commit()
                 save_db.close()
@@ -2056,6 +2336,7 @@ def _md_to_html(text: str) -> str:
     in_table = False
     in_list = False
     list_type = ""
+    in_not_found_block = False  # Issue 9: track not-found div state
     for line in lines:
         stripped = line.strip()
         # Table
@@ -2078,16 +2359,30 @@ def _md_to_html(text: str) -> str:
         if stripped.startswith("### "):
             if in_list:
                 out.append(f"</{list_type}>"); in_list = False
+            if in_not_found_block:
+                out.append("</div>"); in_not_found_block = False
             out.append(f"<h3>{_html.escape(stripped[4:])}</h3>")
             continue
         if stripped.startswith("## "):
             if in_list:
                 out.append(f"</{list_type}>"); in_list = False
-            out.append(f"<h2>{_html.escape(stripped[3:])}</h2>")
+            if in_not_found_block:
+                out.append("</div>"); in_not_found_block = False
+            heading_text = stripped[3:]
+            if heading_text.strip().lower() == "не найдено в материалах":
+                out.append(
+                    '<div class="not-found-block">'
+                    f'<h2 class="not-found-title">{_html.escape(heading_text)}</h2>'
+                )
+                in_not_found_block = True
+            else:
+                out.append(f"<h2>{_html.escape(heading_text)}</h2>")
             continue
         if stripped.startswith("# "):
             if in_list:
                 out.append(f"</{list_type}>"); in_list = False
+            if in_not_found_block:
+                out.append("</div>"); in_not_found_block = False
             out.append(f"<h2>{_html.escape(stripped[2:])}</h2>")
             continue
         # Numbered list
@@ -2119,6 +2414,9 @@ def _md_to_html(text: str) -> str:
         out.append(f"</{list_type}>")
     if in_table:
         out.append("</table>")
+    # Issue 9: close not-found div at end if still open (after all list items)
+    if in_not_found_block:
+        out.append("</div>")
     result = "\n".join(out)
     # Inline formatting (on the HTML)
     result = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", result)
@@ -2192,6 +2490,9 @@ h1{{font-size:1.5rem;font-weight:700;letter-spacing:-0.03em;margin-bottom:0.5rem
 .ticket-body li{{margin-bottom:.3rem}}
 .ticket-body code{{font-family:'JetBrains Mono',monospace;font-size:.82rem;background:rgba(255,255,255,0.08);
   padding:.1rem .4rem;border-radius:6px}}
+.not-found-block{{margin:1.2rem 0 .5rem;padding:.8rem 1rem;background:rgba(251,191,91,0.06);
+  border-left:3px solid rgba(251,191,91,0.5);border-radius:8px}}
+.not-found-title{{font-size:.875rem;font-weight:600;color:#fbbf5b;margin-bottom:.4rem}}
 .footer{{margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border);font-size:.78rem;color:var(--muted)}}
 @media print{{body{{background:#fff;color:#1a1a2e}}body::before{{display:none}}
   .ticket{{background:#fff;border:1px solid #ddd;box-shadow:none}}
@@ -2758,6 +3059,23 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .ticket-answer code{background:var(--glass2);padding:1px 5px;border-radius:3px}
 .ticket-answer h2,.ticket-answer h3{margin:1em 0 .4em;font-size:.8125rem;font-weight:600;letter-spacing:.06em;
   text-transform:uppercase;color:var(--accent)}
+.not-found-block{margin:1em 0 .5em;padding:.75rem 1rem;background:rgba(251,191,91,0.07);
+  border-left:3px solid rgba(251,191,91,0.45);border-radius:8px}
+.not-found-title{font-size:.8125rem!important;font-weight:600!important;color:var(--yellow)!important;
+  letter-spacing:.06em;text-transform:uppercase!important;margin-bottom:.4em!important}
+/* depth selector */
+.depth-seg{display:inline-flex;gap:0;border:1px solid var(--border);border-radius:var(--r-s);overflow:hidden;margin-bottom:10px}
+.depth-seg button{border:none;background:none;padding:6px 14px;font-size:.8125rem;font-family:inherit;cursor:pointer;
+  color:var(--muted);transition:background .12s,color .12s}
+.depth-seg button.active{background:var(--accent);color:var(--accent-ink);font-weight:600}
+/* collapsible wishes */
+.wishes-toggle{background:none;border:none;color:var(--muted);font-size:.8125rem;font-family:inherit;cursor:pointer;
+  padding:0;text-decoration:underline;text-underline-offset:3px}
+.wishes-field{margin-top:8px;display:none}
+.wishes-field.open{display:block}
+/* bulk generate panel */
+.bulk-gen-panel{background:var(--glass);border:1px solid var(--border);border-radius:var(--r-m);
+  padding:16px 20px;margin-top:12px}
 .msg-bubble table,.ticket-answer table{display:block;max-width:100%;overflow-x:auto;border-collapse:collapse;margin:.6em 0;font-size:.9375rem}
 .msg-bubble th,.msg-bubble td,.ticket-answer th,.ticket-answer td{border:1px solid var(--border);padding:8px 12px;text-align:left}
 .msg-bubble th,.ticket-answer th{background:var(--glass2)}
@@ -2963,7 +3281,14 @@ function md(text) {
   });
   var h = esc(t);
   h = h.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-  h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  h = h.replace(/^## (.+)$/gm, function(_, heading) {
+    if (heading.trim().toLowerCase() === '\u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e \u0432 \u043c\u0430\u0442\u0435\u0440\u0438\u0430\u043b\u0430\u0445') {
+      return '<div class="not-found-block"><h2 class="not-found-title">' + heading + '</h2>';
+    }
+    return '<h2>' + heading + '</h2>';
+  });
+  // Close any open not-found-block (add sentinel end marker)
+  if (h.indexOf('not-found-block') !== -1) { h += '</div>'; }
   h = h.replace(/^# (.+)$/gm, '<h2>$1</h2>');
   h = h.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
@@ -4389,7 +4714,6 @@ function _tkRenderList(slug) {
     var P = '\'' + slug + '\',' + t.id;
     var menuItems =
       '<button type="button" role="menuitem" onclick="closeMenus(null);tkEditInline(' + t.id + ')">Редактировать</button>' +
-      (hasAnswer ? '<button type="button" role="menuitem" onclick="closeMenus(null);genTicket(' + P + ')">Обновить ответ</button>' : '') +
       (hasAnswer ? '<a role="menuitem" href="/api/subjects/' + slug + '/tickets/' + t.id + '/export" target="_blank" onclick="closeMenus(null)">Скачать HTML</a>' : '') +
       '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delTicket(' + P + ')">Удалить</button>';
     return '<div class="glass ticket-item" id="tk-' + t.id + '" data-id="' + t.id + '">' +
@@ -4401,7 +4725,11 @@ function _tkRenderList(slug) {
       '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с билетом" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
       '<div class="menu hidden" role="menu">' + menuItems + '</div></div>' +
       '</div>' +
-      (hasAnswer ? '<div class="ticket-answer" style="display:none">' + md(t.answer) + '</div>' : '') +
+      // Issue 11: depth panel is inside the expanded answer area, not outside
+      '<div class="ticket-answer" style="display:none">' +
+      _tkDepthPanel(slug, t.id, hasAnswer) +
+      (hasAnswer ? '<div class="ticket-answer-content">' + md(t.answer) + '</div>' : '') +
+      '</div>' +
       '</div>';
   }).join('');
   // Attach checkbox listeners
@@ -4413,16 +4741,21 @@ function _tkRenderList(slug) {
       _tkUpdateSelectAllState();
     });
   });
-  // Click on answer text toggles expand
-  el.querySelectorAll('.ticket-answer').forEach(function(ans) {
-    ans.style.cursor = 'pointer';
-    ans.addEventListener('click', function() {
-      var hidden = ans.style.display === 'none' || ans.style.display === '';
-      // find toggle in same ticket-item
-      var item = ans.closest('.ticket-item');
-      var togBtn = item && item.querySelector('.toggle-answer');
-      if (togBtn) { toggleAnswer(togBtn); return; }
-      ans.style.display = (ans.style.display === 'none') ? '' : 'none';
+  // Attach depth panel interactivity for each ticket
+  visible.forEach(function(t) { _attachDepthPanel(slug, t.id); });
+  // Issue 11: click on ticket-head (question) toggles the answer+panel area
+  el.querySelectorAll('.ticket-head').forEach(function(head) {
+    head.style.cursor = 'pointer';
+    head.addEventListener('click', function(e) {
+      // Don't toggle when clicking checkbox, menu, or edit
+      if (e.target.closest('input[type="checkbox"]') || e.target.closest('.menuwrap') || e.target.closest('[ondblclick]')) return;
+      var item = head.closest('.ticket-item');
+      if (!item) return;
+      var ans = item.querySelector('.ticket-answer');
+      if (!ans) return;
+      var isHidden = ans.style.display === 'none' || ans.style.display === '';
+      ans.style.display = isHidden ? '' : 'none';
+      if (isHidden) renderMath(ans);
     });
   });
   renderMath(el);
@@ -4768,10 +5101,97 @@ async function vTickets(main, slug) {
     }, 120);
   });
 
-  // Bulk prepare (stub for now — tasks 04/06)
+  // Bulk prepare
   var prepBtn = document.getElementById('tk-btn-prep');
   if (prepBtn) prepBtn.addEventListener('click', function() {
-    toast('Генерация ответов по ' + _TK.selected.size + ' билетам — будет доступна в следующем обновлении', 'info');
+    if (!_TK.selected.size) return;
+    var bulkBar = document.getElementById('tk-bulk-bar');
+    // Show bulk panel inline below the button bar
+    var existPanel = document.getElementById('bulk-gen-panel');
+    if (existPanel) { existPanel.remove(); return; }
+    var panel = document.createElement('div');
+    panel.id = 'bulk-gen-panel';
+    panel.className = 'bulk-gen-panel';
+    panel.innerHTML =
+      '<div style="font-size:.9375rem;font-weight:600;margin-bottom:10px">Подготовить ответы (' + _TK.selected.size + ')</div>' +
+      '<div class="depth-seg" id="bulk-dseg">' +
+        '<button type="button" data-d="short">Кратко</button>' +
+        '<button type="button" class="active" data-d="standard">Стандарт</button>' +
+        '<button type="button" data-d="full">Подробно</button>' +
+      '</div>' +
+      '<div style="margin-top:10px">' +
+        '<textarea rows="2" id="bulk-wishes" style="width:100%;font-size:.875rem" placeholder="Например: как у Иванова, с классификацией и схемой"></textarea>' +
+      '</div>' +
+      '<div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+        '<label style="display:flex;align-items:center;gap:6px;font-size:.875rem;cursor:pointer">' +
+          '<input type="checkbox" id="bulk-skip-ready" checked style="accent-color:var(--accent)"> Пропустить уже готовые' +
+        '</label>' +
+      '</div>' +
+      '<div style="margin-top:12px;display:flex;gap:10px">' +
+        '<button type="button" class="btn btn-primary btn-sm" id="bulk-gen-go">Подготовить</button>' +
+        '<button type="button" class="btn btn-ghost btn-sm" id="bulk-gen-cancel">Отмена</button>' +
+      '</div>' +
+      '<div id="bulk-gen-progress" style="margin-top:10px;font-size:.875rem;color:var(--muted)"></div>';
+    if (bulkBar && bulkBar.parentNode) {
+      bulkBar.parentNode.insertBefore(panel, bulkBar.nextSibling);
+    } else {
+      document.getElementById('main').appendChild(panel);
+    }
+    // Depth seg toggle
+    panel.querySelectorAll('#bulk-dseg button').forEach(function(b) {
+      b.addEventListener('click', function() {
+        panel.querySelectorAll('#bulk-dseg button').forEach(function(bb) { bb.classList.remove('active'); });
+        b.classList.add('active');
+      });
+    });
+    document.getElementById('bulk-gen-cancel').addEventListener('click', function() { panel.remove(); });
+    document.getElementById('bulk-gen-go').addEventListener('click', async function() {
+      var depthBtn = panel.querySelector('#bulk-dseg button.active');
+      var depth = depthBtn ? depthBtn.dataset.d : 'standard';
+      var wishes = (document.getElementById('bulk-wishes').value || '').trim();
+      var skipReady = document.getElementById('bulk-skip-ready').checked;
+      var ids = Array.from(_TK.selected);
+      if (skipReady) {
+        ids = ids.filter(function(id) {
+          var t = _TK.all.find(function(x) { return x.id === id; });
+          return t && (!t.answer || !t.answer.length);
+        });
+      }
+      if (!ids.length) { toast('Нет билетов для генерации', 'info'); panel.remove(); return; }
+      var progEl = document.getElementById('bulk-gen-progress');
+      var goBtn = document.getElementById('bulk-gen-go');
+      goBtn.disabled = true;
+      var bulkOk = 0;
+      var bulkErr = 0;
+      var bulkErrIds = [];
+      for (var i = 0; i < ids.length; i++) {
+        var tid2 = ids[i];
+        progEl.textContent = (i + 1) + ' из ' + ids.length + '…';
+        await new Promise(function(resolve) {
+          var params = new URLSearchParams({depth: depth});
+          if (wishes) params.set('wishes', wishes);
+          var es2 = new EventSource('/api/subjects/' + slug + '/tickets/' + tid2 + '/generate?' + params.toString());
+          es2.onmessage = function(ev) {
+            if (ev.data === '[DONE]') { es2.close(); bulkOk++; resolve(); }
+            else {
+              try {
+                var d2 = JSON.parse(ev.data);
+                if (d2.error) { es2.close(); bulkErr++; bulkErrIds.push(tid2); resolve(); }
+              } catch(e3) {}
+            }
+          };
+          es2.onerror = function() { es2.close(); bulkErr++; bulkErrIds.push(tid2); resolve(); };
+        });
+      }
+      var doneMsg = 'Готово: ' + bulkOk + (bulkErr ? ', с ошибкой: ' + bulkErr : '');
+      progEl.textContent = doneMsg;
+      if (bulkErrIds.length) {
+        progEl.textContent += ' (билеты: ' + bulkErrIds.join(', ') + ')';
+      }
+      toast(doneMsg, bulkErr ? 'error' : 'success');
+      await loadTickets(slug);
+      setTimeout(function() { panel.remove(); }, 2000);
+    });
   });
 
   // Bulk delete
@@ -4812,6 +5232,11 @@ async function loadTickets(slug) {
     if (el) el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>';
     return;
   }
+  // Issue 5: persist depth/wishes from API as defaults
+  _TK.all.forEach(function(t) {
+    if (t.depth && !_tkDepth[t.id]) { _tkDepth[t.id] = t.depth; }
+    if (t.wishes && !_tkWishes[t.id]) { _tkWishes[t.id] = t.wishes; }
+  });
   // Remove stale selection ids
   _TK.selected = new Set(Array.from(_TK.selected).filter(function(id) {
     return _TK.all.some(function(t) { return t.id === id; });
@@ -4835,31 +5260,114 @@ function toggleAnswer(btn) {
   if (hidden) renderMath(answer);
 }
 
-async function genTicket(slug, tid) {
+// Per-ticket depth/wishes state
+var _tkDepth = {};   // tid -> 'short'|'standard'|'full'
+var _tkWishes = {};  // tid -> string
+
+var _DEPTH_LABELS = {short: 'Кратко', standard: 'Стандарт', full: 'Подробно'};
+
+async function genTicket(slug, tid, depth, wishes) {
+  depth = depth || _tkDepth[tid] || 'standard';
+  wishes = (wishes !== undefined ? wishes : _tkWishes[tid]) || '';
+  _tkDepth[tid] = depth;
+  _tkWishes[tid] = wishes;
   const ticketEl = document.getElementById('tk-' + tid);
   if (!ticketEl) return;
-  let ansEl = ticketEl.querySelector('.ticket-answer');
-  if (!ansEl) {
-    ansEl = document.createElement('div');
-    ansEl.className = 'ticket-answer';
-    ticketEl.appendChild(ansEl);
+  // Issue 11: .ticket-answer always exists and contains gen-panel + content area
+  var ansWrapper = ticketEl.querySelector('.ticket-answer');
+  if (!ansWrapper) {
+    ansWrapper = document.createElement('div');
+    ansWrapper.className = 'ticket-answer';
+    ticketEl.appendChild(ansWrapper);
   }
-  ansEl.style.display = '';
-  ansEl.innerHTML = '<div class="spinner"></div> Генерация ответа…';
+  ansWrapper.style.display = '';
+  // Hide the generate panel while generating
+  var genPanel = ansWrapper.querySelector('.gen-panel');
+  if (genPanel) genPanel.style.opacity = '0.5';
+  // Use or create content area
+  var contentEl = ansWrapper.querySelector('.ticket-answer-content');
+  if (!contentEl) {
+    contentEl = document.createElement('div');
+    contentEl.className = 'ticket-answer-content';
+    ansWrapper.appendChild(contentEl);
+  }
+  contentEl.innerHTML = '<div class="spinner"></div> Генерация ответа…';
   let full = '';
-  const es = new EventSource('/api/subjects/' + slug + '/tickets/' + tid + '/generate');
+  var params = new URLSearchParams({depth: depth});
+  if (wishes) params.set('wishes', wishes);
+  const es = new EventSource('/api/subjects/' + slug + '/tickets/' + tid + '/generate?' + params.toString());
   es.onmessage = function(ev) {
-    if (ev.data === '[DONE]') { es.close(); loadTickets(slug); return; }
+    if (ev.data === '[DONE]') {
+      es.close();
+      contentEl.innerHTML = md(full);
+      renderMath(contentEl);
+      if (genPanel) genPanel.style.opacity = '';
+      // Issue 8: update generate button text with depth label
+      var genBtn = ansWrapper.querySelector('.gen-btn');
+      var depthLabel = _DEPTH_LABELS[depth] || depth;
+      if (genBtn) { genBtn.textContent = 'Составить заново (' + depthLabel + ')'; }
+      loadTickets(slug);
+      return;
+    }
     try {
       const d = JSON.parse(ev.data);
-      if (d.error) { ansEl.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; es.close(); return; }
+      if (d.error) { contentEl.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; es.close(); if (genPanel) genPanel.style.opacity = ''; return; }
       if (d.content) {
         full += d.content;
-        ansEl.innerHTML = md(full) + '<span class="spinner" style="width:10px;height:10px;margin-left:4px"></span>';
+        contentEl.innerHTML = md(full) + '<span class="spinner" style="width:10px;height:10px;margin-left:4px"></span>';
       }
     } catch(e2) {}
   };
-  es.onerror = function() { es.close(); if (!full) ansEl.innerHTML = '<span style="color:var(--red)">Ошибка генерации</span>'; };
+  es.onerror = function() { es.close(); if (!full) contentEl.innerHTML = '<span style="color:var(--red)">Ошибка генерации</span>'; if (genPanel) genPanel.style.opacity = ''; };
+}
+
+function _tkDepthPanel(slug, tid, hasAnswer) {
+  var curDepth = _tkDepth[tid] || 'standard';
+  var depthBtns = [['short','Кратко'],['standard','Стандарт'],['full','Подробно']].map(function(d) {
+    return '<button type="button" class="' + (curDepth === d[0] ? 'active' : '') + '" data-d="' + d[0] + '">' + d[1] + '</button>';
+  }).join('');
+  return '<div class="gen-panel" style="padding:10px 16px 12px;border-top:1px solid var(--border)">' +
+    '<div class="depth-seg" id="dseg-' + tid + '">' + depthBtns + '</div>' +
+    '<button class="wishes-toggle" id="wt-' + tid + '" type="button">+ Пожелания к ответу</button>' +
+    '<div class="wishes-field" id="wf-' + tid + '">' +
+    '<textarea rows="2" id="wish-' + tid + '" style="width:100%;margin-top:6px;font-size:.875rem" placeholder="Например: как у Иванова, с классификацией и схемой"></textarea>' +
+    '</div>' +
+    '<button type="button" class="btn btn-primary btn-sm gen-btn" style="margin-top:10px" onclick="(function(){'  +
+      'var d=document.querySelector(\'#dseg-' + tid + ' button.active\');' +
+      'var w=document.getElementById(\'wish-' + tid + '\');' +
+      'genTicket(\'' + slug + '\',' + tid + ',d?d.dataset.d:\'standard\',w?w.value:\'\');' +
+    '})()">' + (hasAnswer ? ('Составить заново (' + (_DEPTH_LABELS[curDepth] || curDepth) + ')') : 'Составить ответ') + '</button>' +
+    '</div>';
+}
+
+function _attachDepthPanel(slug, tid) {
+  var dseg = document.getElementById('dseg-' + tid);
+  if (dseg) {
+    dseg.querySelectorAll('button').forEach(function(b) {
+      b.addEventListener('click', function() {
+        dseg.querySelectorAll('button').forEach(function(bb) { bb.classList.remove('active'); });
+        b.classList.add('active');
+        _tkDepth[tid] = b.dataset.d;
+        // Issue 8: update gen button label with depth
+        var genBtn = dseg.closest('.gen-panel') && dseg.closest('.gen-panel').querySelector('.gen-btn');
+        if (genBtn) {
+          var depthLabel = _DEPTH_LABELS[b.dataset.d] || b.dataset.d;
+          genBtn.textContent = 'Составить заново (' + depthLabel + ')';
+        }
+      });
+    });
+  }
+  var wt = document.getElementById('wt-' + tid);
+  var wf = document.getElementById('wf-' + tid);
+  if (wt && wf) {
+    wt.addEventListener('click', function() {
+      wf.classList.toggle('open');
+      wt.textContent = wf.classList.contains('open') ? '− Пожелания к ответу' : '+ Пожелания к ответу';
+    });
+    // Restore previously saved wishes
+    var wi = document.getElementById('wish-' + tid);
+    if (wi && _tkWishes[tid]) { wi.value = _tkWishes[tid]; wf.classList.add('open'); wt.textContent = '− Пожелания к ответу'; }
+  }
 }
 
 async function delTicket(slug, tid) {
