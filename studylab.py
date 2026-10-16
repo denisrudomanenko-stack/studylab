@@ -152,6 +152,7 @@ def init_db():
         "ALTER TABLE subjects ADD COLUMN year INTEGER DEFAULT 0",
         "ALTER TABLE subjects ADD COLUMN semester INTEGER DEFAULT 0",
         "ALTER TABLE subjects ADD COLUMN exam_date TEXT DEFAULT ''",
+        "ALTER TABLE exam_tickets ADD COLUMN position INTEGER DEFAULT 0",
     ]:
         try:
             db.execute(migration)
@@ -1188,7 +1189,7 @@ async def upload_chat_image(slug: str, file: UploadFile = File(),
 async def list_tickets(slug: str, user: dict = Depends(current_user)):
     db = get_db()
     rows = db.execute(
-        "SELECT * FROM exam_tickets WHERE subject_slug=? ORDER BY id", (slug,)
+        "SELECT * FROM exam_tickets WHERE subject_slug=? ORDER BY COALESCE(position,0), id", (slug,)
     ).fetchall()
     db.close()
     return [dict(r) for r in rows]
@@ -1201,9 +1202,12 @@ async def create_ticket(slug: str, question: str = Form(),
         raise HTTPException(400, "Вопрос не может быть пустым")
     db = get_db()
     now = datetime.now(timezone.utc).isoformat()
+    max_pos = db.execute(
+        "SELECT COALESCE(MAX(position),0) FROM exam_tickets WHERE subject_slug=?", (slug,)
+    ).fetchone()[0]
     cur = db.execute(
-        "INSERT INTO exam_tickets (subject_slug,question,status,created_at) VALUES (?,?,'pending',?)",
-        (slug, question.strip(), now)
+        "INSERT INTO exam_tickets (subject_slug,question,status,created_at,position) VALUES (?,?,'pending',?,?)",
+        (slug, question.strip(), now, max_pos + 1)
     )
     ticket_id = cur.lastrowid
     db.commit()
@@ -1211,50 +1215,265 @@ async def create_ticket(slug: str, question: str = Form(),
     return {"ok": True, "id": ticket_id}
 
 
+def _parse_ticket_lines(text: str) -> list[str]:
+    """Parse raw text into a list of clean question strings.
+
+    Handles numbering prefixes: '1.', '1)', '- ', 'Билет 1.', 'Вопрос 1:', '№1', '№ 1'.
+    Merges continuation lines (next line doesn't start with a numbering prefix).
+    """
+    NUMBER_RE = re.compile(
+        r"^(?:"
+        r"(?:Билет\s+\d+[.):]\s*)"    # Билет 1.
+        r"|(?:Вопрос\s+\d+[.:)]\s*)"  # Вопрос 1:
+        r"|(?:№\s*\d+[.):]*\s*)"       # №1 or № 1
+        r"|(?:\d+[.)]\s+)"             # 1. or 1)
+        r"|(?:[-*]\s+)"                # - or *
+        r")",
+        re.IGNORECASE
+    )
+
+    raw_lines = text.splitlines()
+    paragraphs: list[str] = []
+    current: str | None = None
+
+    for raw in raw_lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if NUMBER_RE.match(line):
+            if current is not None:
+                paragraphs.append(current)
+            # Strip the prefix
+            current = NUMBER_RE.sub("", line).strip()
+        else:
+            # Continuation line
+            if current is not None:
+                current = current + " " + line
+            else:
+                # No prefix encountered yet — treat as a plain question
+                current = line
+
+    if current is not None:
+        paragraphs.append(current)
+
+    return [p for p in paragraphs if p]
+
+
 @app.post("/api/subjects/{slug}/tickets/batch")
 async def batch_create_tickets(slug: str, questions: str = Form(),
                                 user: dict = Depends(current_user)):
-    """Пакетная загрузка вопросов — один вопрос на строку."""
+    """Пакетная загрузка вопросов с умным парсингом, дедупликацией и позициями."""
     db = get_db()
     if not db.execute("SELECT id FROM subjects WHERE slug=?", (slug,)).fetchone():
         db.close()
         raise HTTPException(404, "Предмет не найден")
-    now = datetime.now(timezone.utc).isoformat()
-    lines = [q.strip() for q in questions.strip().split("\n") if q.strip()]
-    if not lines:
+
+    parsed = _parse_ticket_lines(questions)
+    if not parsed:
         db.close()
         raise HTTPException(400, "Список вопросов пуст")
-    # Remove numbering like "1. ", "1) ", "- "
-    import re as _re2
-    cleaned = []
-    for line in lines:
-        line = _re2.sub(r"^\d+[.)]\s*", "", line)
-        line = _re2.sub(r"^[-*]\s*", "", line)
-        if line:
-            cleaned.append(line)
-    ids = []
-    for q in cleaned:
+
+    # Load existing questions for dedup (case-insensitive)
+    existing = {
+        row[0].strip().lower()
+        for row in db.execute(
+            "SELECT question FROM exam_tickets WHERE subject_slug=?", (slug,)
+        ).fetchall()
+    }
+
+    # Get max position
+    max_pos = db.execute(
+        "SELECT COALESCE(MAX(position),0) FROM exam_tickets WHERE subject_slug=?", (slug,)
+    ).fetchone()[0]
+
+    now = datetime.now(timezone.utc).isoformat()
+    ids: list[int] = []
+    skipped = 0
+    seen_in_batch: set[str] = set()
+
+    for q in parsed:
+        key = q.strip().lower()
+        if key in existing or key in seen_in_batch:
+            skipped += 1
+            continue
+        seen_in_batch.add(key)
+        max_pos += 1
         cur = db.execute(
-            "INSERT INTO exam_tickets (subject_slug,question,status,created_at) VALUES (?,?,'pending',?)",
-            (slug, q, now)
+            "INSERT INTO exam_tickets (subject_slug,question,status,created_at,position) VALUES (?,?,'pending',?,?)",
+            (slug, q.strip(), now, max_pos)
         )
         ids.append(cur.lastrowid)
+
     db.commit()
     db.close()
-    return {"ok": True, "count": len(ids), "ids": ids}
+    return {"ok": True, "count": len(ids), "skipped": skipped, "ids": ids}
+
+
+@app.post("/api/subjects/{slug}/tickets/import")
+async def import_tickets_preview(slug: str, file: UploadFile = File(),
+                                  user: dict = Depends(current_user)):
+    """Парсит файл со списком вопросов и возвращает список для предпросмотра (ничего не сохраняет)."""
+    db = get_db()
+    if not db.execute("SELECT id FROM subjects WHERE slug=?", (slug,)).fetchone():
+        db.close()
+        raise HTTPException(404, "Предмет не найден")
+    db.close()
+
+    filename = (file.filename or "").lower()
+    ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+
+    if ext == "heic":
+        raise HTTPException(400, "Фото в формате HEIC не поддерживается, выберите другое")
+    if ext in ("xlsx", "xls"):
+        raise HTTPException(400, "Формат XLSX пока не поддерживается")
+
+    content = await file.read()
+
+    raw_text = ""
+
+    if ext in ("txt", "md"):
+        try:
+            raw_text = content.decode("utf-8", errors="replace")
+        except Exception as e:
+            raise HTTPException(400, f"Ошибка чтения файла: {e}")
+
+    elif ext == "pdf":
+        try:
+            import fitz  # PyMuPDF
+            import io
+            doc = fitz.open(stream=io.BytesIO(content), filetype="pdf")
+            parts = []
+            for page in doc:
+                parts.append(page.get_text())
+            raw_text = "\n".join(parts)
+        except ImportError:
+            raise HTTPException(503, "PyMuPDF не установлен")
+        except Exception as e:
+            raise HTTPException(400, f"Ошибка чтения PDF: {e}")
+
+    elif ext in ("docx", "doc"):
+        try:
+            import subprocess
+            import tempfile
+            import os as _os
+            with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                result = subprocess.run(
+                    ["pandoc", "--to", "plain", tmp_path],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    raw_text = result.stdout
+                else:
+                    raise RuntimeError(result.stderr)
+            finally:
+                _os.unlink(tmp_path)
+        except FileNotFoundError:
+            # pandoc not available — try python-docx via mklib convert
+            try:
+                import tempfile
+                import os as _os
+                with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+                    tmp.write(content)
+                    tmp_path = tmp.name
+                if MKLIB_OK:
+                    md_tmp = Path(tempfile.mkdtemp())
+                    try:
+                        mk_convert(Path(tmp_path), "import_tmp", md_tmp, with_images=False)
+                        md_file = md_tmp / "import_tmp.md"
+                        if md_file.exists():
+                            raw_text = md_file.read_text(encoding="utf-8")
+                        else:
+                            for f2 in md_tmp.rglob("*.md"):
+                                raw_text = f2.read_text(encoding="utf-8")
+                                break
+                    finally:
+                        shutil.rmtree(md_tmp, ignore_errors=True)
+                        _os.unlink(tmp_path)
+                else:
+                    _os.unlink(tmp_path)
+                    raise HTTPException(503, "Конвертация DOCX недоступна — установите pandoc")
+            except HTTPException:
+                raise
+            except Exception as e2:
+                raise HTTPException(400, f"Ошибка чтения DOCX: {e2}")
+        except Exception as e:
+            raise HTTPException(400, f"Ошибка обработки файла: {e}")
+
+    elif ext in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
+        if not TIMEWEB_API_KEY:
+            raise HTTPException(503, "TIMEWEB_API_KEY не задан — OCR недоступен")
+        b64 = _b64.b64encode(content).decode()
+        messages = [{"role": "user", "content": [
+            {"type": "text",
+             "text": (
+                 "На этом изображении — список экзаменационных вопросов или билетов. "
+                 "Распознай все вопросы и выведи их нумерованным списком, по одному на строку. "
+                 "Формат: '1. Текст вопроса'. Только список, без пояснений."
+             )},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+        ]}]
+        try:
+            async with _httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    TIMEWEB_URL,
+                    headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+                    json={"model": VISION_MODEL, "messages": messages,
+                          "stream": False, "max_tokens": 2048, "temperature": 0.1}
+                )
+                resp.raise_for_status()
+                raw_text = resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise HTTPException(502, f"Ошибка OCR: {e}")
+    else:
+        raise HTTPException(400, f"Формат .{ext} не поддерживается. Используйте TXT, MD, PDF, DOCX, JPG, PNG")
+
+    questions = _parse_ticket_lines(raw_text)
+    return {"questions": questions, "count": len(questions)}
+
+
+@app.post("/api/subjects/{slug}/tickets/bulk-delete")
+async def bulk_delete_tickets(slug: str, request: Request,
+                               user: dict = Depends(current_user)):
+    """Удаляет несколько билетов по списку id."""
+    body = await request.json()
+    raw_ids = body.get("ids", [])
+    if not raw_ids:
+        raise HTTPException(400, "Список id пуст")
+    try:
+        ids = [int(i) for i in raw_ids]
+    except (ValueError, TypeError):
+        raise HTTPException(400, "Все id должны быть числами")
+    db = get_db()
+    placeholders = ",".join("?" * len(ids))
+    cur = db.execute(
+        f"DELETE FROM exam_tickets WHERE subject_slug=? AND id IN ({placeholders})",
+        [slug] + ids
+    )
+    deleted = cur.rowcount
+    db.commit()
+    db.close()
+    return {"ok": True, "deleted": deleted}
 
 
 @app.put("/api/subjects/{slug}/tickets/{tid}")
 async def update_ticket(slug: str, tid: int, question: str = Form(),
                          user: dict = Depends(current_user)):
+    new_q = question.strip()
     db = get_db()
+    row = db.execute("SELECT question FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)).fetchone()
+    if row and row["question"].strip() == new_q:
+        db.close()
+        return {"ok": True, "changed": False}
     db.execute(
         "UPDATE exam_tickets SET question=?, status='pending', answer='' WHERE id=? AND subject_slug=?",
-        (question.strip(), tid, slug)
+        (new_q, tid, slug)
     )
     db.commit()
     db.close()
-    return {"ok": True}
+    return {"ok": True, "changed": True}
 
 
 @app.delete("/api/subjects/{slug}/tickets/{tid}")
@@ -3163,38 +3382,371 @@ function appendMsg(role, content) {
 }
 
 // ── Tickets ────────────────────────────────────────────────────────────
+
+// State for ticket list screen
+var _TK = { all: [], selected: new Set(), filter: 'all', query: '' };
+
+function _tkStatusBadge(t) {
+  var st = t.status;
+  var hasAnswer = t.answer && t.answer.length > 0;
+  if (st === 'generating') return '<span class="badge badge-yellow badge-dot">Пишу\u2026</span>';
+  if (st === 'queued')     return '<span class="badge badge-blue badge-dot">В очереди</span>';
+  if (st === 'error')      return '<span class="badge badge-red badge-dot">Ошибка</span>';
+  if (hasAnswer)           return '<span class="badge badge-green badge-dot">Готов</span>';
+  return '<span class="badge badge-dim badge-dot">Нет ответа</span>';
+}
+
+function _tkMatchFilter(t) {
+  var hasAnswer = t.answer && t.answer.length > 0;
+  if (_TK.filter === 'noanswer' && hasAnswer) return false;
+  if (_TK.filter === 'ready' && !hasAnswer) return false;
+  if (_TK.query) {
+    var q = _TK.query.toLowerCase();
+    if (t.question.toLowerCase().indexOf(q) === -1) return false;
+  }
+  return true;
+}
+
+function _tkUpdateBulkBar(slug) {
+  var bar = document.getElementById('tk-bulk-bar');
+  if (!bar) return;
+  var n = _TK.selected.size;
+  var total = _TK.all.length;
+  var selCounter = document.getElementById('tk-sel-counter');
+  if (selCounter) selCounter.textContent = n > 0 ? ('Выбрано ' + n + ' из ' + total) : '';
+  if (n > 0) {
+    bar.classList.remove('hidden');
+    var prepBtn = document.getElementById('tk-btn-prep');
+    if (prepBtn) prepBtn.textContent = 'Подготовить ответы (' + n + ')';
+  } else {
+    bar.classList.add('hidden');
+  }
+}
+
+function _tkUpdateSelectAllState() {
+  var cb = document.getElementById('tk-sel-all');
+  if (!cb) return;
+  var visible = _TK.all.filter(_tkMatchFilter);
+  var allChecked = visible.length > 0 && visible.every(function(t) { return _TK.selected.has(t.id); });
+  cb.checked = allChecked;
+  cb.indeterminate = !allChecked && visible.some(function(t) { return _TK.selected.has(t.id); });
+}
+
+function _tkRenderList(slug) {
+  var el = document.getElementById('t-list');
+  if (!el) return;
+  var visible = _TK.all.filter(_tkMatchFilter);
+  if (!_TK.all.length) {
+    el.innerHTML = '<div class="empty">' + ic(IC.doc, 36) + '<b>Билетов пока нет. Вставьте список вопросов или загрузите файл</b></div>';
+    return;
+  }
+  if (!visible.length) {
+    el.innerHTML = '<div class="empty">' + ic(IC.doc, 28) + '<b>Ничего не найдено</b><span>Попробуйте другой фильтр или запрос</span></div>';
+    return;
+  }
+  el.innerHTML = visible.map(function(t, idx) {
+    var hasAnswer = t.answer && t.answer.length > 0;
+    var checked = _TK.selected.has(t.id) ? ' checked' : '';
+    var pos = t.position || (idx + 1);
+    var P = '\'' + slug + '\',' + t.id;
+    var menuItems =
+      '<button type="button" role="menuitem" onclick="closeMenus(null);tkEditInline(' + t.id + ')">Редактировать</button>' +
+      (hasAnswer ? '<button type="button" role="menuitem" onclick="closeMenus(null);genTicket(' + P + ')">Обновить ответ</button>' : '') +
+      (hasAnswer ? '<a role="menuitem" href="/api/subjects/' + slug + '/tickets/' + t.id + '/export" target="_blank" onclick="closeMenus(null)">Скачать HTML</a>' : '') +
+      '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delTicket(' + P + ')">Удалить</button>';
+    return '<div class="glass ticket-item" id="tk-' + t.id + '" data-id="' + t.id + '">' +
+      '<div class="ticket-head">' +
+      '<input type="checkbox" class="tk-cb" data-id="' + t.id + '"' + checked + ' style="width:20px;height:20px;flex:0 0 auto;cursor:pointer;accent-color:var(--accent)" aria-label="Выбрать билет ' + pos + '">' +
+      '<span style="min-width:28px;text-align:right;font-size:.8125rem;color:var(--dim);flex-shrink:0">' + pos + '</span>' +
+      '<div class="ticket-q" id="tkq-' + t.id + '" ondblclick="tkEditInline(' + t.id + ')" style="-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;cursor:text" title="Двойной клик — редактировать">' + esc(t.question) + '</div>' +
+      _tkStatusBadge(t) +
+      '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с билетом" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
+      '<div class="menu hidden" role="menu">' + menuItems + '</div></div>' +
+      '</div>' +
+      (hasAnswer ? '<div class="ticket-answer" style="display:none">' + md(t.answer) + '</div>' : '') +
+      '</div>';
+  }).join('');
+  // Attach checkbox listeners
+  el.querySelectorAll('.tk-cb').forEach(function(cb) {
+    cb.addEventListener('change', function() {
+      var id = parseInt(this.dataset.id);
+      if (this.checked) { _TK.selected.add(id); } else { _TK.selected.delete(id); }
+      _tkUpdateBulkBar(slug);
+      _tkUpdateSelectAllState();
+    });
+  });
+  // Click on answer text toggles expand
+  el.querySelectorAll('.ticket-answer').forEach(function(ans) {
+    ans.style.cursor = 'pointer';
+    ans.addEventListener('click', function() {
+      var hidden = ans.style.display === 'none' || ans.style.display === '';
+      // find toggle in same ticket-item
+      var item = ans.closest('.ticket-item');
+      var togBtn = item && item.querySelector('.toggle-answer');
+      if (togBtn) { toggleAnswer(togBtn); return; }
+      ans.style.display = (ans.style.display === 'none') ? '' : 'none';
+    });
+  });
+  renderMath(el);
+  _tkUpdateSelectAllState();
+}
+
+function tkEditInline(tid) {
+  var qEl = document.getElementById('tkq-' + tid);
+  if (!qEl) return;
+  var current = qEl.textContent;
+  var inp = document.createElement('input');
+  inp.type = 'text';
+  inp.value = current;
+  inp.style.cssText = 'flex:1;min-width:0;font-size:.9375rem;font-family:inherit;padding:4px 8px;min-height:36px';
+  qEl.replaceWith(inp);
+  inp.focus();
+  inp.select();
+  var slug = (location.hash.match(/\/tickets\/([^/?]+)/) || [])[1] || '';
+  async function saveTkEdit() {
+    var newQ = inp.value.trim();
+    if (!newQ || newQ === current) {
+      // restore
+      var restored = document.createElement('div');
+      restored.className = 'ticket-q';
+      restored.id = 'tkq-' + tid;
+      restored.setAttribute('ondblclick', 'tkEditInline(' + tid + ')');
+      restored.style.cssText = '-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;cursor:text';
+      restored.setAttribute('title', 'Двойной клик — редактировать');
+      restored.textContent = current;
+      inp.replaceWith(restored);
+      return;
+    }
+    var fd = new FormData(); fd.append('question', newQ);
+    var r = await api('/api/subjects/' + slug + '/tickets/' + tid, {method:'PUT', body:fd});
+    if (r.ok) {
+      var t = _TK.all.find(function(x) { return x.id === tid; });
+      if (t) t.question = newQ;
+      toast('Сохранено', 'success');
+      _tkRenderList(slug);
+    } else {
+      toast('Ошибка сохранения', 'error');
+      var restEl = document.createElement('div');
+      restEl.className = 'ticket-q';
+      restEl.id = 'tkq-' + tid;
+      restEl.setAttribute('ondblclick', 'tkEditInline(' + tid + ')');
+      restEl.style.cssText = '-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;cursor:text';
+      restEl.setAttribute('title', 'Двойной клик — редактировать');
+      restEl.textContent = current;
+      if (inp.parentNode) inp.replaceWith(restEl);
+    }
+  }
+  inp.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); saveTkEdit(); }
+    if (e.key === 'Escape') {
+      var r2 = document.createElement('div'); r2.className = 'ticket-q'; r2.id = 'tkq-' + tid;
+      r2.setAttribute('ondblclick', 'tkEditInline(' + tid + ')');
+      r2.style.cssText = '-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;cursor:text';
+      r2.setAttribute('title', 'Двойной клик — редактировать');
+      r2.textContent = current; inp.replaceWith(r2);
+    }
+  });
+  inp.addEventListener('blur', saveTkEdit);
+}
+
+function showPasteListModal(slug) {
+  var ov = document.createElement('div');
+  ov.className = 'modal-overlay';
+  ov.innerHTML =
+    '<div class="glass modal" style="max-width:580px">' +
+    '<div class="modal-title">Вставить список</div>' +
+    '<p class="text-sm text-muted" style="margin-bottom:12px">Проверьте и поправьте перед сохранением</p>' +
+    '<textarea id="paste-q" rows="10" placeholder="1. Первый вопрос\n2. Второй вопрос\n\u2014 или любой формат нумерации" style="font-size:.875rem"></textarea>' +
+    '<div id="paste-preview" class="text-muted text-sm" style="margin-top:8px;min-height:1.4em"></div>' +
+    '<div class="flex gap" style="margin-top:14px">' +
+    '<button type="button" class="btn btn-ghost" id="paste-cancel">Отмена</button>' +
+    '<button type="button" class="btn btn-primary" id="paste-save" disabled>Добавить билеты</button>' +
+    '</div></div>';
+  document.body.appendChild(ov);
+  ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+  document.getElementById('paste-cancel').addEventListener('click', function() { ov.remove(); });
+
+  var _pasteTimer = null;
+  var _parsedList = [];
+
+  function updatePreview() {
+    var text = document.getElementById('paste-q').value;
+    // Client-side quick count (split on numbered lines)
+    var lines = text.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+    var count = lines.length;
+    var prevEl = document.getElementById('paste-preview');
+    var saveBtn = document.getElementById('paste-save');
+    if (!text.trim()) {
+      if (prevEl) prevEl.textContent = '';
+      if (saveBtn) saveBtn.disabled = true;
+      return;
+    }
+    if (prevEl) prevEl.textContent = 'Строк: ' + count + ' — нажмите «Добавить»';
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Добавить ' + count + ' билетов'; }
+    _parsedList = lines;
+  }
+
+  var ta = document.getElementById('paste-q');
+  ta.addEventListener('input', function() {
+    clearTimeout(_pasteTimer);
+    _pasteTimer = setTimeout(updatePreview, 200);
+  });
+
+  document.getElementById('paste-save').addEventListener('click', async function() {
+    var text = document.getElementById('paste-q').value.trim();
+    if (!text) return;
+    var btn = this; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+    var fd = new FormData(); fd.append('questions', text);
+    var r = await api('/api/subjects/' + slug + '/tickets/batch', {method:'POST', body:fd});
+    if (r.ok) {
+      var data = await r.json();
+      var msg = 'Найдено ' + (data.count + (data.skipped || 0)) + ' вопросов';
+      if (data.skipped) msg += ', добавлено ' + data.count + ', пропущено ' + data.skipped + ' дублей';
+      else msg += ', добавлено ' + data.count;
+      toast(msg, 'success');
+      ov.remove();
+      loadTickets(slug);
+    } else {
+      var err = await r.json();
+      toast(err.detail || 'Ошибка', 'error');
+      btn.disabled = false; btn.textContent = 'Добавить билеты';
+    }
+  });
+  setTimeout(function() { ta.focus(); }, 50);
+}
+
+function showImportFileModal(slug) {
+  var inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.txt,.md,.pdf,.docx,.doc,.jpg,.jpeg,.png,.webp';
+  inp.style.display = 'none';
+  document.body.appendChild(inp);
+  inp.addEventListener('change', async function() {
+    var file = inp.files[0];
+    inp.remove();
+    if (!file) return;
+    toast('Загружаю и разбираю файл…', 'info');
+    var fd = new FormData(); fd.append('file', file);
+    var r;
+    try {
+      r = await api('/api/subjects/' + slug + '/tickets/import', {method:'POST', body:fd});
+    } catch(e) { toast('Ошибка сети', 'error'); return; }
+    if (!r.ok) {
+      var err = await r.json();
+      toast(err.detail || 'Ошибка разбора файла', 'error');
+      return;
+    }
+    var data = await r.json();
+    var qs = data.questions || [];
+    if (!qs.length) { toast('Вопросов не найдено', 'error'); return; }
+    // Show preview/edit modal
+    var ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    var listHtml = qs.map(function(q, i) {
+      return '<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px">' +
+        '<span style="color:var(--dim);font-size:.8125rem;min-width:24px;padding-top:4px">' + (i+1) + '</span>' +
+        '<input type="text" class="import-q-inp" value="' + esc(q) + '" style="flex:1;min-height:36px;font-size:.875rem">' +
+        '</div>';
+    }).join('');
+    ov.innerHTML =
+      '<div class="glass modal wide">' +
+      '<div class="modal-title">Найдено ' + qs.length + ' вопросов — проверьте и поправьте перед сохранением</div>' +
+      '<div style="max-height:55vh;overflow-y:auto;padding-right:4px">' + listHtml + '</div>' +
+      '<div class="flex gap" style="margin-top:16px">' +
+      '<button type="button" class="btn btn-ghost" id="imp-cancel">Отмена</button>' +
+      '<button type="button" class="btn btn-primary" id="imp-save">Добавить ' + qs.length + ' билетов</button>' +
+      '</div></div>';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+    document.getElementById('imp-cancel').addEventListener('click', function() { ov.remove(); });
+    document.getElementById('imp-save').addEventListener('click', async function() {
+      var inputs = ov.querySelectorAll('.import-q-inp');
+      var lines = [];
+      inputs.forEach(function(inp2) { var v = inp2.value.trim(); if (v) lines.push(v); });
+      if (!lines.length) { ov.remove(); return; }
+      var btn = this; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+      var fd2 = new FormData(); fd2.append('questions', lines.join('\n'));
+      var r2 = await api('/api/subjects/' + slug + '/tickets/batch', {method:'POST', body:fd2});
+      if (r2.ok) {
+        var d2 = await r2.json();
+        toast('Добавлено ' + d2.count + ' билетов' + (d2.skipped ? ', пропущено ' + d2.skipped + ' дублей' : ''), 'success');
+        ov.remove();
+        loadTickets(slug);
+      } else {
+        var e2 = await r2.json();
+        toast(e2.detail || 'Ошибка', 'error');
+        btn.disabled = false; btn.textContent = 'Добавить ' + qs.length + ' билетов';
+      }
+    });
+  });
+  inp.click();
+}
+
 async function vTickets(main, slug) {
+  _TK.all = []; _TK.selected = new Set(); _TK.filter = 'all'; _TK.query = '';
   let subject = {title: slug};
   try { const r = await api('/api/subjects/' + slug); subject = await r.json(); } catch(e) {}
   S.titles[slug] = subject.title || slug;
   updateNav('tickets', slug);
   main.innerHTML =
     '<div class="page">' +
-    '<div class="section-header">' +
-    '<h1 class="section-title">Билеты</h1>' +
+    // ── Header row
+    '<div class="section-header" style="flex-wrap:wrap;gap:12px 24px">' +
+    '<div style="display:flex;flex-direction:column;gap:8px">' +
+    '<h1 class="section-title">' + esc(subject.title) + '</h1>' +
+    '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">' +
+    '<span id="tk-sel-counter" class="text-muted text-sm"></span>' +
+    '<label style="display:flex;align-items:center;gap:8px;min-height:44px;cursor:pointer;font-size:.9375rem">' +
+    '<input type="checkbox" id="tk-sel-all" style="width:18px;height:18px;accent-color:var(--accent)"> Все без ответа' +
+    '</label>' +
+    '<button type="button" class="btn btn-ghost btn-sm" id="tk-btn-desel" style="display:none">Снять выбор</button>' +
+    '</div></div>' +
     '<div class="flex gap" style="flex-wrap:wrap">' +
-    '<button class="btn btn-ghost btn-sm" type="button" id="btn-preview">Превью экспорта</button>' +
+    '<button class="btn btn-ghost btn-sm" type="button" id="btn-preview">Превью</button>' +
     '<a href="/api/subjects/' + slug + '/tickets/export" class="btn btn-ghost btn-sm" target="_blank">Скачать HTML</a>' +
     '</div></div>' +
+    // ── Search + filter tabs
+    '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:16px 0">' +
+    '<input type="text" id="tk-search" placeholder="Поиск по билетам…" style="flex:1 1 200px;min-width:140px;max-width:400px">' +
+    '<div class="chips">' +
+    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn active" data-f="all">Все</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="noanswer">Без ответа</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="ready">Готовы</button>' +
+    '</div></div>' +
+    // ── Add area
     '<div class="ticket-add">' +
-    '<input type="text" id="new-q" aria-label="Новый вопрос" placeholder="Новый вопрос для билета… (Enter)">' +
+    '<input type="text" id="new-q" aria-label="Добавить вопрос" placeholder="Добавить вопрос…">' +
     '<button class="btn btn-primary btn-sm" style="flex-shrink:0" id="btn-add-t">Добавить</button>' +
-    '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-batch-t">Пакетная загрузка</button>' +
+    '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-paste-t">Вставить список</button>' +
+    '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-import-t">Загрузить файл со списком</button>' +
     '</div>' +
     '<div id="t-list"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
+    // ── Bulk action bar
+    '<div id="tk-bulk-bar" class="hidden" style="position:sticky;bottom:0;background:var(--nav-bg);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);border-top:1px solid var(--border);padding:12px 0;display:flex;gap:10px;align-items:center;margin-top:16px">' +
+    '<button type="button" class="btn btn-primary" id="tk-btn-prep">Подготовить ответы</button>' +
+    '<button type="button" class="btn btn-danger" id="tk-btn-bulk-del">Удалить</button>' +
+    '</div>' +
     '</div>';
 
+  // Add ticket
   async function addTicket() {
-    const q = document.getElementById('new-q').value.trim();
+    var q = document.getElementById('new-q').value.trim();
     if (!q) return;
-    const fd = new FormData();
-    fd.append('question', q);
-    const r = await api('/api/subjects/' + slug + '/tickets', {method:'POST', body:fd});
+    var fd = new FormData(); fd.append('question', q);
+    var r = await api('/api/subjects/' + slug + '/tickets', {method:'POST', body:fd});
     if (r.ok) { document.getElementById('new-q').value = ''; toast('Билет добавлен', 'success'); loadTickets(slug); }
     else toast('Ошибка', 'error');
   }
-
   document.getElementById('btn-add-t').addEventListener('click', addTicket);
+  document.getElementById('new-q').addEventListener('keydown', function(e) { if (e.key === 'Enter') addTicket(); });
+
+  // Paste list
+  document.getElementById('btn-paste-t').addEventListener('click', function() { showPasteListModal(slug); });
+
+  // Import from file
+  document.getElementById('btn-import-t').addEventListener('click', function() { showImportFileModal(slug); });
+
+  // Preview export
   document.getElementById('btn-preview').addEventListener('click', function() {
     var ov = document.createElement('div');
     ov.className = 'modal-overlay';
@@ -3209,74 +3761,105 @@ async function vTickets(main, slug) {
     ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
     document.getElementById('pv-close').addEventListener('click', function() { ov.remove(); });
   });
-  document.getElementById('new-q').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') addTicket();
+
+  // Select all (without answer)
+  document.getElementById('tk-sel-all').addEventListener('change', function() {
+    var visible = _TK.all.filter(_tkMatchFilter);
+    if (this.checked) {
+      // select all without answer in visible
+      visible.forEach(function(t) { if (!t.answer || !t.answer.length) _TK.selected.add(t.id); });
+    } else {
+      _TK.selected.clear();
+    }
+    _tkRenderList(slug);
+    _tkUpdateBulkBar(slug);
   });
-  document.getElementById('btn-batch-t').addEventListener('click', function() {
-    var ov = document.createElement('div');
-    ov.className = 'modal-overlay';
-    ov.innerHTML =
-      '<div class="glass modal" style="max-width:560px">' +
-      '<div class="modal-title">Пакетная загрузка вопросов</div>' +
-      '<p class="text-sm text-muted" style="margin-bottom:12px">Один вопрос на строку. Нумерация (1. 2. 3.) удаляется автоматически.</p>' +
-      '<form id="batch-form">' +
-      '<div class="form-group"><textarea id="batch-q" rows="10" placeholder="1. Первый закон термодинамики\n2. Закон Гесса\n3. Энтропия как функция состояния" style="font-size:.875rem"></textarea></div>' +
-      '<div class="flex gap" style="margin-top:4px">' +
-      '<button type="button" class="btn btn-ghost" id="batch-cancel">Отмена</button>' +
-      '<button type="submit" class="btn btn-primary">Загрузить</button>' +
-      '</div></form></div>';
-    document.body.appendChild(ov);
-    ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
-    document.getElementById('batch-cancel').addEventListener('click', function() { ov.remove(); });
-    document.getElementById('batch-form').addEventListener('submit', async function(e) {
-      e.preventDefault();
-      var fd = new FormData();
-      fd.append('questions', document.getElementById('batch-q').value);
-      var r = await api('/api/subjects/' + slug + '/tickets/batch', {method:'POST', body:fd});
-      if (r.ok) {
-        var data = await r.json();
-        toast(data.count + ' вопросов загружено', 'success');
-        ov.remove();
-        loadTickets(slug);
-      } else {
-        var err = await r.json();
-        toast(err.detail || 'Ошибка', 'error');
-      }
+
+  // Deselect
+  var deselBtn = document.getElementById('tk-btn-desel');
+  if (deselBtn) deselBtn.addEventListener('click', function() {
+    _TK.selected.clear();
+    _tkRenderList(slug);
+    _tkUpdateBulkBar(slug);
+  });
+
+  // Filter tabs
+  document.querySelectorAll('.tk-filter-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.tk-filter-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      _TK.filter = btn.dataset.f;
+      _tkRenderList(slug);
+      _tkUpdateSelectAllState();
     });
-    setTimeout(function() { document.getElementById('batch-q').focus(); }, 50);
   });
+
+  // Search
+  var searchTimer = null;
+  document.getElementById('tk-search').addEventListener('input', function() {
+    clearTimeout(searchTimer);
+    var val = this.value;
+    searchTimer = setTimeout(function() {
+      _TK.query = val.trim();
+      _tkRenderList(slug);
+      _tkUpdateSelectAllState();
+    }, 120);
+  });
+
+  // Bulk prepare (stub for now — tasks 04/06)
+  var prepBtn = document.getElementById('tk-btn-prep');
+  if (prepBtn) prepBtn.addEventListener('click', function() {
+    toast('Генерация ответов по ' + _TK.selected.size + ' билетам — будет доступна в следующем обновлении', 'info');
+  });
+
+  // Bulk delete
+  var bulkDelBtn = document.getElementById('tk-btn-bulk-del');
+  if (bulkDelBtn) bulkDelBtn.addEventListener('click', async function() {
+    if (!_TK.selected.size) return;
+    if (!confirm('Удалить ' + _TK.selected.size + ' билетов?')) return;
+    var ids = Array.from(_TK.selected);
+    var r = await api('/api/subjects/' + slug + '/tickets/bulk-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ids: ids})
+    });
+    if (r.ok) {
+      _TK.selected.clear();
+      toast('Удалено билетов: ' + ids.length, 'success');
+      loadTickets(slug);
+    } else { toast('Ошибка удаления', 'error'); }
+  });
+
+  // Show desel button when selection changes
+  function updateDeselBtn() {
+    var b = document.getElementById('tk-btn-desel');
+    if (b) b.style.display = _TK.selected.size > 0 ? '' : 'none';
+  }
+  var _origUpdateBulkBar = _tkUpdateBulkBar;
+  window._tkUpdateBulkBar_orig = _tkUpdateBulkBar;
+
   await loadTickets(slug);
 }
 
 async function loadTickets(slug) {
-  const el = document.getElementById('t-list');
-  if (!el) return;
   try {
-    const r = await api('/api/subjects/' + slug + '/tickets');
-    const tickets = await r.json();
-    if (!tickets.length) {
-      el.innerHTML = '<div class="empty">' + ic(IC.doc, 36) + '<b>Билетов пока нет</b><span>Добавьте вопросы выше.</span></div>';
-      return;
-    }
-    el.innerHTML = tickets.map(function(t) {
-      var hasAnswer = t.answer && t.answer.length > 0;
-      var P = '\'' + slug + '\',' + t.id;
-      return '<div class="glass ticket-item" id="tk-' + t.id + '">' +
-        '<div class="ticket-head">' +
-        (hasAnswer ? '<button class="icon-btn toggle-answer" type="button" onclick="toggleAnswer(this)" aria-expanded="false" aria-label="Развернуть или свернуть ответ">' + ic(IC.chev) + '</button>' : '<span style="width:44px;flex:0 0 auto"></span>') +
-        '<div class="ticket-q">' + esc(t.question) + '</div>' +
-        '<span class="badge badge-dot ' + (hasAnswer ? 'badge-green' : 'badge-dim') + '">' + (hasAnswer ? 'Ответ готов' : 'Нет ответа') + '</span>' +
-        '<button class="btn btn-primary btn-sm" type="button" onclick="genTicket(' + P + ')">' + (t.status === 'generated' ? 'Обновить ответ' : 'Ответить') + '</button>' +
-        '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с билетом" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
-        '<div class="menu hidden" role="menu">' +
-        (hasAnswer ? '<a role="menuitem" href="/api/subjects/' + slug + '/tickets/' + t.id + '/export" target="_blank" onclick="closeMenus(null)">Скачать HTML</a>' : '') +
-        '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delTicket(' + P + ')">Удалить</button>' +
-        '</div></div></div>' +
-        (hasAnswer ? '<div class="ticket-answer" style="display:none">' + md(t.answer) + '</div>' : '') +
-        '</div>';
-    }).join('');
-    renderMath(el);
-  } catch(e) { el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>'; }
+    var r = await api('/api/subjects/' + slug + '/tickets');
+    _TK.all = await r.json();
+  } catch(e) {
+    var el = document.getElementById('t-list');
+    if (el) el.innerHTML = '<p style="color:var(--red)" class="text-sm">Ошибка загрузки</p>';
+    return;
+  }
+  // Remove stale selection ids
+  _TK.selected = new Set(Array.from(_TK.selected).filter(function(id) {
+    return _TK.all.some(function(t) { return t.id === id; });
+  }));
+  _tkRenderList(slug);
+  _tkUpdateBulkBar(slug);
+  _tkUpdateSelectAllState();
+  // Update counter in header
+  var counter = document.getElementById('tk-sel-counter');
+  if (counter && _TK.selected.size === 0) counter.textContent = _TK.all.length + ' ' + plural(_TK.all.length, ['билет','билета','билетов']);
 }
 
 function toggleAnswer(btn) {
@@ -3299,6 +3882,7 @@ async function genTicket(slug, tid) {
     ansEl.className = 'ticket-answer';
     ticketEl.appendChild(ansEl);
   }
+  ansEl.style.display = '';
   ansEl.innerHTML = '<div class="spinner"></div> Генерация ответа…';
   let full = '';
   const es = new EventSource('/api/subjects/' + slug + '/tickets/' + tid + '/generate');
