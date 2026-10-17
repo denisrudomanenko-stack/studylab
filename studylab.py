@@ -4112,6 +4112,64 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
   .user-btn{padding:0 6px}
   .send-label{display:none}
   .login-card .body{padding:28px 20px 22px}
+  /* phone: extra bottom space for tab bar */
+  .page{padding-bottom:calc(72px + env(safe-area-inset-bottom,0px))}
+  .chat-input-area{padding-bottom:calc(16px + env(safe-area-inset-bottom,0px))}
+  /* full-width review cards */
+  .review-card{padding:20px 16px}
+  .review-actions .btn{min-height:44px;flex:1}
+}
+/* ── Safe areas ─────────────────────────────────────────────────────── */
+@supports(padding-bottom:env(safe-area-inset-bottom)){
+  body{padding-bottom:env(safe-area-inset-bottom,0)}
+}
+/* ── Phone bottom tab bar ───────────────────────────────────────────── */
+.phone-tabs{
+  position:fixed;bottom:0;left:0;right:0;
+  display:none;justify-content:space-around;align-items:stretch;
+  background:var(--nav-bg);border-top:1px solid var(--border);
+  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+  padding:8px 0;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px));
+  z-index:200;
+}
+.phone-tab-btn{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:3px;min-height:44px;background:none;border:none;color:var(--muted);
+  font-family:var(--font);font-size:.6875rem;font-weight:500;cursor:pointer;
+  transition:color .15s;padding:0 4px;
+}
+.phone-tab-btn.active,.phone-tab-btn:hover{color:var(--accent)}
+.phone-tab-btn svg{flex-shrink:0}
+/* ── Bottom sheet (phone) ───────────────────────────────────────────── */
+.bottom-sheet-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,.45);z-index:290;display:none;
+}
+.bottom-sheet-overlay.open{display:block}
+.bottom-sheet{
+  position:fixed;bottom:0;left:0;right:0;
+  max-height:70vh;background:var(--pop);
+  border-radius:18px 18px 0 0;border-top:1px solid var(--border);
+  padding:16px;overflow-y:auto;
+  transform:translateY(100%);transition:transform 0.3s ease;
+  z-index:300;
+  padding-bottom:calc(16px + env(safe-area-inset-bottom,0px));
+}
+.bottom-sheet.open{transform:translateY(0)}
+.bottom-sheet-handle{width:36px;height:4px;border-radius:2px;background:var(--border2);margin:0 auto 12px}
+.bottom-sheet-close{float:right;background:none;border:none;color:var(--muted);cursor:pointer;
+  font-size:1.125rem;line-height:1;padding:0 4px;min-height:28px;min-width:28px;}
+/* ── Desktop-only / phone-only visibility helpers ───────────────────── */
+.phone-laptop-hint{display:none;color:var(--muted);font-size:.8125rem;padding:8px 0}
+@media(max-width:480px){
+  body{overflow-x:hidden}
+  .desktop-only{display:none!important}
+  .phone-laptop-hint{display:block}
+  .navbar-phone-only{display:flex!important}
+}
+@media(min-width:481px){
+  .phone-only{display:none!important}
+  .phone-tabs{display:none!important}
 }
 </style>
 </head>
@@ -4120,11 +4178,37 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
   <nav class="navbar hidden" id="navbar"></nav>
   <main id="main"></main>
   <div class="toast-container" id="toasts"></div>
+  <nav class="phone-tabs hidden" id="phone-tabs" aria-label="Навигация"></nav>
+  <div class="bottom-sheet-overlay" id="bs-overlay" onclick="closeBottomSheet()"></div>
+  <div class="bottom-sheet" id="bs-sheet" role="dialog" aria-modal="true" aria-label="Источник"></div>
 </div>
 <script>
 // ── State ──────────────────────────────────────────────────────────────
 const S = { user: null, chatES: null, pendingImg: null, chatConvId: 0, titles: {}, _pollTimers: [],
-            _imgCache: {} };  // id -> {caption, kind, latex, figure_label, source_slug, segment, url}
+            _imgCache: {}, isPhone: false };  // id -> {caption, kind, latex, figure_label, source_slug, segment, url}
+
+// ── Phone detection ────────────────────────────────────────────────────
+function _detectPhone() {
+  return window.innerWidth <= 480 ||
+    (window.matchMedia('(pointer: coarse)').matches && window.innerWidth <= 768);
+}
+function _updatePhoneMode() {
+  var was = S.isPhone;
+  S.isPhone = _detectPhone();
+  if (was !== S.isPhone) { _applyPhoneTabs(); }
+}
+function _applyPhoneTabs() {
+  var tabs = document.getElementById('phone-tabs');
+  if (!tabs) return;
+  if (S.isPhone) {
+    tabs.classList.remove('hidden');
+    tabs.style.display = 'flex';
+  } else {
+    tabs.classList.add('hidden');
+    tabs.style.display = '';
+  }
+}
+window.addEventListener('resize', function() { _updatePhoneMode(); });
 
 // Stop all polling timers
 function stopPolling() { S._pollTimers.forEach(clearTimeout); S._pollTimers = []; }
@@ -4343,8 +4427,8 @@ function md(text) {
       '<figcaption style="font-size:.82em;color:var(--muted);margin-top:.4em">' +
       esc(caption) +
       (readerHref ? ' · <a href="' + readerHref + '" style="color:var(--accent)">читалка</a>' : '') +
-      '<button style="margin-left:8px;background:none;border:none;font-size:.8em;color:var(--muted);cursor:pointer;padding:0 4px" ' +
-      'title="Скрыть из ответов" onclick="_hideImg(' + imgId + ',this.closest(\'figure\'))">✕</button>' +
+      (S.isPhone ? '' : '<button style="margin-left:8px;background:none;border:none;font-size:.8em;color:var(--muted);cursor:pointer;padding:0 4px" ' +
+      'title="Скрыть из ответов" onclick="_hideImg(' + imgId + ',this.closest(\'figure\'))">✕</button>') +
       '</figcaption></figure>';
     return '</p>' + figHtml + '<p>';
   });
@@ -4436,11 +4520,134 @@ function chatSide(open) {
   if (sh) sh.classList.toggle('side-open', !!open);
 }
 
+// ── Bottom sheet (phone chips) ─────────────────────────────────────────
+function openBottomSheet(html) {
+  var ov = document.getElementById('bs-overlay');
+  var sh = document.getElementById('bs-sheet');
+  if (!sh || !ov) return;
+  sh.innerHTML =
+    '<div class="bottom-sheet-handle" aria-hidden="true"></div>' +
+    '<button class="bottom-sheet-close" onclick="closeBottomSheet()" aria-label="Закрыть">✕</button>' +
+    html;
+  ov.classList.add('open');
+  setTimeout(function() { sh.classList.add('open'); }, 10);
+  // Swipe down to close
+  var startY = 0;
+  sh.addEventListener('touchstart', function(e) { startY = e.touches[0].clientY; }, {passive:true, once:false});
+  sh.addEventListener('touchend', function(e) {
+    var dy = e.changedTouches[0].clientY - startY;
+    if (dy > 60) closeBottomSheet();
+  }, {passive:true, once:false});
+}
+function closeBottomSheet() {
+  var ov = document.getElementById('bs-overlay');
+  var sh = document.getElementById('bs-sheet');
+  if (!sh || !ov) return;
+  sh.classList.remove('open');
+  ov.classList.remove('open');
+}
+
+// Open a source chip as a bottom sheet on phone
+async function _openChipBottomSheet(subjectSlug, srcSlug, segId, readerHref) {
+  // Show sheet with spinner while loading
+  openBottomSheet('<div style="display:flex;align-items:center;gap:8px;padding:20px 0;color:var(--muted)"><div class="spinner"></div> Загрузка источника…</div>');
+  try {
+    var r = await api('/api/subjects/' + subjectSlug + '/segments/' + srcSlug + '/' + segId);
+    if (!r.ok) { openBottomSheet('<p style="color:var(--red);padding:8px 0">Источник не найден</p>'); return; }
+    var seg = await r.json();
+    var html =
+      '<div style="font-size:.8125rem;color:var(--muted);margin-bottom:8px">' +
+      esc(seg.source_title || srcSlug) + ' · §' + segId + ' · ' + seg.words + ' слов' +
+      (readerHref ? ' · <a href="' + readerHref + '" style="color:var(--accent)" onclick="closeBottomSheet()">читалка →</a>' : '') +
+      '</div>' +
+      '<div class="reader-body" style="font-size:.9375rem;line-height:1.65;overflow-wrap:anywhere">' +
+      renderSegment(seg.text, subjectSlug, srcSlug) + '</div>';
+    openBottomSheet(html);
+    var sh = document.getElementById('bs-sheet');
+    if (sh) {
+      renderMath(sh);
+      sh.querySelectorAll('.reader-body img').forEach(function(img) {
+        img.style.cursor = 'zoom-in';
+        img.addEventListener('click', function() { _showImgModal(img.src, img.alt); });
+      });
+    }
+  } catch(e) {
+    openBottomSheet('<p style="color:var(--red);padding:8px 0">Ошибка загрузки источника</p>');
+  }
+}
+
+// ── Phone tab bar render ───────────────────────────────────────────────
+function _renderPhoneTabs(view, slug) {
+  var tabs = document.getElementById('phone-tabs');
+  if (!tabs) return;
+  if (!S.isPhone || !S.user || view === 'login') {
+    tabs.classList.add('hidden');
+    tabs.style.display = '';
+    return;
+  }
+  tabs.classList.remove('hidden');
+  tabs.style.display = 'flex';
+  // Determine current active tab
+  var activeTab = (view === 'tickets' || view === 'ticket') ? 'tickets'
+                : (view === 'chat') ? 'chat'
+                : 'profile';
+  // Derive slug for links
+  var linkSlug = slug || '';
+  // Try to get a subject slug from the current hash if not provided
+  if (!linkSlug) {
+    var hm = location.hash.match(/\/(tickets|ticket|chat|subject|reader|review)\/([^/?#]+)/);
+    if (hm) linkSlug = hm[2];
+  }
+  var ticketsHref = linkSlug ? '#/tickets/' + linkSlug : '#/dashboard';
+  var chatHref = linkSlug ? '#/chat/' + linkSlug : '#/dashboard';
+  function _tb(id, icon, label, href, isActive) {
+    var el = isActive ? 'button type="button"' : 'a href="' + href + '"';
+    var clsAttr = isActive ? ' class="phone-tab-btn active"' : ' class="phone-tab-btn"';
+    var onclick = isActive ? '' : '';
+    if (isActive) {
+      return '<button type="button"' + clsAttr + ' aria-current="page" aria-label="' + label + '">' +
+        ic(icon, 22) + '<span>' + label + '</span></button>';
+    }
+    return '<a href="' + href + '"' + clsAttr + ' aria-label="' + label + '">' +
+      ic(icon, 22) + '<span>' + label + '</span></a>';
+  }
+  var ticketsIcon = '<path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2"/>';
+  var chatIcon = '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>';
+  var profileIcon = '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>';
+  tabs.innerHTML =
+    _tb('tickets', ticketsIcon, 'Билеты', ticketsHref, activeTab === 'tickets') +
+    _tb('chat', chatIcon, 'Спросить', chatHref, activeTab === 'chat') +
+    '<button type="button" class="phone-tab-btn' + (activeTab === 'profile' ? ' active' : '') + '" onclick="_showPhoneProfileMenu()" aria-label="Профиль">' +
+    ic(profileIcon, 22) + '<span>Профиль</span></button>';
+}
+
+function _showPhoneProfileMenu() {
+  var name = S.user ? S.user.username : '';
+  var roleLabel = S.user && S.user.role === 'admin' ? 'Администратор' : 'Студент';
+  var ov = document.createElement('div');
+  ov.className = 'modal-overlay';
+  ov.innerHTML =
+    '<div class="glass modal" style="max-width:320px">' +
+    '<div class="modal-title">Профиль</div>' +
+    '<div style="margin-bottom:16px;display:flex;align-items:center;gap:10px">' +
+    '<div class="avatar" style="width:44px;height:44px;font-size:1.125rem">' + esc(name.charAt(0).toUpperCase()) + '</div>' +
+    '<div><div style="font-weight:600">' + esc(name) + '</div><div class="text-muted text-sm">' + roleLabel + '</div></div>' +
+    '</div>' +
+    '<div style="display:flex;flex-direction:column;gap:8px">' +
+    (S.user && S.user.role !== 'admin' ? '<button class="btn btn-ghost" type="button" onclick="this.closest(\'.modal-overlay\').remove();showPasswordReset()">Сменить пароль</button>' : '') +
+    '<button class="btn btn-ghost" type="button" onclick="toggleTheme()">Сменить тему</button>' +
+    '<button class="btn btn-danger" type="button" onclick="this.closest(\'.modal-overlay\').remove();doLogout()">Выйти</button>' +
+    '</div></div>';
+  document.body.appendChild(ov);
+  ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+}
+
 // ── Navbar ─────────────────────────────────────────────────────────────
 function updateNav(view, slug) {
   const nb = document.getElementById('navbar');
-  if (view === 'login') { nb.classList.add('hidden'); return; }
+  if (view === 'login') { nb.classList.add('hidden'); _renderPhoneTabs('login', ''); return; }
   nb.classList.remove('hidden');
+  _renderPhoneTabs(view, slug);
   const labels = {subject:'Источники', reader:'Читалка', chat:'Чат', tickets:'Билеты', review:'Повторение'};
   const sep = '<span class="sep" aria-hidden="true">/</span>';
   var crumb;
@@ -4454,6 +4661,18 @@ function updateNav(view, slug) {
   }
   const name = S.user ? S.user.username : '';
   const roleLabel = S.user && S.user.role === 'admin' ? 'Администратор' : 'Студент';
+  // On phone: simplified navbar (logo + back only, no user menu — handled by bottom tab bar)
+  if (S.isPhone) {
+    var backHref = '#/dashboard';
+    if (slug && view !== 'dashboard') backHref = '#/tickets/' + slug;
+    if (view === 'ticket') backHref = '#/tickets/' + slug;
+    if (view === 'reader') backHref = '#/subject/' + slug;
+    nb.innerHTML =
+      '<a href="#/dashboard" class="logo">' + logoSvg() + '<span>StudyLab</span></a>' +
+      '<div class="crumb" aria-label="Путь">' + crumb + '</div>' +
+      (view !== 'dashboard' && slug ? '<a href="' + backHref + '" class="btn btn-ghost btn-sm" style="flex-shrink:0;margin-left:auto">← Назад</a>' : '');
+    return;
+  }
   nb.innerHTML =
     '<a href="#/dashboard" class="logo">' + logoSvg() + '<span>StudyLab</span></a>' +
     '<div class="crumb" aria-label="Путь">' + crumb + '</div>' +
@@ -4655,14 +4874,17 @@ async function vDashboard(main) {
   main.innerHTML = '<div class="page">' +
     '<div class="section-header" style="margin-bottom:16px">' +
     '<h1 class="section-title">Предметы</h1>' +
-    '<button class="btn btn-primary btn-sm" id="btn-add-subj">+ Новый предмет</button>' +
+    (S.isPhone
+      ? '<span class="phone-laptop-hint">Добавление предметов — на ноутбуке</span>'
+      : '<button class="btn btn-primary btn-sm" id="btn-add-subj">+ Новый предмет</button>') +
     '</div>' +
     '<div id="dash-tabs" class="tabs" role="tablist" style="margin-bottom:16px"></div>' +
     '<div style="margin-bottom:20px"><input type="text" id="dash-search" placeholder="Поиск по названию…" style="max-width:360px"></div>' +
     '<div id="dash-content"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
     '</div>';
 
-  document.getElementById('btn-add-subj').addEventListener('click', function() {
+  var addSubjBtn = document.getElementById('btn-add-subj');
+  if (addSubjBtn) addSubjBtn.addEventListener('click', function() {
     var sem = 0;
     try { sem = parseInt(localStorage.getItem('sl-semester') || '0') || 0; } catch(e) {}
     location.hash = '#/new';
@@ -4874,6 +5096,22 @@ async function vSubject(main, slug) {
   try { const r = await api('/api/subjects/' + slug); subject = await r.json(); } catch(e) {}
   S.titles[slug] = subject.title || slug;
   updateNav('subject', slug);
+  // On phone: hide Materials tab, no upload — show read-only hint
+  if (S.isPhone) {
+    main.innerHTML =
+      '<div class="page">' +
+      '<div class="section-header" style="margin-bottom:12px">' +
+      '<h1 class="section-title">' + esc(subject.title) + '</h1>' +
+      '</div>' +
+      '<div class="flex gap" style="flex-wrap:wrap;margin-bottom:16px">' +
+      '<a href="#/tickets/' + slug + '" class="btn btn-primary btn-sm">Билеты</a>' +
+      '<a href="#/review/' + slug + '" class="btn btn-ghost btn-sm">Повторить</a>' +
+      '<a href="#/chat/' + slug + '" class="btn btn-ghost btn-sm">Спросить</a>' +
+      '</div>' +
+      '<p class="phone-laptop-hint">Загрузка материалов и управление источниками — удобнее на ноутбуке.</p>' +
+      '</div>';
+    return;
+  }
   main.innerHTML =
     '<div class="page">' +
     '<div class="section-header">' +
@@ -5431,22 +5669,24 @@ function _showImgModal(srcOrId, alt) {
       readerLink.addEventListener('click', function() { document.body.removeChild(overlay); });
       info.appendChild(readerLink);
     }
-    // Hide button
-    var hideBtn = document.createElement('button');
-    hideBtn.textContent = 'Скрыть из ответов';
-    hideBtn.style.cssText = 'background:rgba(255,59,48,.15);border:1px solid rgba(255,59,48,.3);color:#ff8080;font-size:.8125rem;padding:4px 10px;border-radius:6px;cursor:pointer;font-family:inherit';
-    hideBtn.addEventListener('click', function() {
-      api('/api/images/' + imgId, {
-        method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({hidden: 1})
-      }).then(function() {
-        toast('Картинка скрыта из ответов', 'info');
-        // Hide the figure in the current view
-        document.querySelectorAll('figure[data-imgid="' + imgId + '"]').forEach(function(f) { f.style.display = 'none'; });
-        document.body.removeChild(overlay);
-      }).catch(function() { toast('Ошибка', 'error'); });
-    });
-    info.appendChild(hideBtn);
+    // Hide button — not shown on phone
+    if (!S.isPhone) {
+      var hideBtn = document.createElement('button');
+      hideBtn.textContent = 'Скрыть из ответов';
+      hideBtn.style.cssText = 'background:rgba(255,59,48,.15);border:1px solid rgba(255,59,48,.3);color:#ff8080;font-size:.8125rem;padding:4px 10px;border-radius:6px;cursor:pointer;font-family:inherit';
+      hideBtn.addEventListener('click', function() {
+        api('/api/images/' + imgId, {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({hidden: 1})
+        }).then(function() {
+          toast('Картинка скрыта из ответов', 'info');
+          // Hide the figure in the current view
+          document.querySelectorAll('figure[data-imgid="' + imgId + '"]').forEach(function(f) { f.style.display = 'none'; });
+          document.body.removeChild(overlay);
+        }).catch(function() { toast('Ошибка', 'error'); });
+      });
+      info.appendChild(hideBtn);
+    }
   }
   inner.appendChild(info);
   overlay.appendChild(inner);
@@ -5597,6 +5837,23 @@ async function vChat(main, slug) {
     '</div></div></div></div>';
 
   await loadConvList(slug);
+
+  // Phone: intercept chip clicks to open bottom sheet instead of navigating
+  if (S.isPhone) {
+    var chatMsgsEl = document.getElementById('chat-msgs');
+    if (chatMsgsEl) {
+      chatMsgsEl.addEventListener('click', function(e) {
+        var chip = e.target.closest('a.chip');
+        if (!chip) return;
+        e.preventDefault();
+        var href = chip.getAttribute('href') || '';
+        var m2 = href.match(/\/reader\/([^?#]+)\?src=([^&]+)&seg=(\d+)/);
+        if (!m2) return;
+        var rSlug = m2[1], rSrc = decodeURIComponent(m2[2]), rSeg = parseInt(m2[3], 10);
+        _openChipBottomSheet(rSlug, rSrc, rSeg, href);
+      });
+    }
+  }
 
   document.getElementById('btn-new-conv').addEventListener('click', function() {
     chatSide(false);
@@ -6166,48 +6423,64 @@ function showImportFileModal(slug) {
 }
 
 async function vTickets(main, slug) {
-  _TK.all = []; _TK.selected = new Set(); _TK.filter = 'all'; _TK.query = '';
+  _TK.all = []; _TK.selected = new Set();
+  _TK.filter = S.isPhone ? 'again' : 'all';
+  _TK.query = '';
   let subject = {title: slug};
   try { const r = await api('/api/subjects/' + slug); subject = await r.json(); } catch(e) {}
   S.titles[slug] = subject.title || slug;
   updateNav('tickets', slug);
+  // Phone: simplified header — no add controls, no bulk, only ready tickets + "Ещё раз" filter
+  var phoneHeader = S.isPhone
+    ? ('<div class="section-header" style="flex-wrap:wrap;gap:12px 24px;margin-bottom:12px">' +
+       '<h1 class="section-title">' + esc(subject.title) + '</h1>' +
+       '<a href="#/review/' + slug + '" class="btn btn-primary btn-sm">Повторить</a>' +
+       '</div>' +
+       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">' +
+       '<span id="tk-prog-counter" class="text-muted text-sm" style="align-self:center"></span>' +
+       '</div>' +
+       '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:12px">' +
+       '<input type="text" id="tk-search" placeholder="Поиск по билетам…" style="flex:1 1 160px;min-width:0;max-width:100%">' +
+       '<div class="chips">' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn' + (S.isPhone ? '' : ' active') + '" data-f="ready">Готовые</button>' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn' + (S.isPhone ? ' active' : '') + '" data-f="again">Ещё раз</button>' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="known">Знаю</button>' +
+       '</div></div>')
+    : ('<div class="section-header" style="flex-wrap:wrap;gap:12px 24px">' +
+       '<div style="display:flex;flex-direction:column;gap:8px">' +
+       '<h1 class="section-title">' + esc(subject.title) + '</h1>' +
+       '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">' +
+       '<span id="tk-sel-counter" class="text-muted text-sm"></span>' +
+       '<span id="tk-prog-counter" class="text-muted text-sm"></span>' +
+       '<label style="display:flex;align-items:center;gap:8px;min-height:44px;cursor:pointer;font-size:.9375rem">' +
+       '<input type="checkbox" id="tk-sel-all" style="width:18px;height:18px;accent-color:var(--accent)"> Все без ответа' +
+       '</label>' +
+       '<button type="button" class="btn btn-ghost btn-sm" id="tk-btn-desel" style="display:none">Снять выбор</button>' +
+       '</div></div>' +
+       '<div class="flex gap" style="flex-wrap:wrap">' +
+       '<a href="#/review/' + slug + '" class="btn btn-primary btn-sm">Повторить</a>' +
+       '<button class="btn btn-ghost btn-sm" type="button" id="btn-preview">Превью</button>' +
+       '<a href="/api/subjects/' + slug + '/tickets/export" class="btn btn-ghost btn-sm" target="_blank">Скачать HTML</a>' +
+       '</div></div>' +
+       '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:16px 0">' +
+       '<input type="text" id="tk-search" placeholder="Поиск по билетам…" style="flex:1 1 200px;min-width:140px;max-width:400px">' +
+       '<div class="chips">' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn active" data-f="all">Все</button>' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="noanswer">Без ответа</button>' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="ready">Готовы</button>' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="known">Знаю</button>' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="again">Ещё раз</button>' +
+       '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="check">Проверить</button>' +
+       '</div></div>' +
+       '<div class="ticket-add">' +
+       '<input type="text" id="new-q" aria-label="Добавить вопрос" placeholder="Добавить вопрос…">' +
+       '<button class="btn btn-primary btn-sm" style="flex-shrink:0" id="btn-add-t">Добавить</button>' +
+       '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-paste-t">Вставить список</button>' +
+       '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-import-t">Загрузить файл со списком</button>' +
+       '</div>');
   main.innerHTML =
     '<div class="page">' +
-    // ── Header row
-    '<div class="section-header" style="flex-wrap:wrap;gap:12px 24px">' +
-    '<div style="display:flex;flex-direction:column;gap:8px">' +
-    '<h1 class="section-title">' + esc(subject.title) + '</h1>' +
-    '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">' +
-    '<span id="tk-sel-counter" class="text-muted text-sm"></span>' +
-    '<span id="tk-prog-counter" class="text-muted text-sm"></span>' +
-    '<label style="display:flex;align-items:center;gap:8px;min-height:44px;cursor:pointer;font-size:.9375rem">' +
-    '<input type="checkbox" id="tk-sel-all" style="width:18px;height:18px;accent-color:var(--accent)"> Все без ответа' +
-    '</label>' +
-    '<button type="button" class="btn btn-ghost btn-sm" id="tk-btn-desel" style="display:none">Снять выбор</button>' +
-    '</div></div>' +
-    '<div class="flex gap" style="flex-wrap:wrap">' +
-    '<a href="#/review/' + slug + '" class="btn btn-primary btn-sm">Повторить</a>' +
-    '<button class="btn btn-ghost btn-sm" type="button" id="btn-preview">Превью</button>' +
-    '<a href="/api/subjects/' + slug + '/tickets/export" class="btn btn-ghost btn-sm" target="_blank">Скачать HTML</a>' +
-    '</div></div>' +
-    // ── Search + filter tabs
-    '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:16px 0">' +
-    '<input type="text" id="tk-search" placeholder="Поиск по билетам…" style="flex:1 1 200px;min-width:140px;max-width:400px">' +
-    '<div class="chips">' +
-    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn active" data-f="all">Все</button>' +
-    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="noanswer">Без ответа</button>' +
-    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="ready">Готовы</button>' +
-    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="known">Знаю</button>' +
-    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="again">Ещё раз</button>' +
-    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="check">Проверить</button>' +
-    '</div></div>' +
-    // ── Add area
-    '<div class="ticket-add">' +
-    '<input type="text" id="new-q" aria-label="Добавить вопрос" placeholder="Добавить вопрос…">' +
-    '<button class="btn btn-primary btn-sm" style="flex-shrink:0" id="btn-add-t">Добавить</button>' +
-    '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-paste-t">Вставить список</button>' +
-    '<button class="btn btn-ghost btn-sm" style="flex-shrink:0" id="btn-import-t">Загрузить файл со списком</button>' +
-    '</div>' +
+    phoneHeader +
     '<div id="t-list"><div class="text-muted text-sm"><div class="spinner"></div></div></div>' +
     // ── Bulk action bar
     '<div id="tk-bulk-bar" class="hidden" style="position:sticky;bottom:0;background:var(--nav-bg);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);border-top:1px solid var(--border);padding:12px 0;display:flex;gap:10px;align-items:center;margin-top:16px">' +
@@ -6216,26 +6489,33 @@ async function vTickets(main, slug) {
     '</div>' +
     '</div>';
 
-  // Add ticket
+  // Add ticket (desktop only)
   async function addTicket() {
-    var q = document.getElementById('new-q').value.trim();
+    var newQ = document.getElementById('new-q');
+    if (!newQ) return;
+    var q = newQ.value.trim();
     if (!q) return;
     var fd = new FormData(); fd.append('question', q);
     var r = await api('/api/subjects/' + slug + '/tickets', {method:'POST', body:fd});
-    if (r.ok) { document.getElementById('new-q').value = ''; toast('Билет добавлен', 'success'); loadTickets(slug); }
+    if (r.ok) { newQ.value = ''; toast('Билет добавлен', 'success'); loadTickets(slug); }
     else toast('Ошибка', 'error');
   }
-  document.getElementById('btn-add-t').addEventListener('click', addTicket);
-  document.getElementById('new-q').addEventListener('keydown', function(e) { if (e.key === 'Enter') addTicket(); });
+  var addBtn = document.getElementById('btn-add-t');
+  var newQEl = document.getElementById('new-q');
+  if (addBtn) addBtn.addEventListener('click', addTicket);
+  if (newQEl) newQEl.addEventListener('keydown', function(e) { if (e.key === 'Enter') addTicket(); });
 
-  // Paste list
-  document.getElementById('btn-paste-t').addEventListener('click', function() { showPasteListModal(slug); });
+  // Paste list (desktop only)
+  var pasteBtn = document.getElementById('btn-paste-t');
+  if (pasteBtn) pasteBtn.addEventListener('click', function() { showPasteListModal(slug); });
 
-  // Import from file
-  document.getElementById('btn-import-t').addEventListener('click', function() { showImportFileModal(slug); });
+  // Import from file (desktop only)
+  var importBtn = document.getElementById('btn-import-t');
+  if (importBtn) importBtn.addEventListener('click', function() { showImportFileModal(slug); });
 
-  // Preview export
-  document.getElementById('btn-preview').addEventListener('click', function() {
+  // Preview export (desktop only)
+  var prevBtn2 = document.getElementById('btn-preview');
+  if (prevBtn2) prevBtn2.addEventListener('click', function() {
     var ov = document.createElement('div');
     ov.className = 'modal-overlay';
     ov.innerHTML =
@@ -6250,8 +6530,9 @@ async function vTickets(main, slug) {
     document.getElementById('pv-close').addEventListener('click', function() { ov.remove(); });
   });
 
-  // Select all (without answer)
-  document.getElementById('tk-sel-all').addEventListener('change', function() {
+  // Select all (without answer) — desktop only
+  var tkSelAll = document.getElementById('tk-sel-all');
+  if (tkSelAll) tkSelAll.addEventListener('change', function() {
     var visible = _TK.all.filter(_tkMatchFilter);
     if (this.checked) {
       // select all without answer in visible
@@ -6854,6 +7135,39 @@ async function vTicketDetail(main, slug, ticketId) {
     var hasAnswer = !!(ticket.answer && ticket.answer.trim());
     var curDepth = _tkDepth[tid] || 'standard';
 
+    // Phone: depth switcher visible (read-only mode), no generate/wishes/refine
+    var actionControls = S.isPhone
+      ? ('<div style="margin-top:14px">' +
+           _renderDepthSeg(tid, curDepth) +
+           '<p class="phone-laptop-hint" style="margin-top:8px">Составить ответ заново — удобнее на ноутбуке.</p>' +
+         '</div>' +
+         '<div style="margin-top:16px;display:flex;gap:10px">' +
+           '<button type="button" class="btn btn-ghost btn-sm" id="td-known-btn" style="min-height:44px;color:var(--green);border-color:var(--green)">Знаю</button>' +
+           '<button type="button" class="btn btn-danger btn-sm" id="td-again-btn" style="min-height:44px">Ещё раз</button>' +
+         '</div>')
+      : ('<div style="margin-top:14px">' +
+           _renderDepthSeg(tid, curDepth) +
+           '<button class="wishes-toggle" id="td-wt-' + tid + '" type="button" style="margin-left:12px">+ Пожелания</button>' +
+           '<div class="wishes-field" id="td-wf-' + tid + '">' +
+             '<textarea rows="2" id="td-wish-' + tid + '" style="width:100%;margin-top:6px;font-size:.875rem" placeholder="Например: с классификацией и схемой">' +
+             esc(wishes) + '</textarea>' +
+           '</div>' +
+           '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">' +
+             '<button type="button" class="btn btn-primary btn-sm" id="td-gen-btn">' +
+               (hasAnswer ? 'Составить заново' : 'Составить ответ') +
+             '</button>' +
+             (hasAnswer ? '<button type="button" class="btn btn-ghost btn-sm" id="td-pin-btn">Зафиксировать</button>' : '') +
+           '</div>' +
+           (hasAnswer ?
+             '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+               '<input type="text" id="td-refine-input" placeholder="Что добавить?" style="flex:1 1 200px;min-width:0;font-size:.875rem">' +
+               '<button type="button" class="btn btn-ghost btn-sm" id="td-refine-btn">Дополнить</button>' +
+             '</div>' : '') +
+         '</div>' +
+         '<div style="margin-top:16px;display:flex;gap:8px">' +
+           '<button type="button" class="btn btn-ghost btn-sm" id="td-known-btn" style="color:var(--green);border-color:var(--green)">Знаю</button>' +
+           '<button type="button" class="btn btn-danger btn-sm" id="td-again-btn">Ещё раз</button>' +
+         '</div>');
     main.innerHTML =
       '<div class="page">' +
       _renderTopBar() +
@@ -6863,38 +7177,13 @@ async function vTicketDetail(main, slug, ticketId) {
           '<h2 style="font-size:1.0625rem;font-weight:600;line-height:1.45;margin-bottom:16px">' + esc(ticket.question) + '</h2>' +
           '<div class="glass" style="padding:16px 20px;border-radius:var(--r-m)">' +
             '<div id="td-answer-content" class="ticket-answer" style="padding:0;border:none;white-space:normal">' +
-              (hasAnswer ? md(ticket.answer) : '<span class="text-muted text-sm">Ответ ещё не составлен. Нажмите «Составить ответ».</span>') +
+              (hasAnswer ? md(ticket.answer) : '<span class="text-muted text-sm">Ответ ещё не составлен.</span>') +
             '</div>' +
           '</div>' +
-          // depth + wishes + actions
-          '<div style="margin-top:14px">' +
-            _renderDepthSeg(tid, curDepth) +
-            '<button class="wishes-toggle" id="td-wt-' + tid + '" type="button" style="margin-left:12px">+ Пожелания</button>' +
-            '<div class="wishes-field" id="td-wf-' + tid + '">' +
-              '<textarea rows="2" id="td-wish-' + tid + '" style="width:100%;margin-top:6px;font-size:.875rem" placeholder="Например: с классификацией и схемой">' +
-              esc(wishes) + '</textarea>' +
-            '</div>' +
-            '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">' +
-              '<button type="button" class="btn btn-primary btn-sm" id="td-gen-btn">' +
-                (hasAnswer ? 'Составить заново' : 'Составить ответ') +
-              '</button>' +
-              (hasAnswer ? '<button type="button" class="btn btn-ghost btn-sm" id="td-pin-btn">Зафиксировать</button>' : '') +
-            '</div>' +
-            // "Дополнить" field (only when answer exists)
-            (hasAnswer ?
-              '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
-                '<input type="text" id="td-refine-input" placeholder="Что добавить?" style="flex:1 1 200px;min-width:0;font-size:.875rem">' +
-                '<button type="button" class="btn btn-ghost btn-sm" id="td-refine-btn">Дополнить</button>' +
-              '</div>' : '') +
-          '</div>' +
-          // Progress buttons
-          '<div style="margin-top:16px;display:flex;gap:8px">' +
-            '<button type="button" class="btn btn-ghost btn-sm" id="td-known-btn" style="color:var(--green);border-color:var(--green)">Знаю</button>' +
-            '<button type="button" class="btn btn-danger btn-sm" id="td-again-btn">Ещё раз</button>' +
-          '</div>' +
+          actionControls +
         '</div>' +
-        // ── Right column ──
-        '<div class="ticket-right">' +
+        // ── Right column (hidden on phone to avoid clutter) ──
+        '<div class="ticket-right' + (S.isPhone ? ' desktop-only' : '') + '">' +
           '<div id="td-cov-panel" class="coverage-panel" style="margin-bottom:0">' +
             '<div style="display:flex;align-items:center;gap:8px;color:var(--muted);font-size:.875rem"><div class="spinner"></div> Поиск источников…</div>' +
           '</div>' +
@@ -7008,7 +7297,7 @@ async function vTicketDetail(main, slug, ticketId) {
     if (prevBtn) prevBtn.addEventListener('click', function() { navigate(idx - 1); });
     if (nextBtn) nextBtn.addEventListener('click', function() { navigate(idx + 1); });
 
-    // Chip click → load segment in right column
+    // Chip click → load segment in right column (desktop) or bottom sheet (phone)
     var leftCol = main.querySelector('.ticket-left');
     if (leftCol) {
       leftCol.addEventListener('click', function(e) {
@@ -7021,10 +7310,15 @@ async function vTicketDetail(main, slug, ticketId) {
         if (!m2) return;
         var rSlug = m2[1], rSrc = decodeURIComponent(m2[2]), rSeg = parseInt(m2[3], 10);
         var fragEl = chip.getAttribute('title') || '';
-        _tdLoadReaderPane(slug || rSlug, rSrc, rSeg, chip.getAttribute('href'), fragEl, '');
-        // highlight the clicked chip
-        leftCol.querySelectorAll('a.chip').forEach(function(c) { c.style.background = ''; });
-        chip.style.background = 'rgba(99,102,241,.25)';
+        if (S.isPhone) {
+          // Open in bottom sheet
+          _openChipBottomSheet(slug || rSlug, rSrc, rSeg, href);
+        } else {
+          _tdLoadReaderPane(slug || rSlug, rSrc, rSeg, href, fragEl, '');
+          // highlight the clicked chip
+          leftCol.querySelectorAll('a.chip').forEach(function(c) { c.style.background = ''; });
+          chip.style.background = 'rgba(99,102,241,.25)';
+        }
       });
     }
 
@@ -7597,6 +7891,8 @@ async function vReview(main, slug) {
 
 // ── Init ───────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async function() {
+  // Initialize phone detection before first route
+  S.isPhone = _detectPhone();
   try {
     const r = await fetch('/api/me', {credentials:'include'});
     if (r.ok) S.user = await r.json();
