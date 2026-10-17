@@ -413,26 +413,114 @@ MIN_SEGMENT_WORDS = 500
 CHUNK_WORDS = 500
 HEADING_RE = re.compile(r"(?m)^(#{1,6})\s+(\S.*)$")
 
+# Numbered heading: "1. Основные понятия..." (>15 chars after number, starts with capital+lowercase)
+_NUMBERED_HEADING_RE = re.compile(
+    r"(?m)^(\d{1,2})\.\s+([А-ЯA-Z][а-яёa-z][^\n]{15,120})$"
+)
+
+
+def _clean_text(text: str) -> str:
+    """Clean PDF extraction artifacts."""
+    from collections import Counter
+    # Replace private-use Unicode (□) with bullet
+    text = text.replace("\u25a1", "\u2022")
+    # Remove repeating page headers/footers
+    pages = text.split("\n---\n")
+    if len(pages) >= 3:
+        line_counts: Counter = Counter()
+        for page in pages:
+            seen: set = set()
+            for line in page.strip().split("\n"):
+                s = line.strip()
+                if s and len(s) < 80 and s not in seen:
+                    seen.add(s)
+                    line_counts[s] += 1
+        threshold = max(3, len(pages) * 0.3)
+        noise = {line for line, count in line_counts.items() if count >= threshold}
+        if noise:
+            cleaned = []
+            for line in text.split("\n"):
+                if line.strip() not in noise:
+                    cleaned.append(line)
+            text = "\n".join(cleaned)
+    # Collapse multiple --- separators
+    text = re.sub(r"(\n---\n\s*){2,}", "\n---\n", text)
+    # Remove orphaned image-ref tails (e.g. "page1_img4.png)")
+    text = re.sub(r"(?m)^[a-zA-Z0-9_\-]+\.(png|jpg|jpeg|gif|webp)\)\s*$", "", text)
+    return text
+
+
+def _is_heading_line(line: str) -> bool:
+    """Check if a line looks like a real heading (not a formula or subpoint)."""
+    s = line.strip()
+    if not s or len(s) < 5 or len(s) > 140:
+        return False
+    # Reject lines with formulas
+    if s.startswith("$") or s.endswith("$"):
+        return False
+    # Contains = and looks like formula (letters around =, or math symbols)
+    if "=" in s:
+        return False
+    # Contains math symbols
+    if any(c in s for c in "$∫∑∂δΔ±×÷≤≥≠≈∞"):
+        return False
+    # Starts lowercase after number — likely a continuation, not a heading
+    m2 = re.match(r"^\d+\.\s+(.)", s)
+    if m2 and m2.group(1).islower():
+        return False
+    # Must have at least 2 alphabetic words
+    words = [w for w in s.split() if any(c.isalpha() for c in w)]
+    if len(words) < 2:
+        return False
+    return True
+
+
+def _extract_title(text_block: str) -> str:
+    """Extract a meaningful title from a text block."""
+    for line in text_block.strip().split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("!["):
+            continue
+        if s == "---" or set(s) <= {"-", " "}:
+            continue
+        if not _is_heading_line(s):
+            continue
+        m = re.match(r"^(\d{1,2})\.\s+(.+)", s)
+        if m:
+            return m.group(0)[:120]
+        clean = s[:120]
+        if len(clean) > 80:
+            clean = clean[:80] + "…"
+        return clean
+    return "без названия"
+
 
 def read_text(md_dir: Path, slug: str) -> str:
     p = md_dir / slug / "book.md"
     if not p.exists():
         return ""
     text = p.read_text(encoding="utf-8")
-    return re.sub(r"\A---\n.*?\n---\n", "", text, count=1, flags=re.S)
+    text = re.sub(r"\A---\n.*?\n---\n", "", text, count=1, flags=re.S)
+    return text
 
 
 def segment_text(text: str) -> list[dict]:
-    heads = HEADING_RE.findall(text)
-    wph = len(text.split()) / len(heads) if heads else float("inf")
+    # Step 1: Clean artifacts
+    cleaned = _clean_text(text)
+
+    # Step 2: Try markdown headings
+    heads = HEADING_RE.findall(cleaned)
+    wph = len(cleaned.split()) / len(heads) if heads else float("inf")
 
     if heads and wph <= 1500:
-        positions = [m.start() for m in HEADING_RE.finditer(text)]
-        positions.append(len(text))
+        positions = [m.start() for m in HEADING_RE.finditer(cleaned)]
+        positions.append(len(cleaned))
         segments = []
         for i in range(len(positions) - 1):
             start, end = positions[i], positions[i + 1]
-            body = text[start:end].strip()
+            body = cleaned[start:end].strip()
             words = len(body.split())
             if words < 50:
                 continue
@@ -444,30 +532,81 @@ def segment_text(text: str) -> list[dict]:
             title = m.group(2).strip()[:160] if m else f"сегмент {len(segments)+1}"
             segments.append({"index": len(segments), "start_char": start,
                              "end_char": end, "words": words, "title": title})
-        return segments
-    else:
-        total_words = len(text.split())
-        want = max(1, round(total_words / TARGET_SEGMENT_WORDS))
-        paras = [(m.start(), m.end()) for m in re.finditer(r"[^\n]+(?:\n(?!\n)[^\n]+)*", text)]
-        if not paras:
-            return [{"index": 0, "start_char": 0, "end_char": len(text),
-                     "words": total_words, "title": "полный текст"}]
-        target_per = total_words / want
-        segments, cur_start, cur_words = [], 0, 0
-        for s, e in paras:
-            cur_words += len(text[s:e].split())
-            if cur_words >= target_per and len(segments) < want - 1:
-                tw = text[cur_start:cur_start+200].split()
-                title = " ".join(tw[:8]) + "…" if tw else f"сегмент {len(segments)+1}"
-                segments.append({"index": len(segments), "start_char": cur_start,
-                                 "end_char": e, "words": cur_words, "title": title})
-                cur_start, cur_words = e, 0
-        if cur_words > 0 or not segments:
-            tw = text[cur_start:cur_start+200].split()
-            title = " ".join(tw[:8]) + "…" if tw else f"сегмент {len(segments)+1}"
+        if segments:
+            return segments
+
+    # Step 3: Try numbered headings (e.g. "1. Основные понятия...")
+    numbered = [m for m in _NUMBERED_HEADING_RE.finditer(cleaned) if _is_heading_line(m.group(0))]
+    if len(numbered) >= 2:
+        positions = [m.start() for m in numbered]
+        positions.append(len(cleaned))
+        segments = []
+        for i in range(len(positions) - 1):
+            start, end = positions[i], positions[i + 1]
+            body = cleaned[start:end].strip()
+            words = len(body.split())
+            if words < 30:
+                continue
+            m = _NUMBERED_HEADING_RE.match(body)
+            title = m.group(0).strip()[:160] if m else _extract_title(body)
+            # Merge very small segments (<150 words)
+            if segments and words < 150:
+                segments[-1]["end_char"] = end
+                segments[-1]["words"] += words
+                continue
+            segments.append({"index": len(segments), "start_char": start,
+                             "end_char": end, "words": words, "title": title})
+        for i, s in enumerate(segments):
+            s["index"] = i
+        if segments:
+            return segments
+
+    # Step 4: Fall back to page-break splitting (---) with smart titles
+    pages = cleaned.split("\n---\n")
+    if len(pages) >= 3:
+        segments = []
+        pos = 0
+        for page in pages:
+            words = len(page.split())
+            if words < 30:
+                pos += len(page) + 5
+                continue
+            title = _extract_title(page)
+            if segments and words < MIN_SEGMENT_WORDS:
+                segments[-1]["end_char"] = pos + len(page)
+                segments[-1]["words"] += words
+            else:
+                segments.append({"index": len(segments), "start_char": pos,
+                                 "end_char": pos + len(page), "words": words,
+                                 "title": title})
+            pos += len(page) + 5
+        for i, s in enumerate(segments):
+            s["index"] = i
+        if segments:
+            return segments
+
+    # Step 5: Word-count fallback
+    total_words = len(cleaned.split())
+    want = max(1, round(total_words / TARGET_SEGMENT_WORDS))
+    paras = [(m.start(), m.end()) for m in re.finditer(r"[^\n]+(?:\n(?!\n)[^\n]+)*", cleaned)]
+    if not paras:
+        return [{"index": 0, "start_char": 0, "end_char": len(cleaned),
+                 "words": total_words, "title": "полный текст"}]
+    target_per = total_words / want
+    segments, cur_start, cur_words = [], 0, 0
+    for s, e in paras:
+        cur_words += len(cleaned[s:e].split())
+        if cur_words >= target_per and len(segments) < want - 1:
+            title = _extract_title(cleaned[cur_start:e])
             segments.append({"index": len(segments), "start_char": cur_start,
-                             "end_char": len(text), "words": cur_words or total_words, "title": title})
-        return segments
+                             "end_char": e, "words": cur_words, "title": title})
+            cur_start, cur_words = e, 0
+    if cur_words > 0 or not segments:
+        title = _extract_title(cleaned[cur_start:])
+        segments.append({"index": len(segments), "start_char": cur_start,
+                         "end_char": len(cleaned), "words": cur_words or total_words,
+                         "title": title})
+    return segments
 
 
 def chunk_segment(text: str, seg: dict) -> list[tuple[int, int]]:
