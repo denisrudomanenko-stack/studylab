@@ -2009,6 +2009,9 @@ _DEPTH_K          = {"short": 10,   "standard": 10,   "full": 14}
 # if max score in top-3 < 0.50 BUT >= 0.40, pass to LLM with warning in prompt
 _RELEVANCE_THRESHOLD = 0.50
 _RELEVANCE_SOFT_THRESHOLD = 0.40
+# Coverage panel thresholds (tunable on real data)
+_COVERAGE_STRONG_THRESHOLD = 0.50   # strong match
+_COVERAGE_WEAK_THRESHOLD   = 0.40   # minimum to show in coverage panel
 
 _NOT_FOUND_ANSWER = (
     "В материалах по этому вопросу ничего не найдено\n\n"
@@ -2494,6 +2497,77 @@ async def retry_ticket(
 
     asyncio.create_task(_process_queue(slug, [tid], depth, wishes, False))
     return {"ok": True, "queued": 1}
+
+
+@app.get("/api/subjects/{slug}/tickets/{tid}/coverage")
+async def ticket_coverage(slug: str, tid: int, user: dict = Depends(current_user)):
+    """Return source coverage analysis for a ticket (RAG search, no LLM call)."""
+    db = get_db()
+    row = db.execute(
+        "SELECT question FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Билет не найден")
+
+    question = row["question"]
+    if not MKLIB_OK:
+        return {"sources": [], "total_hits": 0, "image_count": 0}
+
+    # Perform same RAG search as generation (subject scope, k=10, text only)
+    rag_result = await _rag_context(slug, question, k=10, only_subject=True)
+    text_chunks = rag_result["text"]
+    image_chunks = rag_result["images"]
+
+    # Build per-source aggregation
+    source_map: dict[str, dict] = {}
+    for h in text_chunks:
+        src_slug = h.get("slug", "")
+        score = h.get("score", 0.0)
+        if score < _COVERAGE_WEAK_THRESHOLD:
+            continue
+        if src_slug not in source_map:
+            source_map[src_slug] = {"slug": src_slug, "hits": 0, "best_score": 0.0}
+        source_map[src_slug]["hits"] += 1
+        if score > source_map[src_slug]["best_score"]:
+            source_map[src_slug]["best_score"] = score
+
+    # Fetch source titles and attach strength
+    db2 = get_db()
+    result_sources = []
+    for src_slug, info in source_map.items():
+        src_row = db2.execute(
+            "SELECT title FROM sources WHERE subject_slug=? AND slug=?",
+            (slug, src_slug)
+        ).fetchone()
+        title = src_row["title"] if src_row else src_slug
+        best = info["best_score"]
+        strength = "strong" if best >= _COVERAGE_STRONG_THRESHOLD else "weak"
+        result_sources.append({
+            "slug": src_slug,
+            "title": title,
+            "hits": info["hits"],
+            "best_score": round(best, 3),
+            "strength": strength,
+        })
+
+    # Count image chunks from non-hidden, active-source images
+    active = _active_slugs(slug)
+    image_count = sum(
+        1 for h in image_chunks
+        if h.get("slug") in active
+    )
+
+    db2.close()
+
+    # Sort: strong first, then by best_score desc
+    result_sources.sort(key=lambda s: (0 if s["strength"] == "strong" else 1, -s["best_score"]))
+
+    return {
+        "sources": result_sources,
+        "total_hits": len(text_chunks),
+        "image_count": image_count,
+    }
 
 
 @app.get("/api/subjects/{slug}/tickets/{tid}/generate")
@@ -3375,6 +3449,31 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .msg-bubble code{background:var(--glass2);padding:1px 5px;border-radius:3px;font-size:.875em}
 .msg-bubble h2,.msg-bubble h3{margin:.75em 0 .3em;font-size:1em;font-weight:600}
 .prov{font-size:.8em;color:var(--accent)}
+.chip{display:inline-flex;align-items:center;padding:2px 10px;border-radius:12px;font-size:.75rem;
+  font-weight:500;background:var(--glass2);border:1px solid var(--border);color:var(--accent);
+  text-decoration:none;cursor:pointer;white-space:nowrap;max-width:200px;overflow:hidden;
+  text-overflow:ellipsis;vertical-align:middle;margin:0 2px}
+.chip:hover{background:var(--border)}
+[data-theme="light"] .chip{background:rgba(37,99,235,.08);border-color:rgba(37,99,235,.2);color:#1d4ed8}
+[data-theme="light"] .chip:hover{background:rgba(37,99,235,.15)}
+/* coverage panel */
+.coverage-panel{padding:12px 16px;border-radius:var(--r-s);background:var(--glass);
+  border:1px solid var(--border);margin-bottom:14px;font-size:.875rem}
+.coverage-panel-header{font-weight:600;font-size:.8125rem;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+.coverage-empty{color:var(--muted);font-size:.875rem;line-height:1.5}
+.coverage-source-row{display:flex;align-items:center;gap:8px;padding:5px 0;
+  border-bottom:1px solid var(--border)}
+.coverage-source-row:last-of-type{border-bottom:none}
+.coverage-source-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.coverage-badge{font-size:.7rem;font-weight:600;padding:2px 8px;border-radius:999px;flex-shrink:0}
+.coverage-badge.strong{background:rgba(52,211,153,.12);color:var(--green)}
+.coverage-badge.weak{background:rgba(251,191,91,.1);color:var(--yellow)}
+.coverage-toggle{display:flex;align-items:center;gap:5px;font-size:.75rem;color:var(--muted);flex-shrink:0}
+.coverage-toggle input[type=checkbox]{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
+.coverage-imgs{font-size:.8125rem;color:var(--muted);margin-top:8px;padding-top:8px;
+  border-top:1px solid var(--border)}
+.coverage-actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
 .math-block{text-align:center;margin:.8em 0;font-size:1.1em;overflow-x:auto}
 .chat-input-area{padding:12px 24px 20px;border-top:1px solid var(--border);background:var(--nav-bg);
   -webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px)}
@@ -3635,18 +3734,34 @@ function md(text) {
   h = h.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
   h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Provenance links — two formats:
+  // Provenance links → styled chips (no emoji, short label, full text in title)
   // New: [src:SUBJECT/SLUG#SEG | раздел: Title] — subject is explicit
   // Old: [src:SLUG#SEG | раздел: Title] — subject taken from current page context
+  function _makeChip(href, srcSlug, seg, rawTitle) {
+    var sectionTitle = rawTitle.trim().replace(/^раздел:\s*/i, '');
+    var isGarbage = /^---/.test(sectionTitle) || /[=$]/.test(sectionTitle) || sectionTitle.length > 80;
+    var shortLabel;
+    if (isGarbage) {
+      shortLabel = srcSlug + ', §' + seg;
+    } else {
+      var labelText = sectionTitle.length > 20 ? sectionTitle.slice(0, 20) + '…' : sectionTitle;
+      shortLabel = labelText + ', §' + seg;
+    }
+    if (shortLabel.length > 28) shortLabel = shortLabel.slice(0, 27) + '…';
+    var fullTitle = 'Открыть в читалке: ' + (isGarbage ? srcSlug + ' §' + seg : sectionTitle);
+    return '<a href="' + href + '" class="chip" title="' + esc(fullTitle) + '">' + esc(shortLabel) + '</a>';
+  }
   h = h.replace(/\[src:([^\/\#|\]]+)\/([^\/\#|\]]+)#(\d+)\s*\|\s*([^\]]+)\]/gi, function(_, subj, srcSlug, seg, rest) {
-    var title = encodeURIComponent(rest.trim().replace(/^раздел:\s*/i, ''));
-    return '<a href="#/reader/' + subj + '?src=' + srcSlug + '&seg=' + seg + '&t=' + title + '" class="prov" title="Открыть в читалке" style="cursor:pointer">[📖 ' + rest.trim() + ']</a>';
+    var titleEnc = encodeURIComponent(rest.trim().replace(/^раздел:\s*/i, ''));
+    var href = '#/reader/' + subj + '?src=' + srcSlug + '&seg=' + seg + '&t=' + titleEnc;
+    return _makeChip(href, srcSlug, seg, rest);
   });
   h = h.replace(/\[src:([^\/\#|\]]+)#(\d+)\s*\|\s*([^\]]+)\]/gi, function(_, srcSlug, seg, rest) {
     // Old format — extract subject from current page context
     var subjectSlug = (location.hash.match(/\/(chat|tickets|subject|reader)\/([^/?#]+)/) || [])[2] || '';
-    var title = encodeURIComponent(rest.trim().replace(/^раздел:\s*/i, ''));
-    return '<a href="#/reader/' + subjectSlug + '?src=' + srcSlug + '&seg=' + seg + '&t=' + title + '" class="prov" title="Открыть в читалке" style="cursor:pointer">[📖 ' + rest.trim() + ']</a>';
+    var titleEnc = encodeURIComponent(rest.trim().replace(/^раздел:\s*/i, ''));
+    var href = '#/reader/' + subjectSlug + '?src=' + srcSlug + '&seg=' + seg + '&t=' + titleEnc;
+    return _makeChip(href, srcSlug, seg, rest);
   });
   h = h.replace(/\[([^\]]+)\]/g, '<span class="prov">[$1]</span>');
   // Convert numbered lists with explicit numbers
@@ -5071,6 +5186,8 @@ function _tkRenderList(slug) {
       // Issue 11: depth panel is inside the expanded answer area, not outside
       '<div class="ticket-answer" style="display:none">' +
       _tkDepthPanel(slug, t.id, hasAnswer) +
+      // Coverage panel shown before answer when no answer yet (or always before content)
+      (!hasAnswer ? '<div id="cov-panel-' + t.id + '" style="padding:0 16px 4px"></div>' : '') +
       (hasAnswer ? '<div class="ticket-answer-content">' + md(t.answer) + '</div>' : '') +
       (t.status === 'error' && t.error_text ? '<div style="color:var(--red);font-size:.8125rem;margin-top:6px;padding:6px 10px;background:rgba(255,59,48,.08);border-radius:6px">' + esc(t.error_text) + ' \u00b7 <a href="#" onclick="event.preventDefault();tkRetry(\'' + slug + '\',' + t.id + ')">Повторить</a></div>' : '') +
       '</div>' +
@@ -5097,9 +5214,15 @@ function _tkRenderList(slug) {
       if (!item) return;
       var ans = item.querySelector('.ticket-answer');
       if (!ans) return;
+      var tid = parseInt(item.dataset.id);
       var isHidden = ans.style.display === 'none' || ans.style.display === '';
       ans.style.display = isHidden ? '' : 'none';
-      if (isHidden) renderMath(ans);
+      if (isHidden) {
+        renderMath(ans);
+        // Load coverage panel on first expand (only when no answer yet)
+        var covEl = document.getElementById('cov-panel-' + tid);
+        if (covEl && !_tkCoverage[tid]) { loadCoverage(slug, tid); }
+      }
     });
   });
   renderMath(el);
@@ -5722,22 +5845,159 @@ async function genTicket(slug, tid, depth, wishes) {
   es.onerror = function() { es.close(); if (!full) contentEl.innerHTML = '<span style="color:var(--red)">Ошибка генерации</span>'; if (genPanel) genPanel.style.opacity = ''; };
 }
 
+// ── Coverage panel ─────────────────────────────────────────────────────
+
+// State: per-ticket coverage data and excluded source slugs
+var _tkCoverage = {};    // tid -> coverage API response
+var _tkExcluded = {};    // tid -> Set of excluded source slugs
+
+function _renderCoveragePanel(slug, tid) {
+  var el = document.getElementById('cov-panel-' + tid);
+  if (!el) return;
+  var cov = _tkCoverage[tid];
+  if (!cov) {
+    el.innerHTML = '<div style="display:flex;align-items:center;gap:8px;color:var(--muted);font-size:.875rem"><div class="spinner"></div> Поиск в материалах…</div>';
+    return;
+  }
+  var excluded = _tkExcluded[tid] || new Set();
+  var sources = cov.sources || [];
+  var html = '<div class="coverage-panel">';
+  if (!sources.length) {
+    html += '<div class="coverage-panel-header">Нашла в материалах</div>' +
+      '<div class="coverage-empty">По этому вопросу в материалах ничего не нашла.<br>Загрузите ещё источники или составьте ответ по минимуму.</div>';
+  } else {
+    html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
+      '<span class="coverage-panel-header" style="margin-bottom:0">Нашла в материалах</span>' +
+      '<button type="button" class="btn btn-ghost btn-sm" id="cov-toggle-' + tid + '" style="font-size:.75rem;padding:2px 10px" onclick="(function(){' +
+        'var rows=document.querySelectorAll(\'#cov-panel-' + tid + ' .coverage-toggle\');' +
+        'var hidden=rows.length&&rows[0].style.display===\'none\';' +
+        'rows.forEach(function(r){r.style.display=hidden?\'\':\'none\'});' +
+        'document.getElementById(\'cov-toggle-' + tid + '\').textContent=hidden?\'Скрыть\':\'Выбрать источники\';' +
+      '})()">Выбрать источники</button>' +
+    '</div>';
+    sources.forEach(function(s) {
+      var checked = !excluded.has(s.slug) ? ' checked' : '';
+      var badgeCls = s.strength === 'strong' ? 'strong' : 'weak';
+      var badgeText = s.strength === 'strong' ? 'сильно' : 'слабо';
+      html += '<div class="coverage-source-row">' +
+        '<span class="coverage-source-name" title="' + esc(s.title) + '">' + esc(s.title) + '</span>' +
+        '<span class="coverage-badge ' + badgeCls + '">' + badgeText + '</span>' +
+        '<label class="coverage-toggle" style="display:none" title="Использовать источник">' +
+          '<input type="checkbox" data-slug="' + esc(s.slug) + '" data-tid="' + tid + '"' + checked + ' onchange="(function(cb){' +
+            'var ex=_tkExcluded[' + tid + ']||(_tkExcluded[' + tid + ']=new Set());' +
+            'if(cb.checked){ex.delete(cb.dataset.slug);}else{ex.add(cb.dataset.slug);}' +
+          '})(this)"> Использовать' +
+        '</label>' +
+      '</div>';
+    });
+    if (cov.image_count) {
+      html += '<div class="coverage-imgs">Иллюстрации: найдено ' + cov.image_count + '</div>';
+    }
+  }
+  html += '<div class="coverage-actions">' +
+    '<button type="button" class="btn btn-primary btn-sm gen-btn-cov" onclick="(function(){' +
+      'var d=document.querySelector(\'#dseg-' + tid + ' button.active\');' +
+      'var w=document.getElementById(\'wish-' + tid + '\');' +
+      'var ex=Array.from(_tkExcluded[' + tid + ']||[]).join(\',\');' +
+      'genTicketWithExclude(\'' + slug + '\',' + tid + ',d?d.dataset.d:\'standard\',w?w.value:\'\',ex);' +
+    '})()">Составить ответ</button>' +
+    (sources.length ? '<button type="button" class="btn btn-ghost btn-sm" id="cov-toggle-' + tid + '-2" onclick="(function(){' +
+      'var rows=document.querySelectorAll(\'#cov-panel-' + tid + ' .coverage-toggle\');' +
+      'var hidden=rows.length&&rows[0].style.display===\'none\';' +
+      'rows.forEach(function(r){r.style.display=hidden?\'\':\'none\'});' +
+    '})()">Выбрать источники</button>' : '') +
+  '</div>';
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+async function loadCoverage(slug, tid) {
+  if (_tkCoverage[tid]) { _renderCoveragePanel(slug, tid); return; }
+  _renderCoveragePanel(slug, tid);  // show spinner
+  try {
+    var r = await api('/api/subjects/' + slug + '/tickets/' + tid + '/coverage');
+    if (r.ok) {
+      _tkCoverage[tid] = await r.json();
+    } else {
+      _tkCoverage[tid] = {sources: [], total_hits: 0, image_count: 0};
+    }
+  } catch(e) {
+    _tkCoverage[tid] = {sources: [], total_hits: 0, image_count: 0};
+  }
+  _renderCoveragePanel(slug, tid);
+}
+
+async function genTicketWithExclude(slug, tid, depth, wishes, exclude) {
+  depth = depth || _tkDepth[tid] || 'standard';
+  wishes = wishes || _tkWishes[tid] || '';
+  _tkDepth[tid] = depth;
+  _tkWishes[tid] = wishes;
+  const ticketEl = document.getElementById('tk-' + tid);
+  if (!ticketEl) return;
+  var ansWrapper = ticketEl.querySelector('.ticket-answer');
+  if (!ansWrapper) return;
+  // Hide coverage panel, show content area
+  var covPanel = document.getElementById('cov-panel-' + tid);
+  if (covPanel) covPanel.style.display = 'none';
+  var genPanel = ansWrapper.querySelector('.gen-panel');
+  if (genPanel) genPanel.style.opacity = '0.5';
+  var contentEl = ansWrapper.querySelector('.ticket-answer-content');
+  if (!contentEl) {
+    contentEl = document.createElement('div');
+    contentEl.className = 'ticket-answer-content';
+    ansWrapper.appendChild(contentEl);
+  }
+  contentEl.style.display = '';
+  contentEl.innerHTML = '<div class="spinner"></div> Генерация ответа…';
+  let full = '';
+  var params = new URLSearchParams({depth: depth});
+  if (wishes) params.set('wishes', wishes);
+  if (exclude) params.set('exclude', exclude);
+  const es = new EventSource('/api/subjects/' + slug + '/tickets/' + tid + '/generate?' + params.toString());
+  es.onmessage = function(ev) {
+    if (ev.data === '[DONE]') {
+      es.close();
+      contentEl.innerHTML = md(full);
+      renderMath(contentEl);
+      if (genPanel) genPanel.style.opacity = '';
+      var genBtn = ansWrapper.querySelector('.gen-btn');
+      var depthLabel = _DEPTH_LABELS[depth] || depth;
+      if (genBtn) { genBtn.textContent = 'Составить заново (' + depthLabel + ')'; }
+      loadTickets(slug);
+      return;
+    }
+    try {
+      var d = JSON.parse(ev.data);
+      if (d.error) { contentEl.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; es.close(); if (genPanel) genPanel.style.opacity = ''; return; }
+      if (d.content) {
+        full += d.content;
+        contentEl.innerHTML = md(full) + '<span class="spinner" style="width:10px;height:10px;margin-left:4px"></span>';
+      }
+    } catch(e2) {}
+  };
+  es.onerror = function() { es.close(); if (!full) contentEl.innerHTML = '<span style="color:var(--red)">Ошибка генерации</span>'; if (genPanel) genPanel.style.opacity = ''; };
+}
+
 function _tkDepthPanel(slug, tid, hasAnswer) {
   var curDepth = _tkDepth[tid] || 'standard';
   var depthBtns = [['short','Кратко'],['standard','Стандарт'],['full','Подробно']].map(function(d) {
     return '<button type="button" class="' + (curDepth === d[0] ? 'active' : '') + '" data-d="' + d[0] + '">' + d[1] + '</button>';
   }).join('');
+  // When no answer yet, "Составить ответ" lives in the coverage panel; only show "Составить заново" here
+  var genBtnHtml = hasAnswer
+    ? '<button type="button" class="btn btn-primary btn-sm gen-btn" style="margin-top:10px" onclick="(function(){' +
+        'var d=document.querySelector(\'#dseg-' + tid + ' button.active\');' +
+        'var w=document.getElementById(\'wish-' + tid + '\');' +
+        'genTicket(\'' + slug + '\',' + tid + ',d?d.dataset.d:\'standard\',w?w.value:\'\');' +
+      '})()">Составить заново (' + (_DEPTH_LABELS[curDepth] || curDepth) + ')</button>'
+    : '';
   return '<div class="gen-panel" style="padding:10px 16px 12px;border-top:1px solid var(--border)">' +
     '<div class="depth-seg" id="dseg-' + tid + '">' + depthBtns + '</div>' +
     '<button class="wishes-toggle" id="wt-' + tid + '" type="button">+ Пожелания к ответу</button>' +
     '<div class="wishes-field" id="wf-' + tid + '">' +
     '<textarea rows="2" id="wish-' + tid + '" style="width:100%;margin-top:6px;font-size:.875rem" placeholder="Например: как у Иванова, с классификацией и схемой"></textarea>' +
     '</div>' +
-    '<button type="button" class="btn btn-primary btn-sm gen-btn" style="margin-top:10px" onclick="(function(){'  +
-      'var d=document.querySelector(\'#dseg-' + tid + ' button.active\');' +
-      'var w=document.getElementById(\'wish-' + tid + '\');' +
-      'genTicket(\'' + slug + '\',' + tid + ',d?d.dataset.d:\'standard\',w?w.value:\'\');' +
-    '})()">' + (hasAnswer ? ('Составить заново (' + (_DEPTH_LABELS[curDepth] || curDepth) + ')') : 'Составить ответ') + '</button>' +
+    genBtnHtml +
     '</div>';
 }
 
