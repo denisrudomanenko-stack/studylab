@@ -173,6 +173,7 @@ def init_db():
         "ALTER TABLE exam_tickets ADD COLUMN position INTEGER DEFAULT 0",
         "ALTER TABLE exam_tickets ADD COLUMN depth TEXT DEFAULT 'standard'",
         "ALTER TABLE exam_tickets ADD COLUMN wishes TEXT DEFAULT ''",
+        "ALTER TABLE exam_tickets ADD COLUMN error_text TEXT DEFAULT ''",
     ]:
         try:
             db.execute(migration)
@@ -242,6 +243,8 @@ _INDEX_TASKS: dict[str, asyncio.Task] = {}  # key = "subject/src_slug"
 
 @app.on_event("startup")
 async def on_startup():
+    global _GEN_SEM
+    _GEN_SEM = asyncio.Semaphore(MAX_PARALLEL_GENERATION)
     init_db()
     # Re-queue sources stuck in indexing/uploaded after restart
     db = get_db()
@@ -253,7 +256,21 @@ async def on_startup():
     pending_imgs = db.execute(
         "SELECT DISTINCT subject_slug, source_slug FROM images WHERE status='pending'"
     ).fetchall()
+    # Mark tickets stuck in generating/queued as error (interrupted by restart)
+    stuck_tickets = db.execute(
+        "SELECT id, subject_slug FROM exam_tickets WHERE status IN ('queued','generating')"
+    ).fetchall()
     db.close()
+    if stuck_tickets:
+        db2 = get_db()
+        for row in stuck_tickets:
+            db2.execute(
+                "UPDATE exam_tickets SET status='error', error_text=? WHERE id=?",
+                ("Прервано перезапуском сервера", row["id"])
+            )
+            print(f"[startup] ticket {row['id']} ({row['subject_slug']}) interrupted by restart → error", flush=True)
+        db2.commit()
+        db2.close()
     for row in stuck:
         key = f"{row['subject_slug']}/{row['slug']}"
         upload_path = subject_dir(row["subject_slug"]) / "uploads" / row["filename"]
@@ -510,6 +527,13 @@ import sys as _sys
 
 _INDEX_SEM = asyncio.Semaphore(2)
 _IMAGE_SEM = asyncio.Semaphore(1)
+
+# ── Generation queue globals ──────────────────────────────────────────
+MAX_PARALLEL_GENERATION = 1
+GENERATION_DELAY_SEC    = 0
+_GEN_SEM: asyncio.Semaphore   # initialised in on_startup (event loop must be running)
+_GEN_QUEUE: dict[str, dict]   = {}  # slug → {total,done,failed,running_tid,cancelled}
+
 MAX_IMAGES_PER_SOURCE = 150
 MIN_IMAGE_FILE_KB = 8
 MIN_IMAGE_SHORT_SIDE = 120
@@ -2090,6 +2114,388 @@ def _validate_answer(
     return cleaned, warnings
 
 
+def _build_ticket_context(
+    question: str, text_chunks: list, image_chunks: list,
+    depth: str, wishes: str, max_img: int
+) -> tuple[str, str, set, list]:
+    """Build system_prompt, user_message, context_triples, image_candidate_ids from RAG chunks.
+    Returns (system_prompt, user_message, context_triples, image_candidate_ids)."""
+    depth_rule   = _DEPTH_RULES.get(depth, _DEPTH_RULES["standard"])
+    wishes_text  = wishes if wishes else "нет"
+
+    # Relevance check
+    top3_scores = sorted([h.get("score", 0) for h in text_chunks], reverse=True)[:3] if text_chunks else []
+    max_score   = max(top3_scores) if top3_scores else 0
+    weak_relevance = text_chunks and max_score >= _RELEVANCE_SOFT_THRESHOLD and max_score < _RELEVANCE_THRESHOLD
+
+    system_prompt = (
+        "Ты помогаешь студентке подготовить конспект ответа на экзаменационный билет.\n"
+        "Работаешь ТОЛЬКО по приведённым фрагментам источников. Свои знания не добавляй и ничего не выдумывай.\n\n"
+        "ПРАВИЛА\n"
+        "1. Каждый факт из источника сопровождай ссылкой в ТОЧНОМ формате [src:SUBJECT/SLUG#SEG | раздел: заголовок].\n"
+        "   SUBJECT, SLUG и SEG бери из заголовка фрагмента [N src:SUBJECT/SLUG#SEG]. Ссылки на несуществующие фрагменты запрещены.\n"
+        "2. Если по какому-то пункту в источниках нет информации, не заполняй его от себя. Перечисли такие пункты в самом конце.\n"
+        "3. Пиши конспектом: короткие тезисы, списки, ключевые термины **жирным** при первом упоминании. Не пиши сплошным текстом.\n"
+        "4. Структура: определение → основное содержание (классификация, строение или механизм) → формулы и уравнения → значение и примеры.\n"
+        "   Опускай разделы, для которых в источниках ничего нет.\n"
+        "5. Формулы пиши в LaTeX: инлайн $...$, блочные $$...$$. В нумерованных списках используй явные номера.\n"
+        "6. Таблицы — в markdown. Латинские названия организмов пиши правильно и курсивом.\n"
+        f"7. Иллюстрации. Тебе даны кандидаты в блоке «Иллюстрации» в формате [img:ID | подпись | тип | описание]. Вставляй маркер [img:ID] отдельной строкой в то место ответа, к которому картинка относится, не более {max_img} за ответ и ТОЛЬКО из предложенных. Не выдумывай ID, не описывай картинку своими словами, не вставляй ту же дважды. Если ни одна не подходит, не вставляй ничего.\n"
+        "8. Конец ответа ВСЕГДА: заголовок «## Не найдено в материалах» и список пунктов, которые обычно входят в такой ответ, но не найдены во фрагментах.\n"
+        "   Если всё найдено, напиши одной строкой: «Все ключевые пункты найдены в материалах».\n\n"
+        f"ГЛУБИНА: {depth_rule}\n"
+        f"ПОЖЕЛАНИЯ СТУДЕНТКИ (учитывай, если не противоречат правилам выше): {wishes_text}"
+    )
+    if weak_relevance:
+        system_prompt += (
+            "\n\nВНИМАНИЕ: фрагменты могут быть слабо связаны с вопросом. "
+            "Используй ТОЛЬКО те, которые ТОЧНО относятся к вопросу. "
+            "Если ни один фрагмент не подходит, ответь «В материалах по этому вопросу ничего не найдено» "
+            "и перечисли пункты в блоке «Не найдено в материалах»."
+        )
+
+    if text_chunks:
+        parts = []
+        for i, h in enumerate(text_chunks, 1):
+            src_slug = h.get("slug", "")
+            seg_idx  = h.get("segment", 0)
+            title    = h.get("title", "")
+            subject  = h.get("_subject", h.get("topic", ""))
+            parts.append(f"[{i} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
+        ctx = "Источники:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
+        if image_chunks:
+            img_lines = []
+            for h in image_chunks[:max_img * 2]:
+                meta    = h.get("meta") or {}
+                img_id  = meta.get("image_id", "")
+                caption = meta.get("caption", "")
+                kind    = meta.get("kind", "")
+                context = meta.get("context", "")
+                img_lines.append(f"[img:{img_id} | {caption} | {kind} | {context}]")
+            ctx += "Иллюстрации:\n" + "\n".join(img_lines) + "\n\n"
+        else:
+            ctx += "Иллюстрации: нет\n\n"
+        user_message = ctx + f"Вопрос экзаменационного билета: {question}"
+    else:
+        user_message = f"Вопрос экзаменационного билета: {question}"
+
+    context_triples = {
+        (h.get("_subject", h.get("topic", "")), h.get("slug", ""), h.get("segment", 0))
+        for h in text_chunks if h.get("slug")
+    }
+    image_candidate_ids = []
+    if image_chunks:
+        for h in image_chunks[:max_img * 2]:
+            meta   = h.get("meta") or {}
+            img_id = meta.get("image_id", "")
+            if img_id:
+                image_candidate_ids.append(str(img_id))
+
+    return system_prompt, user_message, context_triples, image_candidate_ids
+
+
+async def _generate_one_ticket(
+    slug: str, tid: int, depth: str, wishes: str, scope: str = "subject"
+) -> tuple[str, list[str]]:
+    """Generate answer for one ticket (non-streaming). Returns (answer_text, warnings).
+    Saves result to DB with status='generated' or 'error'."""
+    if not TIMEWEB_API_KEY and not FAKE_LLM:
+        db = get_db()
+        db.execute(
+            "UPDATE exam_tickets SET status='error', error_text=? WHERE id=? AND subject_slug=?",
+            ("TIMEWEB_API_KEY не задан", tid, slug)
+        )
+        db.commit(); db.close()
+        return "", ["TIMEWEB_API_KEY не задан"]
+
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)
+    ).fetchone()
+    db.close()
+    if not row:
+        return "", [f"Билет {tid} не найден"]
+
+    wishes   = (wishes or "")[:500]
+    question = row["question"]
+
+    import unicodedata
+    letter_count = sum(1 for c in question if c.isalpha())
+    if letter_count < 2:
+        db = get_db()
+        db.execute(
+            "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, depth=?, wishes=?, error_text='' WHERE id=?",
+            (_NOT_FOUND_ANSWER, datetime.now(timezone.utc).isoformat(), depth, wishes, tid)
+        )
+        db.commit(); db.close()
+        return _NOT_FOUND_ANSWER, []
+
+    k           = _DEPTH_K.get(depth, 10)
+    only_subject = (scope == "subject")
+    max_tokens  = _DEPTH_MAX_TOKENS.get(depth, 2500)
+    max_img     = _DEPTH_MAX_IMG.get(depth, 3)
+
+    rag_result   = await _rag_context(slug, question, k=k, only_subject=only_subject)
+    text_chunks  = rag_result["text"]
+    image_chunks = rag_result["images"]
+
+    if text_chunks:
+        scores = [h.get("score", 0) for h in text_chunks]
+        print(f"[rag scores queue] {slug}/{question[:40]}: max={max(scores):.3f}", flush=True)
+
+    top3_scores = sorted([h.get("score", 0) for h in text_chunks], reverse=True)[:3] if text_chunks else []
+    max_score   = max(top3_scores) if top3_scores else 0
+    low_relevance = not text_chunks or max_score < _RELEVANCE_SOFT_THRESHOLD
+    if low_relevance:
+        db = get_db()
+        db.execute(
+            "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, depth=?, wishes=?, error_text='' WHERE id=?",
+            (_NOT_FOUND_ANSWER, datetime.now(timezone.utc).isoformat(), depth, wishes, tid)
+        )
+        db.commit(); db.close()
+        return _NOT_FOUND_ANSWER, []
+
+    system_prompt, user_message, context_triples, image_candidate_ids = _build_ticket_context(
+        question, text_chunks, image_chunks, depth, wishes, max_img
+    )
+
+    full_answer: list[str] = []
+    error_text  = ""
+    try:
+        if FAKE_LLM:
+            fake = (
+                f"**Определение**: (тестовый ответ, depth={depth})\n\n"
+                "## Не найдено в материалах\n"
+                "Все ключевые пункты найдены в материалах."
+            )
+            full_answer.append(fake)
+            await asyncio.sleep(0.1)  # simulate minimal work
+        else:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_message},
+            ]
+            async with _httpx.AsyncClient(timeout=300) as client:
+                async with client.stream(
+                    "POST", TIMEWEB_URL,
+                    headers={"Authorization": f"Bearer {TIMEWEB_API_KEY}"},
+                    json={"model": CHAT_MODEL, "messages": messages,
+                          "stream": True, "max_tokens": max_tokens, "temperature": 0.3}
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:].strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            chunk  = json.loads(raw)
+                            choice = chunk["choices"][0]
+                            fr     = choice.get("finish_reason", "")
+                            if fr == "length":
+                                error_text = "Ответ не уложился в объём. Попробуйте другую глубину."
+                                break
+                            delta = choice.get("delta", {}).get("content", "")
+                            if delta:
+                                full_answer.append(delta)
+                        except Exception:
+                            pass
+    except Exception as e:
+        error_text = str(e)
+
+    answer_text = "".join(full_answer)
+    now = datetime.now(timezone.utc).isoformat()
+    if error_text or not answer_text:
+        db = get_db()
+        db.execute(
+            "UPDATE exam_tickets SET status='error', error_text=? WHERE id=?",
+            (error_text or "Пустой ответ от модели", tid)
+        )
+        db.commit(); db.close()
+        return "", [error_text or "Пустой ответ от модели"]
+
+    cleaned, val_warnings = _validate_answer(answer_text, context_triples, image_candidate_ids, max_img)
+    if val_warnings:
+        print(f"[validate_answer tid={tid}] warnings: {val_warnings}", flush=True)
+    db = get_db()
+    db.execute(
+        "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, depth=?, wishes=?, error_text='' WHERE id=?",
+        (cleaned, now, depth, wishes, tid)
+    )
+    db.commit(); db.close()
+    return cleaned, val_warnings
+
+
+async def _process_queue(
+    slug: str, ticket_ids: list[int], depth: str, wishes: str, skip_done: bool
+):
+    """Background queue processor. Runs one ticket at a time (guarded by _GEN_SEM)."""
+    async with _GEN_SEM:
+        q = _GEN_QUEUE.setdefault(slug, {"total": 0, "done": 0, "failed": 0,
+                                          "running_tid": 0, "cancelled": False})
+        q["cancelled"] = False
+        for tid in ticket_ids:
+            if q["cancelled"]:
+                print(f"[gen-queue] {slug} cancelled, stopping", flush=True)
+                break
+            # Optionally skip already generated
+            if skip_done:
+                db = get_db()
+                row = db.execute(
+                    "SELECT status, answer FROM exam_tickets WHERE id=? AND subject_slug=?",
+                    (tid, slug)
+                ).fetchone()
+                db.close()
+                if row and row["status"] == "generated" and row["answer"]:
+                    q["done"] += 1
+                    continue
+
+            # Mark as generating
+            db = get_db()
+            db.execute(
+                "UPDATE exam_tickets SET status='generating', error_text='' WHERE id=? AND subject_slug=?",
+                (tid, slug)
+            )
+            db.commit(); db.close()
+            q["running_tid"] = tid
+
+            try:
+                _, warnings = await _generate_one_ticket(slug, tid, depth, wishes)
+                # Check final status
+                db = get_db()
+                row = db.execute(
+                    "SELECT status FROM exam_tickets WHERE id=?", (tid,)
+                ).fetchone()
+                db.close()
+                if row and row["status"] == "generated":
+                    q["done"] += 1
+                else:
+                    q["failed"] += 1
+            except Exception as e:
+                print(f"[gen-queue] error tid={tid}: {e}", flush=True)
+                db = get_db()
+                db.execute(
+                    "UPDATE exam_tickets SET status='error', error_text=? WHERE id=?",
+                    (str(e), tid)
+                )
+                db.commit(); db.close()
+                q["failed"] += 1
+
+            q["running_tid"] = 0
+            if GENERATION_DELAY_SEC > 0:
+                await asyncio.sleep(GENERATION_DELAY_SEC)
+
+        print(f"[gen-queue] {slug} done: {q['done']}/{q['total']}, failed: {q['failed']}", flush=True)
+
+
+@app.post("/api/subjects/{slug}/tickets/generate")
+async def queue_tickets_generate(
+    slug: str, request: Request, user: dict = Depends(current_user)
+):
+    """Enqueue bulk ticket generation. Returns immediately."""
+    body = await request.json()
+    ticket_ids: list[int] = body.get("ticket_ids", [])
+    depth:      str       = body.get("depth", "standard")
+    wishes:     str       = (body.get("wishes", "") or "")[:500]
+    skip_done:  bool      = bool(body.get("skip_done", True))
+
+    if not ticket_ids:
+        raise HTTPException(400, "ticket_ids is empty")
+    if depth not in ("short", "standard", "full"):
+        depth = "standard"
+
+    # Filter to tickets that actually belong to this subject
+    db = get_db()
+    rows = db.execute(
+        f"SELECT id FROM exam_tickets WHERE subject_slug=? AND id IN ({','.join('?'*len(ticket_ids))})",
+        [slug] + ticket_ids
+    ).fetchall()
+    db.close()
+    valid_ids = [r["id"] for r in rows]
+    if not valid_ids:
+        raise HTTPException(404, "Ни один из указанных билетов не найден")
+
+    # Mark all as queued
+    db = get_db()
+    for tid in valid_ids:
+        db.execute(
+            "UPDATE exam_tickets SET status='queued', error_text='' WHERE id=? AND subject_slug=?",
+            (tid, slug)
+        )
+    db.commit(); db.close()
+
+    # Init queue state
+    q = _GEN_QUEUE.setdefault(slug, {"total": 0, "done": 0, "failed": 0,
+                                      "running_tid": 0, "cancelled": False})
+    q["total"]     = len(valid_ids)
+    q["done"]      = 0
+    q["failed"]    = 0
+    q["cancelled"] = False
+
+    asyncio.create_task(_process_queue(slug, valid_ids, depth, wishes, skip_done))
+    return {"ok": True, "queued": len(valid_ids)}
+
+
+@app.get("/api/subjects/{slug}/tickets/queue")
+async def get_queue_status(slug: str, user: dict = Depends(current_user)):
+    """Return current queue state for the subject."""
+    q = _GEN_QUEUE.get(slug, {"total": 0, "done": 0, "failed": 0,
+                               "running_tid": 0, "cancelled": False})
+    return dict(q)
+
+
+@app.post("/api/subjects/{slug}/tickets/queue/cancel")
+async def cancel_queue(slug: str, user: dict = Depends(current_user)):
+    """Signal the queue for this subject to stop after the current ticket."""
+    q = _GEN_QUEUE.setdefault(slug, {"total": 0, "done": 0, "failed": 0,
+                                      "running_tid": 0, "cancelled": False})
+    q["cancelled"] = True
+    # Also un-queue any remaining queued tickets so they show as pending
+    db = get_db()
+    db.execute(
+        "UPDATE exam_tickets SET status='pending' WHERE subject_slug=? AND status='queued'",
+        (slug,)
+    )
+    db.commit(); db.close()
+    return {"ok": True}
+
+
+@app.post("/api/subjects/{slug}/tickets/{tid}/retry")
+async def retry_ticket(
+    slug: str, tid: int,
+    request: Request,
+    user: dict = Depends(current_user)
+):
+    """Re-queue a single failed ticket."""
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Билет не найден")
+    body  = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    depth  = body.get("depth", row["depth"] or "standard")
+    wishes = (body.get("wishes", row["wishes"] or ""))[:500]
+
+    db = get_db()
+    db.execute(
+        "UPDATE exam_tickets SET status='queued', error_text='' WHERE id=?", (tid,)
+    )
+    db.commit(); db.close()
+
+    q = _GEN_QUEUE.setdefault(slug, {"total": 1, "done": 0, "failed": 0,
+                                      "running_tid": 0, "cancelled": False})
+    q["cancelled"] = False
+
+    asyncio.create_task(_process_queue(slug, [tid], depth, wishes, False))
+    return {"ok": True, "queued": 1}
+
+
 @app.get("/api/subjects/{slug}/tickets/{tid}/generate")
 async def generate_ticket_answer(
     slug: str, tid: int,
@@ -2135,8 +2541,6 @@ async def generate_ticket_answer(
     only_subject = (scope == "subject")
     max_tokens = _DEPTH_MAX_TOKENS.get(depth, 2500)
     max_img = _DEPTH_MAX_IMG.get(depth, 3)
-    depth_rule = _DEPTH_RULES.get(depth, _DEPTH_RULES["standard"])
-    wishes_text = wishes if wishes else "нет"
 
     rag_result = await _rag_context(slug, question, k=k, only_subject=only_subject)
     text_chunks = rag_result["text"]
@@ -2157,7 +2561,6 @@ async def generate_ticket_answer(
     top3_scores = sorted([h.get("score", 0) for h in text_chunks], reverse=True)[:3] if text_chunks else []
     max_score = max(top3_scores) if top3_scores else 0
     low_relevance = not text_chunks or max_score < _RELEVANCE_SOFT_THRESHOLD
-    weak_relevance = not low_relevance and max_score < _RELEVANCE_THRESHOLD
     if low_relevance:
         async def _low_relevance_gen():
             yield f"data: {json.dumps({'content': _NOT_FOUND_ANSWER})}\n\n"
@@ -2173,71 +2576,10 @@ async def generate_ticket_answer(
         return StreamingResponse(_low_relevance_gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    system_prompt = (
-        "Ты помогаешь студентке подготовить конспект ответа на экзаменационный билет.\n"
-        "Работаешь ТОЛЬКО по приведённым фрагментам источников. Свои знания не добавляй и ничего не выдумывай.\n\n"
-        "ПРАВИЛА\n"
-        "1. Каждый факт из источника сопровождай ссылкой в ТОЧНОМ формате [src:SUBJECT/SLUG#SEG | раздел: заголовок].\n"
-        "   SUBJECT, SLUG и SEG бери из заголовка фрагмента [N src:SUBJECT/SLUG#SEG]. Ссылки на несуществующие фрагменты запрещены.\n"
-        "2. Если по какому-то пункту в источниках нет информации, не заполняй его от себя. Перечисли такие пункты в самом конце.\n"
-        "3. Пиши конспектом: короткие тезисы, списки, ключевые термины **жирным** при первом упоминании. Не пиши сплошным текстом.\n"
-        "4. Структура: определение → основное содержание (классификация, строение или механизм) → формулы и уравнения → значение и примеры.\n"
-        "   Опускай разделы, для которых в источниках ничего нет.\n"
-        "5. Формулы пиши в LaTeX: инлайн $...$, блочные $$...$$. В нумерованных списках используй явные номера.\n"
-        "6. Таблицы — в markdown. Латинские названия организмов пиши правильно и курсивом.\n"
-        f"7. Иллюстрации. Тебе даны кандидаты в блоке «Иллюстрации» в формате [img:ID | подпись | тип | описание]. Вставляй маркер [img:ID] отдельной строкой в то место ответа, к которому картинка относится, не более {max_img} за ответ и ТОЛЬКО из предложенных. Не выдумывай ID, не описывай картинку своими словами, не вставляй ту же дважды. Если ни одна не подходит, не вставляй ничего.\n"
-        "8. Конец ответа ВСЕГДА: заголовок «## Не найдено в материалах» и список пунктов, которые обычно входят в такой ответ, но не найдены во фрагментах.\n"
-        "   Если всё найдено, напиши одной строкой: «Все ключевые пункты найдены в материалах».\n\n"
-        f"ГЛУБИНА: {depth_rule}\n"
-        f"ПОЖЕЛАНИЯ СТУДЕНТКИ (учитывай, если не противоречат правилам выше): {wishes_text}"
+    # Use shared builder for prompt + message + validator sets
+    system_prompt, user_message, context_triples, image_candidate_ids = _build_ticket_context(
+        question, text_chunks, image_chunks, depth, wishes, max_img
     )
-    if weak_relevance:
-        system_prompt += (
-            "\n\nВНИМАНИЕ: фрагменты могут быть слабо связаны с вопросом. "
-            "Используй ТОЛЬКО те, которые ТОЧНО относятся к вопросу. "
-            "Если ни один фрагмент не подходит, ответь «В материалах по этому вопросу ничего не найдено» "
-            "и перечисли пункты в блоке «Не найдено в материалах»."
-        )
-
-    # Build user message
-    if text_chunks:
-        parts = []
-        for i, h in enumerate(text_chunks, 1):
-            src_slug = h.get("slug", "")
-            seg_idx  = h.get("segment", 0)
-            title    = h.get("title", "")
-            subject  = h.get("_subject", h.get("topic", ""))
-            parts.append(f"[{i} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
-        ctx = "Источники:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
-        # Image candidates block (task 11 placeholder — no images filled yet)
-        if image_chunks:
-            img_lines = []
-            for h in image_chunks[:max_img * 2]:
-                meta = h.get("meta") or {}
-                img_id   = meta.get("image_id", "")
-                caption  = meta.get("caption", "")
-                kind     = meta.get("kind", "")
-                context  = meta.get("context", "")
-                img_lines.append(f"[img:{img_id} | {caption} | {kind} | {context}]")
-            ctx += "Иллюстрации:\n" + "\n".join(img_lines) + "\n\n"
-        else:
-            ctx += "Иллюстрации: нет\n\n"
-        user_message = ctx + f"Вопрос экзаменационного билета: {question}"
-    else:
-        user_message = f"Вопрос экзаменационного билета: {question}"
-
-    # Build sets for validator (Issue 2)
-    context_triples = {
-        (h.get("_subject", h.get("topic", "")), h.get("slug", ""), h.get("segment", 0))
-        for h in text_chunks if h.get("slug")
-    }
-    image_candidate_ids = []
-    if image_chunks:
-        for h in image_chunks[:max_img * 2]:
-            meta = h.get("meta") or {}
-            img_id = meta.get("image_id", "")
-            if img_id:
-                image_candidate_ids.append(str(img_id))
 
     async def generate():
         full_answer: list[str] = []
@@ -4715,6 +5057,7 @@ function _tkRenderList(slug) {
     var menuItems =
       '<button type="button" role="menuitem" onclick="closeMenus(null);tkEditInline(' + t.id + ')">Редактировать</button>' +
       (hasAnswer ? '<a role="menuitem" href="/api/subjects/' + slug + '/tickets/' + t.id + '/export" target="_blank" onclick="closeMenus(null)">Скачать HTML</a>' : '') +
+      (t.status === 'error' ? '<button type="button" role="menuitem" onclick="closeMenus(null);tkRetry(\'' + slug + '\',' + t.id + ')">Повторить генерацию</button>' : '') +
       '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delTicket(' + P + ')">Удалить</button>';
     return '<div class="glass ticket-item" id="tk-' + t.id + '" data-id="' + t.id + '">' +
       '<div class="ticket-head">' +
@@ -4729,6 +5072,7 @@ function _tkRenderList(slug) {
       '<div class="ticket-answer" style="display:none">' +
       _tkDepthPanel(slug, t.id, hasAnswer) +
       (hasAnswer ? '<div class="ticket-answer-content">' + md(t.answer) + '</div>' : '') +
+      (t.status === 'error' && t.error_text ? '<div style="color:var(--red);font-size:.8125rem;margin-top:6px;padding:6px 10px;background:rgba(255,59,48,.08);border-radius:6px">' + esc(t.error_text) + ' \u00b7 <a href="#" onclick="event.preventDefault();tkRetry(\'' + slug + '\',' + t.id + ')">Повторить</a></div>' : '') +
       '</div>' +
       '</div>';
   }).join('');
@@ -5109,11 +5453,16 @@ async function vTickets(main, slug) {
     // Show bulk panel inline below the button bar
     var existPanel = document.getElementById('bulk-gen-panel');
     if (existPanel) { existPanel.remove(); return; }
+
+    var _nSel = _TK.selected.size;
+    var _estMin = Math.ceil(_nSel * 40 / 60);  // ~40s per ticket
     var panel = document.createElement('div');
     panel.id = 'bulk-gen-panel';
     panel.className = 'bulk-gen-panel';
     panel.innerHTML =
-      '<div style="font-size:.9375rem;font-weight:600;margin-bottom:10px">Подготовить ответы (' + _TK.selected.size + ')</div>' +
+      '<div style="font-size:.9375rem;font-weight:600;margin-bottom:10px">Подготовить ответы (' + _nSel + ')' +
+        '<span id="bulk-est" style="font-weight:400;font-size:.8125rem;color:var(--muted);margin-left:10px">Это займёт около ' + _estMin + ' мин.</span>' +
+      '</div>' +
       '<div class="depth-seg" id="bulk-dseg">' +
         '<button type="button" data-d="short">Кратко</button>' +
         '<button type="button" class="active" data-d="standard">Стандарт</button>' +
@@ -5129,6 +5478,7 @@ async function vTickets(main, slug) {
       '</div>' +
       '<div style="margin-top:12px;display:flex;gap:10px">' +
         '<button type="button" class="btn btn-primary btn-sm" id="bulk-gen-go">Подготовить</button>' +
+        '<button type="button" class="btn btn-ghost btn-sm" id="bulk-gen-stop" style="display:none">Остановить</button>' +
         '<button type="button" class="btn btn-ghost btn-sm" id="bulk-gen-cancel">Отмена</button>' +
       '</div>' +
       '<div id="bulk-gen-progress" style="margin-top:10px;font-size:.875rem;color:var(--muted)"></div>';
@@ -5137,60 +5487,85 @@ async function vTickets(main, slug) {
     } else {
       document.getElementById('main').appendChild(panel);
     }
-    // Depth seg toggle
+
+    // Depth seg toggle + estimate update
     panel.querySelectorAll('#bulk-dseg button').forEach(function(b) {
       b.addEventListener('click', function() {
         panel.querySelectorAll('#bulk-dseg button').forEach(function(bb) { bb.classList.remove('active'); });
         b.classList.add('active');
+        var secsPerTicket = b.dataset.d === 'short' ? 20 : b.dataset.d === 'full' ? 70 : 40;
+        var estEl = document.getElementById('bulk-est');
+        if (estEl) estEl.textContent = 'Это займёт около ' + Math.ceil(_nSel * secsPerTicket / 60) + ' мин.';
       });
     });
+
     document.getElementById('bulk-gen-cancel').addEventListener('click', function() { panel.remove(); });
+
+    var _bulkPollTimer = null;
+
+    function _stopBulkPoll() {
+      if (_bulkPollTimer) { clearInterval(_bulkPollTimer); _bulkPollTimer = null; }
+    }
+
+    document.getElementById('bulk-gen-stop').addEventListener('click', async function() {
+      _stopBulkPoll();
+      await api('/api/subjects/' + slug + '/tickets/queue/cancel', {method:'POST'});
+      document.getElementById('bulk-gen-progress').textContent = 'Остановлено. Загрузка…';
+      await loadTickets(slug);
+      setTimeout(function() { panel.remove(); }, 1500);
+    });
+
     document.getElementById('bulk-gen-go').addEventListener('click', async function() {
       var depthBtn = panel.querySelector('#bulk-dseg button.active');
       var depth = depthBtn ? depthBtn.dataset.d : 'standard';
       var wishes = (document.getElementById('bulk-wishes').value || '').trim();
       var skipReady = document.getElementById('bulk-skip-ready').checked;
       var ids = Array.from(_TK.selected);
-      if (skipReady) {
-        ids = ids.filter(function(id) {
-          var t = _TK.all.find(function(x) { return x.id === id; });
-          return t && (!t.answer || !t.answer.length);
-        });
-      }
       if (!ids.length) { toast('Нет билетов для генерации', 'info'); panel.remove(); return; }
-      var progEl = document.getElementById('bulk-gen-progress');
+
       var goBtn = document.getElementById('bulk-gen-go');
+      var stopBtn = document.getElementById('bulk-gen-stop');
+      var cancelBtn = document.getElementById('bulk-gen-cancel');
+      var progEl = document.getElementById('bulk-gen-progress');
       goBtn.disabled = true;
-      var bulkOk = 0;
-      var bulkErr = 0;
-      var bulkErrIds = [];
-      for (var i = 0; i < ids.length; i++) {
-        var tid2 = ids[i];
-        progEl.textContent = (i + 1) + ' из ' + ids.length + '…';
-        await new Promise(function(resolve) {
-          var params = new URLSearchParams({depth: depth});
-          if (wishes) params.set('wishes', wishes);
-          var es2 = new EventSource('/api/subjects/' + slug + '/tickets/' + tid2 + '/generate?' + params.toString());
-          es2.onmessage = function(ev) {
-            if (ev.data === '[DONE]') { es2.close(); bulkOk++; resolve(); }
-            else {
-              try {
-                var d2 = JSON.parse(ev.data);
-                if (d2.error) { es2.close(); bulkErr++; bulkErrIds.push(tid2); resolve(); }
-              } catch(e3) {}
-            }
-          };
-          es2.onerror = function() { es2.close(); bulkErr++; bulkErrIds.push(tid2); resolve(); };
-        });
+      stopBtn.style.display = '';
+      cancelBtn.style.display = 'none';
+
+      var r = await api('/api/subjects/' + slug + '/tickets/generate', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ticket_ids: ids, depth: depth, wishes: wishes, skip_done: skipReady})
+      });
+      if (!r.ok) {
+        toast('Ошибка запуска очереди', 'error');
+        goBtn.disabled = false; stopBtn.style.display = 'none'; cancelBtn.style.display = '';
+        return;
       }
-      var doneMsg = 'Готово: ' + bulkOk + (bulkErr ? ', с ошибкой: ' + bulkErr : '');
-      progEl.textContent = doneMsg;
-      if (bulkErrIds.length) {
-        progEl.textContent += ' (билеты: ' + bulkErrIds.join(', ') + ')';
-      }
-      toast(doneMsg, bulkErr ? 'error' : 'success');
-      await loadTickets(slug);
-      setTimeout(function() { panel.remove(); }, 2000);
+      var rj = await r.json();
+      progEl.textContent = 'В очереди: ' + rj.queued + ' · можно закрыть страницу';
+
+      // Poll queue status every 3 seconds
+      _bulkPollTimer = setInterval(async function() {
+        try {
+          var qr = await api('/api/subjects/' + slug + '/tickets/queue');
+          if (!qr.ok) return;
+          var q = await qr.json();
+          var finished = q.total > 0 && (q.done + q.failed) >= q.total;
+          var cancelled = q.cancelled && q.running_tid === 0;
+          progEl.textContent = 'Готово ' + q.done + ' из ' + q.total +
+            (q.failed ? ' · ошибок: ' + q.failed : '') +
+            (q.running_tid ? ' · пишу #' + q.running_tid : '') +
+            ' · можно закрыть страницу';
+          // Reload ticket list to show latest statuses
+          await loadTickets(slug);
+          if (finished || cancelled) {
+            _stopBulkPoll();
+            var msg = 'Готово ' + q.done + ' из ' + q.total + (q.failed ? ', с ошибкой: ' + q.failed : '');
+            toast(msg, q.failed ? 'error' : 'success');
+            setTimeout(function() { panel.remove(); }, 2500);
+          }
+        } catch(e2) { /* ignore transient errors */ }
+      }, 3000);
     });
   });
 
@@ -5258,6 +5633,32 @@ function toggleAnswer(btn) {
   btn.setAttribute('aria-expanded', hidden ? 'true' : 'false');
   btn.classList.toggle('open', hidden);
   if (hidden) renderMath(answer);
+}
+
+async function tkRetry(slug, tid) {
+  var t = _TK.all.find(function(x) { return x.id === tid; });
+  var depth  = (t && t.depth)  || 'standard';
+  var wishes = (t && t.wishes) || '';
+  var r = await api('/api/subjects/' + slug + '/tickets/' + tid + '/retry', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({depth: depth, wishes: wishes})
+  });
+  if (r.ok) {
+    toast('Билет поставлен в очередь', 'info');
+    // Poll for completion
+    var _retryTimer = setInterval(async function() {
+      var qr = await api('/api/subjects/' + slug + '/tickets/queue');
+      if (!qr.ok) return;
+      var q = await qr.json();
+      if (q.running_tid === 0 && q.done + q.failed >= q.total) {
+        clearInterval(_retryTimer);
+        await loadTickets(slug);
+      }
+    }, 3000);
+  } else {
+    toast('Ошибка повтора', 'error');
+  }
 }
 
 // Per-ticket depth/wishes state
