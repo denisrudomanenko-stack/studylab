@@ -3995,6 +3995,32 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .msg-bubble th,.msg-bubble td,.ticket-answer th,.ticket-answer td{border:1px solid var(--border);padding:8px 12px;text-align:left}
 .msg-bubble th,.ticket-answer th{background:var(--glass2)}
 .preview-frame{width:100%;height:70vh;border:1px solid var(--border);border-radius:var(--r-s);background:#fff}
+/* ── Экран билета (две колонки) ─────────────────────────────────────── */
+.ticket-detail{display:grid;grid-template-columns:60fr 40fr;gap:20px;align-items:start;margin-top:16px}
+.ticket-left{min-width:0}
+.ticket-right{min-width:0;position:sticky;top:16px}
+.reader-pane{background:var(--glass);border:1px solid var(--border);border-radius:var(--r-m);
+  padding:16px 20px;margin-top:12px;max-height:60vh;overflow-y:auto}
+.reader-pane .reader-body{font-size:.9375rem;line-height:1.65;overflow-wrap:anywhere}
+.td-topbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.td-nav-counter{font-size:.875rem;color:var(--muted)}
+.td-nav-arrows{display:flex;gap:4px}
+.td-nav-arrows button{background:none;border:1px solid var(--border);border-radius:var(--r-s);
+  padding:4px 10px;font-size:1rem;cursor:pointer;color:var(--text);transition:background .12s}
+.td-nav-arrows button:hover:not(:disabled){background:var(--glass)}
+.td-nav-arrows button:disabled{opacity:.35;cursor:default}
+.td-illus-panel{margin-top:12px}
+.td-illus-thumb{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.td-illus-thumb img{width:64px;height:64px;object-fit:cover;border-radius:6px;cursor:zoom-in;
+  border:1px solid var(--border);transition:opacity .15s}
+.td-illus-thumb img:hover{opacity:.8}
+.td-panel-title{font-size:.8125rem;font-weight:600;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:6px}
+@media(max-width:1023px){
+  .ticket-detail{grid-template-columns:1fr}
+  .ticket-right{position:static}
+  .reader-pane{max-height:55vh}
+}
 
 /* ── Вкладки и поиск ────────────────────────────────────────────────── */
 .tabs{display:flex;gap:4px;margin-bottom:24px;border-bottom:1px solid var(--border)}
@@ -4355,6 +4381,11 @@ function route() {
   main.innerHTML = '';
   if (!S.user && view !== 'login') { location.hash = '#/login'; return; }
   if (S.user && view === 'login') { location.hash = '#/dashboard'; return; }
+  // Special 3-part routes: #/ticket/{slug}/{id}
+  if (view === 'ticket' && parts.length >= 3) {
+    vTicketDetail(main, parts[1], parseInt(parts[2], 10));
+    return;
+  }
   const views = { login: vLogin, dashboard: vDashboard, subject: vSubject,
                   reader: vReader, chat: vChat, tickets: vTickets, new: vNewSubject,
                   review: vReview };
@@ -5856,6 +5887,7 @@ function _tkRenderList(slug) {
     var pos = t.position || (idx + 1);
     var P = '\'' + slug + '\',' + t.id;
     var menuItems =
+      '<a role="menuitem" href="#/ticket/' + slug + '/' + t.id + '" onclick="closeMenus(null)">Открыть</a>' +
       '<button type="button" role="menuitem" onclick="closeMenus(null);tkEditInline(' + t.id + ')">Редактировать</button>' +
       (hasAnswer ? '<a role="menuitem" href="/api/subjects/' + slug + '/tickets/' + t.id + '/export" target="_blank" onclick="closeMenus(null)">Скачать HTML</a>' : '') +
       (t.status === 'error' ? '<button type="button" role="menuitem" onclick="closeMenus(null);tkRetry(\'' + slug + '\',' + t.id + ')">Повторить генерацию</button>' : '') +
@@ -6755,6 +6787,412 @@ async function delTicket(slug, tid) {
   const r = await api('/api/subjects/' + slug + '/tickets/' + tid, {method:'DELETE'});
   if (r.ok) { toast('Билет удалён', 'success'); loadTickets(slug); }
   else toast('Ошибка удаления', 'error');
+}
+
+// ── Ticket Detail (two-column screen) ─────────────────────────────────
+async function vTicketDetail(main, slug, ticketId) {
+  // Load all tickets once for navigation
+  var allTickets = [];
+  var subject = {title: slug};
+  try {
+    var sr = await api('/api/subjects/' + slug);
+    if (sr.ok) subject = await sr.json();
+  } catch(e) {}
+  S.titles[slug] = subject.title || slug;
+  try {
+    var tr = await api('/api/subjects/' + slug + '/tickets');
+    if (tr.ok) allTickets = await tr.json();
+  } catch(e) {}
+
+  var idx = allTickets.findIndex(function(t) { return t.id === ticketId; });
+  if (idx < 0 && allTickets.length) idx = 0;
+  var ticket = allTickets[idx] || null;
+
+  // Depth/wishes state for this ticket
+  var depth = (ticket && ticket.depth) || _tkDepth[ticketId] || 'standard';
+  var wishes = (ticket && ticket.wishes) || _tkWishes[ticketId] || '';
+  _tkDepth[ticketId] = depth;
+  _tkWishes[ticketId] = wishes;
+
+  function navigate(newIdx) {
+    if (newIdx < 0 || newIdx >= allTickets.length) return;
+    var t = allTickets[newIdx];
+    location.hash = '#/ticket/' + slug + '/' + t.id;
+  }
+
+  function _renderTopBar() {
+    var total = allTickets.length;
+    var pos = idx >= 0 ? (idx + 1) : 1;
+    return '<div class="td-topbar">' +
+      '<a href="#/tickets/' + slug + '" class="btn btn-ghost btn-sm">← Билеты</a>' +
+      '<span class="td-nav-counter">' + pos + ' из ' + total + '</span>' +
+      '<div class="td-nav-arrows">' +
+        '<button type="button" id="td-prev" title="Предыдущий [←]"' + (idx <= 0 ? ' disabled' : '') + '>←</button>' +
+        '<button type="button" id="td-next" title="Следующий [→]"' + (idx >= allTickets.length - 1 ? ' disabled' : '') + '>→</button>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function _renderDepthSeg(tid, curDepth) {
+    return '<div class="depth-seg" id="td-dseg-' + tid + '">' +
+      [['short','Кратко'],['standard','Стандарт'],['full','Подробно']].map(function(d) {
+        return '<button type="button"' + (curDepth === d[0] ? ' class="active"' : '') +
+          ' data-d="' + d[0] + '">' + d[1] + '</button>';
+      }).join('') +
+    '</div>';
+  }
+
+  function render() {
+    if (!ticket) {
+      main.innerHTML = '<div class="page"><div class="empty">' +
+        '<b>Билет не найден</b>' +
+        '<a href="#/tickets/' + slug + '" class="btn btn-ghost btn-sm" style="margin-top:12px">← Билеты</a>' +
+        '</div></div>';
+      return;
+    }
+    var tid = ticket.id;
+    var hasAnswer = !!(ticket.answer && ticket.answer.trim());
+    var curDepth = _tkDepth[tid] || 'standard';
+
+    main.innerHTML =
+      '<div class="page">' +
+      _renderTopBar() +
+      '<div class="ticket-detail">' +
+        // ── Left column ──
+        '<div class="ticket-left">' +
+          '<h2 style="font-size:1.0625rem;font-weight:600;line-height:1.45;margin-bottom:16px">' + esc(ticket.question) + '</h2>' +
+          '<div class="glass" style="padding:16px 20px;border-radius:var(--r-m)">' +
+            '<div id="td-answer-content" class="ticket-answer" style="padding:0;border:none;white-space:normal">' +
+              (hasAnswer ? md(ticket.answer) : '<span class="text-muted text-sm">Ответ ещё не составлен. Нажмите «Составить ответ».</span>') +
+            '</div>' +
+          '</div>' +
+          // depth + wishes + actions
+          '<div style="margin-top:14px">' +
+            _renderDepthSeg(tid, curDepth) +
+            '<button class="wishes-toggle" id="td-wt-' + tid + '" type="button" style="margin-left:12px">+ Пожелания</button>' +
+            '<div class="wishes-field" id="td-wf-' + tid + '">' +
+              '<textarea rows="2" id="td-wish-' + tid + '" style="width:100%;margin-top:6px;font-size:.875rem" placeholder="Например: с классификацией и схемой">' +
+              esc(wishes) + '</textarea>' +
+            '</div>' +
+            '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">' +
+              '<button type="button" class="btn btn-primary btn-sm" id="td-gen-btn">' +
+                (hasAnswer ? 'Составить заново' : 'Составить ответ') +
+              '</button>' +
+              (hasAnswer ? '<button type="button" class="btn btn-ghost btn-sm" id="td-pin-btn">Зафиксировать</button>' : '') +
+            '</div>' +
+            // "Дополнить" field (only when answer exists)
+            (hasAnswer ?
+              '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+                '<input type="text" id="td-refine-input" placeholder="Что добавить?" style="flex:1 1 200px;min-width:0;font-size:.875rem">' +
+                '<button type="button" class="btn btn-ghost btn-sm" id="td-refine-btn">Дополнить</button>' +
+              '</div>' : '') +
+          '</div>' +
+          // Progress buttons
+          '<div style="margin-top:16px;display:flex;gap:8px">' +
+            '<button type="button" class="btn btn-ghost btn-sm" id="td-known-btn" style="color:var(--green);border-color:var(--green)">Знаю</button>' +
+            '<button type="button" class="btn btn-danger btn-sm" id="td-again-btn">Ещё раз</button>' +
+          '</div>' +
+        '</div>' +
+        // ── Right column ──
+        '<div class="ticket-right">' +
+          '<div id="td-cov-panel" class="coverage-panel" style="margin-bottom:0">' +
+            '<div style="display:flex;align-items:center;gap:8px;color:var(--muted);font-size:.875rem"><div class="spinner"></div> Поиск источников…</div>' +
+          '</div>' +
+          '<div id="td-illus-panel" class="td-illus-panel" style="display:none">' +
+            '<div class="td-panel-title">Иллюстрации</div>' +
+            '<div class="td-illus-thumb" id="td-illus-thumb"></div>' +
+          '</div>' +
+          '<div id="td-reader-pane" class="reader-pane" style="display:none">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+              '<span class="td-panel-title" style="margin-bottom:0">Источник</span>' +
+              '<span id="td-reader-link"></span>' +
+              '<button type="button" id="td-reader-close" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:1rem;padding:0 4px">✕</button>' +
+            '</div>' +
+            '<div id="td-reader-body"></div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+      '</div>';
+
+    // Render math in answer
+    var ansEl = document.getElementById('td-answer-content');
+    if (ansEl) renderMath(ansEl);
+
+    // Preload img cache if answer has [img:ID]
+    if (hasAnswer) {
+      var imgIds = []; var re = /\[img:(\d+)\]/gi; var m;
+      while ((m = re.exec(ticket.answer)) !== null) { if (imgIds.indexOf(m[1]) < 0) imgIds.push(m[1]); }
+      if (imgIds.length) _preloadImgCache(imgIds, slug).then(function() {
+        var ae = document.getElementById('td-answer-content');
+        if (ae) { ae.innerHTML = md(ticket.answer); renderMath(ae); }
+        _renderIllustrations(ticket.answer);
+      });
+      else _renderIllustrations(ticket.answer);
+    }
+
+    // Depth seg toggle
+    var dseg = document.getElementById('td-dseg-' + tid);
+    if (dseg) {
+      dseg.querySelectorAll('button').forEach(function(b) {
+        b.addEventListener('click', function() {
+          dseg.querySelectorAll('button').forEach(function(bb) { bb.classList.remove('active'); });
+          b.classList.add('active');
+          _tkDepth[tid] = b.dataset.d;
+          depth = b.dataset.d;
+        });
+      });
+    }
+
+    // Wishes toggle
+    var wt = document.getElementById('td-wt-' + tid);
+    var wf = document.getElementById('td-wf-' + tid);
+    if (wt && wf) {
+      wt.addEventListener('click', function() {
+        wf.classList.toggle('open');
+        wt.textContent = wf.classList.contains('open') ? '− Пожелания' : '+ Пожелания';
+      });
+      var wi = document.getElementById('td-wish-' + tid);
+      if (wi && wishes) { wf.classList.add('open'); wt.textContent = '− Пожелания'; }
+    }
+
+    // Generate button
+    var genBtn = document.getElementById('td-gen-btn');
+    if (genBtn) genBtn.addEventListener('click', function() {
+      var d = document.querySelector('#td-dseg-' + tid + ' button.active');
+      var w = document.getElementById('td-wish-' + tid);
+      _tdGenerate(slug, tid, d ? d.dataset.d : 'standard', w ? w.value : '');
+    });
+
+    // Дополнить (refine) button
+    var refineBtn = document.getElementById('td-refine-btn');
+    if (refineBtn) refineBtn.addEventListener('click', function() {
+      var ri = document.getElementById('td-refine-input');
+      if (!ri || !ri.value.trim()) return;
+      var d = document.querySelector('#td-dseg-' + tid + ' button.active');
+      var wi2 = document.getElementById('td-wish-' + tid);
+      var existWishes = wi2 ? wi2.value.trim() : '';
+      var refineWishes = ri.value.trim();
+      var combinedWishes = existWishes ? existWishes + '; ' + refineWishes : refineWishes;
+      _tdGenerate(slug, tid, d ? d.dataset.d : 'standard', combinedWishes);
+    });
+
+    // Pin button
+    var pinBtn = document.getElementById('td-pin-btn');
+    if (pinBtn) pinBtn.addEventListener('click', async function() {
+      var r2 = await api('/api/subjects/' + slug + '/tickets/' + tid + '/pin', {method:'POST'});
+      if (r2.ok) toast('Ответ зафиксирован', 'success');
+      else toast('Ошибка', 'error');
+    });
+
+    // Progress buttons
+    var knownBtn2 = document.getElementById('td-known-btn');
+    var againBtn2 = document.getElementById('td-again-btn');
+    if (knownBtn2) knownBtn2.addEventListener('click', async function() {
+      await api('/api/subjects/' + slug + '/tickets/' + tid + '/progress', {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({status:'known'})
+      });
+      toast('Отмечено: Знаю', 'success');
+    });
+    if (againBtn2) againBtn2.addEventListener('click', async function() {
+      await api('/api/subjects/' + slug + '/tickets/' + tid + '/progress', {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({status:'again'})
+      });
+      toast('Отмечено: Ещё раз', 'info');
+    });
+
+    // Navigation arrows
+    var prevBtn = document.getElementById('td-prev');
+    var nextBtn = document.getElementById('td-next');
+    if (prevBtn) prevBtn.addEventListener('click', function() { navigate(idx - 1); });
+    if (nextBtn) nextBtn.addEventListener('click', function() { navigate(idx + 1); });
+
+    // Chip click → load segment in right column
+    var leftCol = main.querySelector('.ticket-left');
+    if (leftCol) {
+      leftCol.addEventListener('click', function(e) {
+        var chip = e.target.closest('a.chip');
+        if (!chip) return;
+        e.preventDefault();
+        var href = chip.getAttribute('href') || '';
+        // Parse #/reader/{slug}?src={srcSlug}&seg={segId}
+        var m2 = href.match(/\/reader\/([^?#]+)\?src=([^&]+)&seg=(\d+)/);
+        if (!m2) return;
+        var rSlug = m2[1], rSrc = decodeURIComponent(m2[2]), rSeg = parseInt(m2[3], 10);
+        var fragEl = chip.getAttribute('title') || '';
+        _tdLoadReaderPane(slug || rSlug, rSrc, rSeg, chip.getAttribute('href'), fragEl, '');
+        // highlight the clicked chip
+        leftCol.querySelectorAll('a.chip').forEach(function(c) { c.style.background = ''; });
+        chip.style.background = 'rgba(99,102,241,.25)';
+      });
+    }
+
+    // Load coverage
+    _tdLoadCoverage(slug, tid);
+
+    // Keyboard nav
+    function _tdKeyHandler(e) {
+      if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+      if (e.key === 'ArrowLeft' && idx > 0) navigate(idx - 1);
+      if (e.key === 'ArrowRight' && idx < allTickets.length - 1) navigate(idx + 1);
+    }
+    document.addEventListener('keydown', _tdKeyHandler);
+    window.addEventListener('hashchange', function _tdCleanup() {
+      document.removeEventListener('keydown', _tdKeyHandler);
+      window.removeEventListener('hashchange', _tdCleanup);
+    });
+  }
+
+  function _renderIllustrations(answer) {
+    if (!answer) return;
+    var imgIds = []; var re = /\[img:(\d+)\]/gi; var m;
+    while ((m = re.exec(answer)) !== null) { if (imgIds.indexOf(m[1]) < 0) imgIds.push(m[1]); }
+    var panel = document.getElementById('td-illus-panel');
+    var thumb = document.getElementById('td-illus-thumb');
+    if (!panel || !thumb || !imgIds.length) return;
+    panel.style.display = '';
+    thumb.innerHTML = imgIds.map(function(id) {
+      return '<img src="/api/images/' + id + '?w=128" data-imgid="' + id + '" alt="Рис." ' +
+        'onclick="_showImgModal(' + id + ')" title="Открыть">';
+    }).join('');
+  }
+
+  async function _tdLoadCoverage(slug, tid) {
+    if (_tkCoverage[tid]) { _tdRenderCoverage(slug, tid); return; }
+    try {
+      var r = await api('/api/subjects/' + slug + '/tickets/' + tid + '/coverage');
+      if (r.ok) _tkCoverage[tid] = await r.json();
+      else _tkCoverage[tid] = {sources:[], total_hits:0, image_count:0};
+    } catch(e) {
+      _tkCoverage[tid] = {sources:[], total_hits:0, image_count:0};
+    }
+    _tdRenderCoverage(slug, tid);
+  }
+
+  function _tdRenderCoverage(slug, tid) {
+    var el = document.getElementById('td-cov-panel');
+    if (!el) return;
+    var cov = _tkCoverage[tid] || {sources:[], total_hits:0, image_count:0};
+    var sources = cov.sources || [];
+    if (!sources.length) {
+      el.innerHTML = '<div class="td-panel-title">Источники ответа</div>' +
+        '<div class="coverage-empty">По этому вопросу в материалах ничего не нашла.</div>';
+      return;
+    }
+    var html = '<div class="td-panel-title">Источники ответа</div>';
+    sources.forEach(function(s) {
+      var badgeCls = s.strength === 'strong' ? 'strong' : 'weak';
+      var badgeText = s.strength === 'strong' ? 'сильно' : 'слабо';
+      html += '<div class="coverage-source-row">' +
+        '<span class="coverage-source-name" title="' + esc(s.title) + '">' + esc(s.title) + '</span>' +
+        '<span class="coverage-badge ' + badgeCls + '">' + badgeText + '</span>' +
+      '</div>';
+    });
+    el.innerHTML = html;
+  }
+
+  async function _tdLoadReaderPane(subjectSlug, srcSlug, segId, fullHref, fragmentTitle, highlight) {
+    var pane = document.getElementById('td-reader-pane');
+    var body = document.getElementById('td-reader-body');
+    var linkEl = document.getElementById('td-reader-link');
+    if (!pane || !body) return;
+    pane.style.display = '';
+    body.innerHTML = '<div style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:.875rem"><div class="spinner"></div> Загрузка…</div>';
+    if (linkEl && fullHref) {
+      linkEl.innerHTML = '<a href="' + fullHref + '" class="btn btn-ghost btn-sm" style="font-size:.75rem">Открыть в читалке</a>';
+    }
+    var closeBtn = document.getElementById('td-reader-close');
+    if (closeBtn) closeBtn.addEventListener('click', function() { pane.style.display = 'none'; });
+    try {
+      var r = await api('/api/subjects/' + subjectSlug + '/segments/' + srcSlug + '/' + segId);
+      if (!r.ok) { body.innerHTML = '<p style="color:var(--muted);font-size:.875rem">Сегмент не найден</p>'; return; }
+      var seg = await r.json();
+      body.innerHTML =
+        '<div style="font-size:.8125rem;color:var(--muted);margin-bottom:8px">' +
+          esc(seg.source_title || srcSlug) + ' · §' + segId + ' · ' + seg.words + ' слов' +
+        '</div>' +
+        '<div class="reader-body">' + renderSegment(seg.text, subjectSlug, srcSlug) + '</div>';
+      renderMath(body);
+      // Highlight fragment
+      if (highlight) _highlightInReader(body, highlight);
+      // Wire image clicks
+      body.querySelectorAll('.reader-body img').forEach(function(img) {
+        img.style.cursor = 'zoom-in';
+        img.addEventListener('click', function() { _showImgModal(img.src, img.alt); });
+      });
+    } catch(e) {
+      body.innerHTML = '<p style="color:var(--red);font-size:.875rem">Ошибка загрузки</p>';
+    }
+    // Scroll pane into view on mobile
+    if (window.innerWidth < 1024) {
+      setTimeout(function() { pane.scrollIntoView({behavior:'smooth', block:'start'}); }, 100);
+    }
+  }
+
+  async function _tdGenerate(slug, tid, genDepth, genWishes) {
+    _tkDepth[tid] = genDepth;
+    _tkWishes[tid] = genWishes;
+    var ansEl = document.getElementById('td-answer-content');
+    if (!ansEl) return;
+    ansEl.innerHTML = '<div class="spinner"></div> Генерация ответа…';
+    var full = '';
+    var params = new URLSearchParams({depth: genDepth});
+    if (genWishes) params.set('wishes', genWishes);
+    var es = new EventSource('/api/subjects/' + slug + '/tickets/' + tid + '/generate?' + params.toString());
+    es.onmessage = function(ev) {
+      if (ev.data === '[DONE]') {
+        es.close();
+        // Preload images then final render
+        var imgIds2 = []; var re2 = /\[img:(\d+)\]/gi; var m2;
+        while ((m2 = re2.exec(full)) !== null) { if (imgIds2.indexOf(m2[1]) < 0) imgIds2.push(m2[1]); }
+        function _finish() {
+          var ae = document.getElementById('td-answer-content');
+          if (ae) { ae.innerHTML = md(full); renderMath(ae); }
+          // Update ticket locally
+          ticket.answer = full; ticket.depth = genDepth; ticket.wishes = genWishes;
+          // Update gen button label
+          var gb = document.getElementById('td-gen-btn');
+          if (gb) gb.textContent = 'Составить заново';
+          // Show illustrations
+          _renderIllustrations(full);
+          // Add pin/refine buttons if missing
+          var pinB = document.getElementById('td-pin-btn');
+          if (!pinB) {
+            var gbContainer = gb && gb.parentNode;
+            if (gbContainer) {
+              var newPin = document.createElement('button');
+              newPin.type = 'button'; newPin.className = 'btn btn-ghost btn-sm'; newPin.id = 'td-pin-btn';
+              newPin.textContent = 'Зафиксировать';
+              newPin.addEventListener('click', async function() {
+                var r2 = await api('/api/subjects/' + slug + '/tickets/' + tid + '/pin', {method:'POST'});
+                if (r2.ok) toast('Ответ зафиксирован', 'success'); else toast('Ошибка', 'error');
+              });
+              gbContainer.appendChild(newPin);
+            }
+          }
+        }
+        if (imgIds2.length) _preloadImgCache(imgIds2, slug).then(_finish); else _finish();
+        return;
+      }
+      try {
+        var d = JSON.parse(ev.data);
+        if (d.error) { if (ansEl) ansEl.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; es.close(); return; }
+        if (d.content) {
+          full += d.content;
+          var ae2 = document.getElementById('td-answer-content');
+          if (ae2) ae2.innerHTML = md(full) + '<span class="spinner" style="width:10px;height:10px;margin-left:4px"></span>';
+        }
+      } catch(e2) {}
+    };
+    es.onerror = function() {
+      es.close();
+      var ae3 = document.getElementById('td-answer-content');
+      if (ae3 && !full) ae3.innerHTML = '<span style="color:var(--red)">Ошибка генерации</span>';
+    };
+  }
+
+  render();
 }
 
 // ── New Subject Wizard ─────────────────────────────────────────────────
