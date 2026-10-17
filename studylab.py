@@ -163,6 +163,22 @@ def init_db():
             hidden INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS ticket_progress (
+            user_id   INTEGER NOT NULL,
+            ticket_id INTEGER NOT NULL,
+            status    TEXT    NOT NULL DEFAULT 'new',
+            updated_at TEXT   NOT NULL,
+            PRIMARY KEY(user_id, ticket_id)
+        );
+        CREATE TABLE IF NOT EXISTS ticket_answers (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id  INTEGER NOT NULL,
+            answer     TEXT    NOT NULL,
+            depth      TEXT    DEFAULT 'standard',
+            wishes     TEXT    DEFAULT '',
+            created_at TEXT    NOT NULL,
+            pinned     INTEGER DEFAULT 0
+        );
     """)
     # Safe migrations: add columns that may not exist in older DBs
     for migration in [
@@ -1117,6 +1133,7 @@ async def update_subject(slug: str,
 
 @app.get("/api/subjects")
 async def list_subjects(user: dict = Depends(current_user)):
+    uid = int(user["sub"])
     db = get_db()
     subjects = [dict(r) for r in db.execute(
         "SELECT slug,title,description,year,semester,exam_date,created_at FROM subjects ORDER BY created_at DESC"
@@ -1130,10 +1147,24 @@ async def list_subjects(user: dict = Depends(current_user)):
         s["total_chunks"] = sum(r["chunk_count"] for r in rows if r["status"] == "active")
         # ticket stats
         ticket_rows = db.execute(
-            "SELECT status FROM exam_tickets WHERE subject_slug=?", (s["slug"],)
+            "SELECT id, status FROM exam_tickets WHERE subject_slug=?", (s["slug"],)
         ).fetchall()
         s["ticket_count"] = len(ticket_rows)
         s["answered_count"] = sum(1 for t in ticket_rows if t["status"] == "generated")
+        # progress counts per user
+        if ticket_rows:
+            tids = [t["id"] for t in ticket_rows]
+            ph = ",".join("?" * len(tids))
+            prog_rows = db.execute(
+                f"SELECT ticket_id, status FROM ticket_progress WHERE user_id=? AND ticket_id IN ({ph})",
+                [uid] + tids
+            ).fetchall()
+            prog_map = {r["ticket_id"]: r["status"] for r in prog_rows}
+            s["known_count"] = sum(1 for tid in tids if prog_map.get(tid) == "known")
+            s["again_count"] = sum(1 for tid in tids if prog_map.get(tid) == "again")
+        else:
+            s["known_count"] = 0
+            s["again_count"] = 0
         # normalize nulls
         s["semester"] = s.get("semester") or 0
         s["exam_date"] = s.get("exam_date") or ""
@@ -1739,12 +1770,24 @@ async def upload_chat_image(slug: str, file: UploadFile = File(),
 
 @app.get("/api/subjects/{slug}/tickets")
 async def list_tickets(slug: str, user: dict = Depends(current_user)):
+    uid = int(user["sub"])
     db = get_db()
     rows = db.execute(
         "SELECT * FROM exam_tickets WHERE subject_slug=? ORDER BY COALESCE(position,0), id", (slug,)
     ).fetchall()
+    tickets = [dict(r) for r in rows]
+    if tickets:
+        tids = [t["id"] for t in tickets]
+        ph = ",".join("?" * len(tids))
+        prog_rows = db.execute(
+            f"SELECT ticket_id, status FROM ticket_progress WHERE user_id=? AND ticket_id IN ({ph})",
+            [uid] + tids
+        ).fetchall()
+        prog_map = {r["ticket_id"]: r["status"] for r in prog_rows}
+        for t in tickets:
+            t["progress"] = prog_map.get(t["id"], "new")
     db.close()
-    return [dict(r) for r in rows]
+    return tickets
 
 
 @app.post("/api/subjects/{slug}/tickets")
@@ -2406,6 +2449,21 @@ async def _generate_one_ticket(
     if val_warnings:
         print(f"[validate_answer tid={tid}] warnings: {val_warnings}", flush=True)
     db = get_db()
+    # Auto-save previous answer to ticket_answers if one exists
+    prev = db.execute("SELECT answer, depth, wishes FROM exam_tickets WHERE id=?", (tid,)).fetchone()
+    if prev and prev["answer"]:
+        db.execute(
+            "INSERT INTO ticket_answers (ticket_id, answer, depth, wishes, created_at, pinned) VALUES (?,?,?,?,?,0)",
+            (tid, prev["answer"], prev["depth"] or "standard", prev["wishes"] or "", now)
+        )
+        # Keep last 5 unpinned versions
+        old_ids = db.execute(
+            "SELECT id FROM ticket_answers WHERE ticket_id=? AND pinned=0 ORDER BY id DESC LIMIT -1 OFFSET 5",
+            (tid,)
+        ).fetchall()
+        if old_ids:
+            ph2 = ",".join("?" * len(old_ids))
+            db.execute(f"DELETE FROM ticket_answers WHERE id IN ({ph2})", [r["id"] for r in old_ids])
     db.execute(
         "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, depth=?, wishes=?, error_text='' WHERE id=?",
         (cleaned, now, depth, wishes, tid)
@@ -2803,12 +2861,26 @@ async def generate_ticket_answer(
                 )
                 if val_warnings:
                     print(f"[validate_answer tid={tid}] warnings: {val_warnings}", flush=True)
+                _save_now = datetime.now(timezone.utc).isoformat()
                 save_db = get_db()
+                # Auto-save previous answer to ticket_answers if one exists
+                prev_row = save_db.execute("SELECT answer, depth, wishes FROM exam_tickets WHERE id=?", (tid,)).fetchone()
+                if prev_row and prev_row["answer"]:
+                    save_db.execute(
+                        "INSERT INTO ticket_answers (ticket_id, answer, depth, wishes, created_at, pinned) VALUES (?,?,?,?,?,0)",
+                        (tid, prev_row["answer"], prev_row["depth"] or "standard", prev_row["wishes"] or "", _save_now)
+                    )
+                    old_ver_ids = save_db.execute(
+                        "SELECT id FROM ticket_answers WHERE ticket_id=? AND pinned=0 ORDER BY id DESC LIMIT -1 OFFSET 5",
+                        (tid,)
+                    ).fetchall()
+                    if old_ver_ids:
+                        _ph = ",".join("?" * len(old_ver_ids))
+                        save_db.execute(f"DELETE FROM ticket_answers WHERE id IN ({_ph})", [r["id"] for r in old_ver_ids])
                 save_db.execute(
                     "UPDATE exam_tickets SET answer=?, status='generated', generated_at=?, "
                     "depth=?, wishes=? WHERE id=?",
-                    (cleaned, datetime.now(timezone.utc).isoformat(),
-                     depth, wishes, tid)
+                    (cleaned, _save_now, depth, wishes, tid)
                 )
                 save_db.commit()
                 save_db.close()
@@ -3183,6 +3255,146 @@ async def export_single_ticket(slug: str, tid: int, inline: int = 0, user: dict 
     )
     headers = {} if inline else {"Content-Disposition": f'attachment; filename="ticket_{tid}.html"'}
     return HTMLResponse(html, headers=headers)
+
+
+# ─── Ticket progress & answer versions ───────────────────────────────
+
+_VALID_PROGRESS_STATUSES = {"new", "known", "again", "check"}
+
+
+@app.put("/api/subjects/{slug}/tickets/{tid}/progress")
+async def set_ticket_progress(slug: str, tid: int, request: Request,
+                               user: dict = Depends(current_user)):
+    uid = int(user["sub"])
+    body = await request.json()
+    status = body.get("status", "new")
+    if status not in _VALID_PROGRESS_STATUSES:
+        raise HTTPException(400, f"Недопустимый статус: {status}")
+    db = get_db()
+    row = db.execute("SELECT id FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Билет не найден")
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "INSERT OR REPLACE INTO ticket_progress (user_id, ticket_id, status, updated_at) VALUES (?,?,?,?)",
+        (uid, tid, status, now)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True, "status": status}
+
+
+@app.post("/api/subjects/{slug}/tickets/{tid}/pin")
+async def pin_ticket_answer(slug: str, tid: int, user: dict = Depends(current_user)):
+    """Save current answer as pinned version in ticket_answers."""
+    db = get_db()
+    row = db.execute("SELECT answer, depth, wishes FROM exam_tickets WHERE id=? AND subject_slug=?",
+                     (tid, slug)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Билет не найден")
+    if not row["answer"]:
+        db.close()
+        raise HTTPException(400, "Ответ ещё не сгенерирован")
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "INSERT INTO ticket_answers (ticket_id, answer, depth, wishes, created_at, pinned) VALUES (?,?,?,?,?,1)",
+        (tid, row["answer"], row["depth"] or "standard", row["wishes"] or "", now)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/api/subjects/{slug}/tickets/{tid}/versions")
+async def list_ticket_versions(slug: str, tid: int, user: dict = Depends(current_user)):
+    """List saved answer versions for a ticket."""
+    db = get_db()
+    row = db.execute("SELECT id FROM exam_tickets WHERE id=? AND subject_slug=?", (tid, slug)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Билет не найден")
+    versions = db.execute(
+        "SELECT id, ticket_id, depth, wishes, created_at, pinned, substr(answer,1,120) AS preview "
+        "FROM ticket_answers WHERE ticket_id=? ORDER BY id DESC",
+        (tid,)
+    ).fetchall()
+    db.close()
+    return [dict(v) for v in versions]
+
+
+@app.put("/api/subjects/{slug}/tickets/{tid}/restore/{version_id}")
+async def restore_ticket_version(slug: str, tid: int, version_id: int,
+                                  user: dict = Depends(current_user)):
+    """Restore a version: save current as history, set restored answer as current."""
+    db = get_db()
+    ticket = db.execute("SELECT answer, depth, wishes FROM exam_tickets WHERE id=? AND subject_slug=?",
+                         (tid, slug)).fetchone()
+    if not ticket:
+        db.close()
+        raise HTTPException(404, "Билет не найден")
+    ver = db.execute("SELECT * FROM ticket_answers WHERE id=? AND ticket_id=?",
+                     (version_id, tid)).fetchone()
+    if not ver:
+        db.close()
+        raise HTTPException(404, "Версия не найдена")
+    now = datetime.now(timezone.utc).isoformat()
+    # Save current answer as a history version (if non-empty)
+    if ticket["answer"]:
+        db.execute(
+            "INSERT INTO ticket_answers (ticket_id, answer, depth, wishes, created_at, pinned) VALUES (?,?,?,?,?,0)",
+            (tid, ticket["answer"], ticket["depth"] or "standard", ticket["wishes"] or "", now)
+        )
+        old_ver_ids = db.execute(
+            "SELECT id FROM ticket_answers WHERE ticket_id=? AND pinned=0 ORDER BY id DESC LIMIT -1 OFFSET 5",
+            (tid,)
+        ).fetchall()
+        if old_ver_ids:
+            _ph = ",".join("?" * len(old_ver_ids))
+            db.execute(f"DELETE FROM ticket_answers WHERE id IN ({_ph})", [r["id"] for r in old_ver_ids])
+    # Restore version as current
+    db.execute(
+        "UPDATE exam_tickets SET answer=?, depth=?, wishes=?, status='generated', generated_at=? WHERE id=?",
+        (ver["answer"], ver["depth"] or "standard", ver["wishes"] or "", now, tid)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/api/subjects/{slug}/review")
+async def review_queue(slug: str, user: dict = Depends(current_user)):
+    """Return ordered review queue: again → check → new (generated only)."""
+    uid = int(user["sub"])
+    db = get_db()
+    tickets = db.execute(
+        "SELECT * FROM exam_tickets WHERE subject_slug=? AND status='generated' AND answer != '' ORDER BY COALESCE(position,0), id",
+        (slug,)
+    ).fetchall()
+    tids = [t["id"] for t in tickets]
+    prog_map: dict[int, dict] = {}
+    if tids:
+        ph = ",".join("?" * len(tids))
+        prog_rows = db.execute(
+            f"SELECT ticket_id, status, updated_at FROM ticket_progress WHERE user_id=? AND ticket_id IN ({ph})",
+            [uid] + tids
+        ).fetchall()
+        for r in prog_rows:
+            prog_map[r["ticket_id"]] = {"status": r["status"], "updated_at": r["updated_at"]}
+    db.close()
+    ORDER = {"again": 0, "check": 1, "new": 2, "known": 3}
+    result = []
+    for t in tickets:
+        td = dict(t)
+        prog = prog_map.get(t["id"], {})
+        td["progress"] = prog.get("status", "new")
+        td["progress_updated_at"] = prog.get("updated_at", "")
+        result.append(td)
+    # Filter out "known"
+    result = [t for t in result if t["progress"] != "known"]
+    result.sort(key=lambda t: (ORDER.get(t["progress"], 2), t["progress_updated_at"]))
+    return result
 
 
 # ─── Stage 7 additions ────────────────────────────────────────────────
@@ -3822,6 +4034,18 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}.toast{animation:none}}
 
+/* ── Режим повторения (Review) ──────────────────────────────────────── */
+.review-card{max-width:680px;margin:0 auto;padding:28px 32px}
+.review-progress-bar{height:4px;background:var(--border);border-radius:999px;overflow:hidden;margin-bottom:20px}
+.review-progress-fill{height:100%;background:linear-gradient(90deg,var(--orb1),var(--accent));transition:width .3s}
+.review-q{font-family:var(--font-d);font-size:1.125rem;font-weight:500;line-height:1.5;margin:16px 0 24px}
+.review-answer{display:none;padding:20px;background:var(--glass2);border:1px solid var(--border);border-radius:var(--r-m);margin-bottom:20px;font-size:.9375rem;line-height:1.7}
+.review-actions{display:flex;gap:12px;flex-wrap:wrap}
+.tk-prog-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-left:6px}
+.tk-prog-known{background:var(--green)}
+.tk-prog-again{background:var(--red)}
+.tk-prog-check{background:var(--yellow)}
+.tk-prog-new{background:var(--border2)}
 /* ── Узкие экраны ───────────────────────────────────────────────────── */
 @media(max-width:820px){
   .three-col{grid-template-columns:1fr;position:relative}
@@ -4132,7 +4356,8 @@ function route() {
   if (!S.user && view !== 'login') { location.hash = '#/login'; return; }
   if (S.user && view === 'login') { location.hash = '#/dashboard'; return; }
   const views = { login: vLogin, dashboard: vDashboard, subject: vSubject,
-                  reader: vReader, chat: vChat, tickets: vTickets, new: vNewSubject };
+                  reader: vReader, chat: vChat, tickets: vTickets, new: vNewSubject,
+                  review: vReview };
   const fn = views[view];
   if (fn) fn(main, slug); else location.hash = '#/dashboard';
 }
@@ -4185,7 +4410,7 @@ function updateNav(view, slug) {
   const nb = document.getElementById('navbar');
   if (view === 'login') { nb.classList.add('hidden'); return; }
   nb.classList.remove('hidden');
-  const labels = {subject:'Источники', reader:'Читалка', chat:'Чат', tickets:'Билеты'};
+  const labels = {subject:'Источники', reader:'Читалка', chat:'Чат', tickets:'Билеты', review:'Повторение'};
   const sep = '<span class="sep" aria-hidden="true">/</span>';
   var crumb;
   if (slug && view !== 'dashboard') {
@@ -4369,17 +4594,26 @@ function _renderSubjectCard(s) {
   var meta = s.ticket_count
     ? (s.answered_count + ' из ' + s.ticket_count + ' ' + plural(s.ticket_count, ['билета','билетов','билетов']) + (unanswered > 0 ? ' · ' + unanswered + ' без ответа' : ''))
     : (s.source_count + ' ' + plural(s.source_count, ['источник','источника','источников']));
+  var progMeta = '';
+  if (s.ticket_count > 0 && ((s.known_count || 0) > 0 || (s.again_count || 0) > 0)) {
+    progMeta = '<div class="card-meta" style="margin-top:4px;font-size:.8125rem;display:flex;gap:10px;flex-wrap:wrap">' +
+      (s.known_count ? '<span style="color:var(--green)">✓ Знаю ' + s.known_count + '</span>' : '') +
+      (s.again_count ? '<span style="color:var(--red)">↻ Ещё раз ' + s.again_count + '</span>' : '') +
+      '</div>';
+  }
   return '<div class="glass subject-card" style="cursor:default">' +
     '<div class="card-top">' + semBadge + badge + '</div>' +
     '<div class="card-title">' + esc(s.title) + '</div>' +
     '<div><div class="progress" style="margin-top:0"><div class="progress-bar" style="width:' + pct + '%"></div></div>' +
-    '<div class="card-meta" style="margin-top:8px">' + esc(meta) + '</div></div>' +
+    '<div class="card-meta" style="margin-top:8px">' + esc(meta) + '</div>' +
+    progMeta + '</div>' +
     '<div style="display:flex;align-items:center;gap:8px;justify-content:space-between">' +
     _subjectCardBtn(s) +
     '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с предметом" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
     '<div class="menu hidden" role="menu">' +
     '<a role="menuitem" href="#/subject/' + s.slug + '" onclick="closeMenus(null)">Источники</a>' +
     '<a role="menuitem" href="#/tickets/' + s.slug + '" onclick="closeMenus(null)">Билеты</a>' +
+    '<a role="menuitem" href="#/review/' + s.slug + '" onclick="closeMenus(null)">Повторить</a>' +
     '<a role="menuitem" href="#/chat/' + s.slug + '" onclick="closeMenus(null)">Чат</a>' +
     '<button type="button" role="menuitem" onclick="closeMenus(null);showEditSubject(\'' + s.slug + '\',\'' + esc(s.title).replace(/'/g,"&#39;") + '\',' + (s.semester||0) + ',\'' + esc(s.exam_date||'') + '\',\'' + esc(s.description||'').replace(/'/g,"&#39;") + '\')">Изменить</button>' +
     '</div></div></div>' +
@@ -4620,6 +4854,7 @@ async function vSubject(main, slug) {
     '<a href="#/reader/' + slug + '" class="btn btn-ghost btn-sm">Читалка</a>' +
     '<a href="#/chat/' + slug + '" class="btn btn-ghost btn-sm">Чат</a>' +
     '<a href="#/tickets/' + slug + '" class="btn btn-ghost btn-sm">Билеты</a>' +
+    '<a href="#/review/' + slug + '" class="btn btn-primary btn-sm">Повторить</a>' +
     '</div></div>' +
     '<div class="tabs" role="tablist" aria-label="Разделы предмета">' +
     '<button class="tab active" id="tab-btn-src" role="tab" aria-selected="true" onclick="switchTab(\'src\',this)">Источники</button>' +
@@ -5557,8 +5792,12 @@ function _tkStatusBadge(t) {
 
 function _tkMatchFilter(t) {
   var hasAnswer = t.answer && t.answer.length > 0;
+  var prog = t.progress || 'new';
   if (_TK.filter === 'noanswer' && hasAnswer) return false;
   if (_TK.filter === 'ready' && !hasAnswer) return false;
+  if (_TK.filter === 'known' && prog !== 'known') return false;
+  if (_TK.filter === 'again' && prog !== 'again') return false;
+  if (_TK.filter === 'check' && prog !== 'check') return false;
   if (_TK.query) {
     var q = _TK.query.toLowerCase();
     if (t.question.toLowerCase().indexOf(q) === -1) return false;
@@ -5573,6 +5812,14 @@ function _tkUpdateBulkBar(slug) {
   var total = _TK.all.length;
   var selCounter = document.getElementById('tk-sel-counter');
   if (selCounter) selCounter.textContent = n > 0 ? ('Выбрано ' + n + ' из ' + total) : '';
+  // Progress counter
+  var progCounter = document.getElementById('tk-prog-counter');
+  if (progCounter && _TK.all.length) {
+    var knownN = _TK.all.filter(function(t) { return t.progress === 'known'; }).length;
+    var againN = _TK.all.filter(function(t) { return t.progress === 'again'; }).length;
+    var newN = _TK.all.filter(function(t) { return !t.progress || t.progress === 'new'; }).length;
+    progCounter.textContent = 'Знаю ' + knownN + ' · Ещё раз ' + againN + ' · Новые ' + newN;
+  }
   if (n > 0) {
     bar.classList.remove('hidden');
     var prepBtn = document.getElementById('tk-btn-prep');
@@ -5613,11 +5860,14 @@ function _tkRenderList(slug) {
       (hasAnswer ? '<a role="menuitem" href="/api/subjects/' + slug + '/tickets/' + t.id + '/export" target="_blank" onclick="closeMenus(null)">Скачать HTML</a>' : '') +
       (t.status === 'error' ? '<button type="button" role="menuitem" onclick="closeMenus(null);tkRetry(\'' + slug + '\',' + t.id + ')">Повторить генерацию</button>' : '') +
       '<button type="button" role="menuitem" class="danger" onclick="closeMenus(null);delTicket(' + P + ')">Удалить</button>';
+    var prog = t.progress || 'new';
+    var progDot = '<span class="tk-prog-dot tk-prog-' + prog + '" title="' + esc({known:'Знаю',again:'Ещё раз',check:'Проверить',new:'Новый'}[prog]||prog) + '"></span>';
     return '<div class="glass ticket-item" id="tk-' + t.id + '" data-id="' + t.id + '">' +
       '<div class="ticket-head">' +
       '<input type="checkbox" class="tk-cb" data-id="' + t.id + '"' + checked + ' style="width:20px;height:20px;flex:0 0 auto;cursor:pointer;accent-color:var(--accent)" aria-label="Выбрать билет ' + pos + '">' +
       '<span style="min-width:28px;text-align:right;font-size:.8125rem;color:var(--dim);flex-shrink:0">' + pos + '</span>' +
       '<div class="ticket-q" id="tkq-' + t.id + '" ondblclick="tkEditInline(' + t.id + ')" style="-webkit-line-clamp:2;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;cursor:text" title="Двойной клик — редактировать">' + esc(t.question) + '</div>' +
+      progDot +
       _tkStatusBadge(t) +
       '<div class="menuwrap"><button class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Действия с билетом" onclick="toggleMenu(this,event)">' + ic(IC.dots, 20, true) + '</button>' +
       '<div class="menu hidden" role="menu">' + menuItems + '</div></div>' +
@@ -5897,12 +6147,14 @@ async function vTickets(main, slug) {
     '<h1 class="section-title">' + esc(subject.title) + '</h1>' +
     '<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">' +
     '<span id="tk-sel-counter" class="text-muted text-sm"></span>' +
+    '<span id="tk-prog-counter" class="text-muted text-sm"></span>' +
     '<label style="display:flex;align-items:center;gap:8px;min-height:44px;cursor:pointer;font-size:.9375rem">' +
     '<input type="checkbox" id="tk-sel-all" style="width:18px;height:18px;accent-color:var(--accent)"> Все без ответа' +
     '</label>' +
     '<button type="button" class="btn btn-ghost btn-sm" id="tk-btn-desel" style="display:none">Снять выбор</button>' +
     '</div></div>' +
     '<div class="flex gap" style="flex-wrap:wrap">' +
+    '<a href="#/review/' + slug + '" class="btn btn-primary btn-sm">Повторить</a>' +
     '<button class="btn btn-ghost btn-sm" type="button" id="btn-preview">Превью</button>' +
     '<a href="/api/subjects/' + slug + '/tickets/export" class="btn btn-ghost btn-sm" target="_blank">Скачать HTML</a>' +
     '</div></div>' +
@@ -5913,6 +6165,9 @@ async function vTickets(main, slug) {
     '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn active" data-f="all">Все</button>' +
     '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="noanswer">Без ответа</button>' +
     '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="ready">Готовы</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="known">Знаю</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="again">Ещё раз</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm tk-filter-btn" data-f="check">Проверить</button>' +
     '</div></div>' +
     // ── Add area
     '<div class="ticket-add">' +
@@ -6762,6 +7017,144 @@ function vNewSubject(main) {
   }
 
   renderStep1();
+}
+
+// ── Review ─────────────────────────────────────────────────────────────
+async function vReview(main, slug) {
+  var queue = [];
+  var idx = 0;
+  var showingAnswer = false;
+  let subject = {title: slug};
+  try { const sr = await api('/api/subjects/' + slug); subject = await sr.json(); } catch(e) {}
+  S.titles[slug] = subject.title || slug;
+  updateNav('review', slug);
+
+  async function loadQueue() {
+    try {
+      var r = await api('/api/subjects/' + slug + '/review');
+      if (!r.ok) throw new Error('err');
+      queue = await r.json();
+    } catch(e) { queue = []; }
+    idx = 0;
+    renderCard();
+  }
+
+  function renderCard() {
+    main.innerHTML = '';
+    if (!queue.length) {
+      main.innerHTML = '<div class="page"><div class="empty" style="margin-top:40px">' +
+        ic(IC.doc, 40) + '<b>Нет билетов для повторения</b>' +
+        '<span>Сгенерируйте ответы на билеты, чтобы начать повторение.</span>' +
+        '<a href="#/tickets/' + slug + '" class="btn btn-primary btn-sm">Перейти к билетам</a>' +
+        '</div></div>';
+      return;
+    }
+    if (idx >= queue.length) {
+      main.innerHTML = '<div class="page"><div class="empty" style="margin-top:40px">' +
+        ic(IC.doc, 40) + '<b>Сессия завершена!</b>' +
+        '<span>Все карточки разобраны.</span>' +
+        '<div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">' +
+        '<a href="#/tickets/' + slug + '" class="btn btn-ghost btn-sm">К билетам</a>' +
+        '<button class="btn btn-primary btn-sm" onclick="vReview(document.getElementById(\'main\'),\'' + slug + '\')">Повторить ещё раз</button>' +
+        '</div></div></div>';
+      return;
+    }
+    var t = queue[idx];
+    var total = queue.length;
+    var done = idx;
+    var pct = total ? Math.round(done / total * 100) : 0;
+    var remaining = total - done;
+
+    main.innerHTML =
+      '<div class="page" style="max-width:760px;margin:0 auto">' +
+      '<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap">' +
+      '<a href="#/tickets/' + slug + '" class="btn btn-ghost btn-sm">← Билеты</a>' +
+      '<span class="text-muted text-sm" style="flex:1">Осталось ' + remaining + '</span>' +
+      '</div>' +
+      '<div class="review-progress-bar"><div class="review-progress-fill" style="width:' + pct + '%"></div></div>' +
+      '<div class="glass review-card">' +
+      '<div style="font-size:.75rem;color:var(--accent);font-weight:600;text-transform:uppercase;letter-spacing:.05em">Билет ' + (t.position || (idx+1)) + '</div>' +
+      '<div class="review-q">' + esc(t.question) + '</div>' +
+      '<div class="review-answer" id="rv-answer"></div>' +
+      '<div class="review-actions">' +
+      '<button class="btn btn-primary" id="rv-show" onclick="_rvShowAnswer()">Показать ответ <span style="font-size:.75rem;opacity:.7">[Пробел]</span></button>' +
+      '<button class="btn btn-danger hidden" id="rv-again" onclick="_rvMark(\'again\')">Ещё раз <span style="font-size:.75rem;opacity:.7">[1]</span></button>' +
+      '<button class="btn btn-ghost hidden" id="rv-known" onclick="_rvMark(\'known\')" style="color:var(--green);border-color:var(--green)">Знаю <span style="font-size:.75rem;opacity:.7">[2]</span></button>' +
+      '</div>' +
+      '</div>' +
+      '</div>';
+
+    // Preload image cache for this answer
+    if (t.answer) {
+      var imgIds = []; var reImg = /\[img:(\d+)\]/gi; var mImg;
+      while ((mImg = reImg.exec(t.answer)) !== null) { imgIds.push(mImg[1]); }
+      if (imgIds.length) _preloadImgCache(imgIds, slug);
+    }
+  }
+
+  window._rvShowAnswer = function() {
+    if (showingAnswer) return;
+    showingAnswer = true;
+    var t = queue[idx];
+    var ansEl = document.getElementById('rv-answer');
+    var showBtn = document.getElementById('rv-show');
+    var againBtn = document.getElementById('rv-again');
+    var knownBtn = document.getElementById('rv-known');
+    if (!ansEl) return;
+    ansEl.style.display = '';
+    ansEl.innerHTML = md(t.answer || '');
+    renderMath(ansEl);
+    if (showBtn) showBtn.classList.add('hidden');
+    if (againBtn) againBtn.classList.remove('hidden');
+    if (knownBtn) knownBtn.classList.remove('hidden');
+  };
+
+  window._rvMark = async function(status) {
+    var t = queue[idx];
+    try {
+      await api('/api/subjects/' + slug + '/tickets/' + t.id + '/progress', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({status: status})
+      });
+    } catch(e) {}
+    idx++;
+    showingAnswer = false;
+    renderCard();
+  };
+
+  // Keyboard shortcuts
+  function _rvKeyHandler(e) {
+    if (!document.getElementById('rv-show') && !document.getElementById('rv-again')) return;
+    if (e.key === ' ' || e.code === 'Space') {
+      e.preventDefault();
+      var showBtn = document.getElementById('rv-show');
+      if (showBtn && !showBtn.classList.contains('hidden')) _rvShowAnswer();
+    } else if (e.key === '1') {
+      var againBtn = document.getElementById('rv-again');
+      if (againBtn && !againBtn.classList.contains('hidden')) _rvMark('again');
+    } else if (e.key === '2') {
+      var knownBtn = document.getElementById('rv-known');
+      if (knownBtn && !knownBtn.classList.contains('hidden')) _rvMark('known');
+    }
+  }
+  document.addEventListener('keydown', _rvKeyHandler);
+  // Remove listener when navigating away
+  var _origRoute = window._rvCleanup;
+  window._rvCleanup = function() {
+    document.removeEventListener('keydown', _rvKeyHandler);
+    if (_origRoute) _origRoute();
+  };
+  var _origStopPolling = stopPolling;
+  S._resume = null;
+  // Override hashchange to cleanup keyboard handler
+  var _prevHashHandler = window.onhashchange;
+  window.addEventListener('hashchange', function _cleanup() {
+    document.removeEventListener('keydown', _rvKeyHandler);
+    window.removeEventListener('hashchange', _cleanup);
+  });
+
+  await loadQueue();
 }
 
 // ── Init ───────────────────────────────────────────────────────────────
