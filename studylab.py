@@ -1532,7 +1532,8 @@ async def _rag_context(subject_slug: str, question: str, k: int = 8,
 
 
 def _build_messages(history: list[dict], question: str,
-                    context_chunks: list[dict], image_b64: str | None = None) -> list[dict]:
+                    context_chunks: list[dict], image_b64: str | None = None,
+                    image_candidates: list | None = None) -> list[dict]:
     ctx = ""
     if context_chunks:
         parts = []
@@ -1543,6 +1544,33 @@ def _build_messages(history: list[dict], question: str,
             subject = h.get("_subject", h.get("topic", ""))
             parts.append(f"[{i} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:600]}")
         ctx = "Фрагменты из источников:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
+    # Add image candidates block for chat (limit 2 per response)
+    _CHAT_MAX_IMG = 2
+    if image_candidates:
+        cand_ids = []
+        for h in image_candidates[:_CHAT_MAX_IMG * 2]:
+            meta = h.get("meta") or {}
+            img_id = meta.get("image_id")
+            if img_id:
+                cand_ids.append(int(img_id))
+        if cand_ids:
+            img_meta = _fetch_image_meta(cand_ids)
+            img_lines = []
+            for img_id in cand_ids[:_CHAT_MAX_IMG * 2]:
+                row = img_meta.get(img_id, {})
+                caption = row.get("caption", "") or ""
+                kind    = row.get("kind", "") or ""
+                context = row.get("context", "") or ""
+                latex   = row.get("latex", "") or ""
+                line    = f"[img:{img_id} | {caption} | {kind} | {context}]"
+                if kind == "formula" and latex:
+                    line += f" | latex: {latex}"
+                img_lines.append(line)
+            ctx += (
+                f"Иллюстрации (вставляй [img:ID] в ответ в нужном месте, не более {_CHAT_MAX_IMG}, "
+                "только из предложенных, не выдумывай ID):\n"
+                + "\n".join(img_lines) + "\n\n"
+            )
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_BIO}]
     for msg in history[-10:]:
@@ -1620,11 +1648,12 @@ async def chat_stream(slug: str, q: str, conversation_id: int = 0,
 
     rag_result = await _rag_context(slug, q, only_subject=False)
     context_chunks = rag_result["text"]
+    image_chunks   = rag_result["images"]
 
     async def generate():
         full_answer = []
         try:
-            messages = _build_messages(history, q, context_chunks, image)
+            messages = _build_messages(history, q, context_chunks, image, image_candidates=image_chunks)
             async with _httpx.AsyncClient(timeout=120) as client:
                 async with client.stream(
                     "POST", TIMEWEB_URL,
@@ -1655,6 +1684,21 @@ async def chat_stream(slug: str, q: str, conversation_id: int = 0,
         finally:
             answer_text = "".join(full_answer)
             if answer_text:
+                # Validate [img:ID] markers — strip unknown/excess IDs
+                _chat_img_cand_ids = []
+                for _h in image_chunks:
+                    _m = (_h.get("meta") or {})
+                    _iid = _m.get("image_id")
+                    if _iid:
+                        _chat_img_cand_ids.append(str(_iid))
+                answer_text, _ = _validate_answer(
+                    answer_text,
+                    set(),          # no src-triple validation for chat
+                    _chat_img_cand_ids,
+                    _CHAT_MAX_IMG,
+                    check_src=False,
+                    check_not_found=False,
+                )
                 save_db = get_db()
                 save_db.execute(
                     "INSERT INTO chat_history (conversation_id,subject_slug,user_id,role,content,created_at) "
@@ -2004,6 +2048,7 @@ _DEPTH_RULES = {
 _DEPTH_MAX_TOKENS = {"short": 8192, "standard": 12288, "full": 16384}
 _DEPTH_MAX_IMG    = {"short": 1,    "standard": 3,    "full": 5}
 _DEPTH_K          = {"short": 10,   "standard": 10,   "full": 14}
+_CHAT_MAX_IMG     = 2  # max [img:ID] markers per chat response
 # Score distribution: case1=0.725 (relevant), case3=0.448 (irrelevant), case12=0.425 (relevant)
 # Threshold 0.50 catches case3 but loses case12. Use 0.50 with secondary check:
 # if max score in top-3 < 0.50 BUT >= 0.40, pass to LLM with warning in prompt
@@ -2031,9 +2076,13 @@ def _validate_answer(
     context_triples: set[tuple[str, str, int]],
     image_candidates: list[int],
     max_img: int,
+    check_src: bool = True,
+    check_not_found: bool = True,
 ) -> tuple[str, list[str]]:
     """Validate and clean LLM answer. Returns (cleaned_text, warnings).
-    context_triples: set of (subject_slug, source_slug, segment_index) from RAG."""
+    context_triples: set of (subject_slug, source_slug, segment_index) from RAG.
+    check_src: if False, skip [src:...] reference validation (for chat).
+    check_not_found: if False, skip «Не найдено» block check (for chat)."""
     warnings: list[str] = []
     cleaned = answer_text
 
@@ -2055,49 +2104,51 @@ def _validate_answer(
         warnings.append(f"Всего запрещённых фраз: {forbidden_count}")
 
     # C1: Check [src:SUBJECT/SLUG#SEG | ...] by triple, remove invalid
-    context_slug_set = {(s, sl) for s, sl, _ in context_triples}  # for fallback
-    def _check_src(m: re.Match) -> str:
-        full_ref = m.group(0)
-        inner = m.group(1)  # e.g. SUBJECT/SLUG#SEG | раздел: ...
-        ref_part = inner.split("|")[0].strip()
-        # Parse SUBJECT/SLUG#SEG or SLUG#SEG
-        parts = ref_part.split("/")
-        if len(parts) >= 2:
-            subj = parts[0].strip()
-            slug_seg = parts[1].strip()
-        else:
-            subj = ""
-            slug_seg = parts[0].strip()
-        slug_part = slug_seg.split("#")[0].strip()
-        seg_part = slug_seg.split("#")[1].strip() if "#" in slug_seg else "0"
-        try:
-            seg_num = int(seg_part)
-        except ValueError:
-            seg_num = -1
-        # Check triple
-        if subj and (subj, slug_part, seg_num) in context_triples:
-            return full_ref
-        # Fallback: check (subject, slug) pair
-        if subj and (subj, slug_part) in context_slug_set:
-            return full_ref
-        # Old format: just slug
-        if not subj and any(slug_part == sl for _, sl in context_slug_set):
-            return full_ref
-        warnings.append(f"Удалена ссылка вне контекста: {full_ref[:80]}")
-        return ""
+    if check_src:
+        context_slug_set = {(s, sl) for s, sl, _ in context_triples}  # for fallback
+        def _check_src_fn(m: re.Match) -> str:
+            full_ref = m.group(0)
+            inner = m.group(1)  # e.g. SUBJECT/SLUG#SEG | раздел: ...
+            ref_part = inner.split("|")[0].strip()
+            # Parse SUBJECT/SLUG#SEG or SLUG#SEG
+            parts = ref_part.split("/")
+            if len(parts) >= 2:
+                subj = parts[0].strip()
+                slug_seg = parts[1].strip()
+            else:
+                subj = ""
+                slug_seg = parts[0].strip()
+            slug_part = slug_seg.split("#")[0].strip()
+            seg_part = slug_seg.split("#")[1].strip() if "#" in slug_seg else "0"
+            try:
+                seg_num = int(seg_part)
+            except ValueError:
+                seg_num = -1
+            # Check triple
+            if subj and (subj, slug_part, seg_num) in context_triples:
+                return full_ref
+            # Fallback: check (subject, slug) pair
+            if subj and (subj, slug_part) in context_slug_set:
+                return full_ref
+            # Old format: just slug
+            if not subj and any(slug_part == sl for _, sl in context_slug_set):
+                return full_ref
+            warnings.append(f"Удалена ссылка вне контекста: {full_ref[:80]}")
+            return ""
 
-    cleaned = re.sub(r"\[src:([^\]]+)\]", _check_src, cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\[src:([^\]]+)\]", _check_src_fn, cleaned, flags=re.IGNORECASE)
 
     # C3: Check ## Не найдено в материалах block
-    if "не найдено в материалах" not in cleaned.lower():
+    if check_not_found and "не найдено в материалах" not in cleaned.lower():
         cleaned += "\n\n## Не найдено в материалах\nБлок не сформирован моделью."
         warnings.append("Отсутствует блок «Не найдено» — дописан")
 
-    # C2: Check [img:ID] — remove if no candidates, over limit, or not in list
+    # C2: Check [img:ID] — remove if no candidates, over limit, duplicate, or not in list
     img_candidate_ids = {str(cid) for cid in image_candidates}
     found_imgs = list(re.finditer(r"\[img:(\d+)\]", cleaned, re.IGNORECASE))
     seen_img_count = 0
-    for m in reversed(found_imgs):  # reverse to preserve positions
+    seen_img_ids: set[str] = set()
+    for m in reversed(found_imgs):  # reverse to preserve positions when slicing
         img_id = m.group(1)
         should_remove = False
         if not img_candidate_ids:
@@ -2106,6 +2157,9 @@ def _validate_answer(
         elif img_id not in img_candidate_ids:
             should_remove = True
             warnings.append(f"Удалён [img:{img_id}] — не в списке кандидатов")
+        elif img_id in seen_img_ids:
+            should_remove = True
+            warnings.append(f"Удалён [img:{img_id}] — дубликат")
         elif seen_img_count >= max_img:
             should_remove = True
             warnings.append(f"Удалён [img:{img_id}] — сверх лимита {max_img}")
@@ -2113,8 +2167,26 @@ def _validate_answer(
             cleaned = cleaned[:m.start()] + cleaned[m.end():]
         else:
             seen_img_count += 1
+            seen_img_ids.add(img_id)
 
     return cleaned, warnings
+
+
+def _fetch_image_meta(image_ids: list) -> dict:
+    """Fetch image metadata (caption, kind, latex, context, source_slug, segment)
+    from the images table for a list of image IDs.
+    Returns dict: {image_id (int): row_dict}."""
+    if not image_ids:
+        return {}
+    db = get_db()
+    placeholders = ",".join("?" * len(image_ids))
+    rows = db.execute(
+        f"SELECT id,subject_slug,source_slug,segment,kind,caption,latex,figure_label,context,path "
+        f"FROM images WHERE id IN ({placeholders})",
+        image_ids
+    ).fetchall()
+    db.close()
+    return {r["id"]: dict(r) for r in rows}
 
 
 def _build_ticket_context(
@@ -2167,14 +2239,25 @@ def _build_ticket_context(
             parts.append(f"[{i} src:{subject}/{src_slug}#{seg_idx}] «{title}»\n{h['text'][:800]}")
         ctx = "Источники:\n\n" + "\n\n---\n\n".join(parts) + "\n\n"
         if image_chunks:
-            img_lines = []
+            # Collect image IDs and fetch full metadata from DB
+            cand_ids = []
             for h in image_chunks[:max_img * 2]:
-                meta    = h.get("meta") or {}
-                img_id  = meta.get("image_id", "")
-                caption = meta.get("caption", "")
-                kind    = meta.get("kind", "")
-                context = meta.get("context", "")
-                img_lines.append(f"[img:{img_id} | {caption} | {kind} | {context}]")
+                meta   = h.get("meta") or {}
+                img_id = meta.get("image_id")
+                if img_id:
+                    cand_ids.append(int(img_id))
+            img_meta = _fetch_image_meta(cand_ids)
+            img_lines = []
+            for img_id in cand_ids:
+                row = img_meta.get(img_id, {})
+                caption = row.get("caption", "") or ""
+                kind    = row.get("kind", "") or ""
+                context = row.get("context", "") or ""
+                latex   = row.get("latex", "") or ""
+                line    = f"[img:{img_id} | {caption} | {kind} | {context}]"
+                if kind == "formula" and latex:
+                    line += f" | latex: {latex}"
+                img_lines.append(line)
             ctx += "Иллюстрации:\n" + "\n".join(img_lines) + "\n\n"
         else:
             ctx += "Иллюстрации: нет\n\n"
@@ -2186,13 +2269,15 @@ def _build_ticket_context(
         (h.get("_subject", h.get("topic", "")), h.get("slug", ""), h.get("segment", 0))
         for h in text_chunks if h.get("slug")
     }
-    image_candidate_ids = []
+    # Collect candidate IDs (fetch from DB for latex support)
+    cand_ids_all = []
     if image_chunks:
         for h in image_chunks[:max_img * 2]:
             meta   = h.get("meta") or {}
-            img_id = meta.get("image_id", "")
+            img_id = meta.get("image_id")
             if img_id:
-                image_candidate_ids.append(str(img_id))
+                cand_ids_all.append(str(img_id))
+    image_candidate_ids = cand_ids_all
 
     return system_prompt, user_message, context_triples, image_candidate_ids
 
@@ -2734,11 +2819,102 @@ async def generate_ticket_answer(
                                       "X-Accel-Buffering": "no"})
 
 
-def _md_to_html(text: str) -> str:
-    """Convert markdown to HTML with support for tables, lists, bold, italic, code, formulas."""
+def _md_to_html(text: str, embed_images: bool = False) -> str:
+    """Convert markdown to HTML with support for tables, lists, bold, italic, code, formulas.
+    When embed_images=True, [img:ID] markers are embedded as base64 data: URIs for offline export."""
     if not text:
         return ""
     import html as _html
+
+    # Pre-process [img:ID] markers: collect IDs, fetch metadata, save placeholders
+    _img_placeholders: list[str] = []
+    def _save_img_marker(m: re.Match) -> str:
+        img_id_str = m.group(1)
+        _img_placeholders.append(img_id_str)
+        return f"\x00IMG{len(_img_placeholders)-1}\x00"
+
+    text = re.sub(r"\[img:(\d+)\]", _save_img_marker, text, flags=re.IGNORECASE)
+
+    # Fetch image metadata for all found IDs
+    _img_meta_cache: dict[str, dict] = {}
+    if _img_placeholders:
+        try:
+            _ids_int = [int(x) for x in _img_placeholders]
+            _meta_rows = _fetch_image_meta(_ids_int)
+            for _iid, _row in _meta_rows.items():
+                _img_meta_cache[str(_iid)] = _row
+        except Exception:
+            pass
+
+    def _render_img_marker(img_id_str: str) -> str:
+        """Render one [img:ID] marker as HTML figure for export or link for inline."""
+        row = _img_meta_cache.get(img_id_str, {})
+        caption   = row.get("caption", "") or ""
+        kind      = row.get("kind", "") or ""
+        latex_val = row.get("latex", "") or ""
+        fig_label = row.get("figure_label", "") or ""
+        source_slug = row.get("source_slug", "") or ""
+        segment   = row.get("segment", 0) or 0
+        display_caption = fig_label or caption or f"Рис. {img_id_str}"
+
+        # For formula kind with latex: render LaTeX block instead of image
+        if kind == "formula" and latex_val:
+            return (
+                f'<figure style="text-align:center;margin:1em 0">'
+                f'<div style="font-size:1.1em">$${_html.escape(latex_val)}$$</div>'
+                f'<figcaption style="font-size:.82em;color:#8888a0;margin-top:.3em">'
+                f'{_html.escape(display_caption)}</figcaption></figure>'
+            )
+
+        if embed_images and row:
+            # Embed as base64 for offline export
+            try:
+                subject_slug_v = row.get("subject_slug", "") or ""
+                path_v = row.get("path", "") or ""
+                if subject_slug_v and path_v:
+                    img_path = subject_dir(subject_slug_v) / path_v
+                    if img_path.exists():
+                        # Resize to max 1200px using fitz if available
+                        img_bytes = img_path.read_bytes()
+                        try:
+                            import fitz
+                            pix = fitz.Pixmap(str(img_path))
+                            if pix.width > 1200:
+                                scale = 1200 / pix.width
+                                new_h = int(pix.height * scale)
+                                doc = fitz.open()
+                                page = doc.new_page(width=1200, height=new_h)
+                                page.insert_image(fitz.Rect(0, 0, 1200, new_h), pixmap=pix)
+                                pix2 = page.get_pixmap(dpi=72)
+                                img_bytes = pix2.tobytes("png")
+                                doc.close()
+                        except Exception:
+                            pass
+                        import base64 as _b64e
+                        b64 = _b64e.b64encode(img_bytes).decode()
+                        src = f"data:image/png;base64,{b64}"
+                        return (
+                            f'<figure style="margin:1em 0;text-align:center">'
+                            f'<img src="{src}" alt="{_html.escape(display_caption)}" '
+                            f'style="max-width:100%;border-radius:8px">'
+                            f'<figcaption style="font-size:.82em;color:#8888a0;margin-top:.3em">'
+                            f'{_html.escape(display_caption)}</figcaption></figure>'
+                        )
+            except Exception:
+                pass
+            return f'<span style="color:#8888a0;font-size:.85em">[Рис. {_html.escape(img_id_str)}]</span>'
+        else:
+            # Online: render as figure with src link
+            src = f"/api/images/{_html.escape(img_id_str)}?w=600"
+            return (
+                f'<figure style="margin:1em 0;text-align:center">'
+                f'<img src="{src}" alt="{_html.escape(display_caption)}" '
+                f'style="max-width:100%;border-radius:8px;cursor:zoom-in" '
+                f'onclick="_showImgModal({img_id_str})">'
+                f'<figcaption style="font-size:.82em;color:#8888a0;margin-top:.3em">'
+                f'{_html.escape(display_caption)}</figcaption></figure>'
+            )
+
     # Normalize block formulas and protect from escaping
     text = re.sub(r"\$\$\s*\n([\s\S]*?)\n\s*\$\$", lambda m: "$$" + m.group(1).strip() + "$$", text)
     _formulas: list[str] = []
@@ -2862,6 +3038,14 @@ def _md_to_html(text: str) -> str:
             return f'<div style="text-align:center;margin:.8em 0">{f}</div>'
         return f
     result = re.sub(r"\x00F(\d+)\x00", _restore, result)
+    # Restore [img:ID] markers
+    def _restore_img(m: re.Match) -> str:
+        idx = int(m.group(1))
+        img_id_str = _img_placeholders[idx] if idx < len(_img_placeholders) else ""
+        if not img_id_str:
+            return ""
+        return _render_img_marker(img_id_str)
+    result = re.sub(r"\x00IMG(\d+)\x00", _restore_img, result)
     return result
 
 
@@ -2910,6 +3094,9 @@ h1{{font-size:1.5rem;font-weight:700;letter-spacing:-0.03em;margin-bottom:0.5rem
   border-left:3px solid rgba(251,191,91,0.5);border-radius:8px}}
 .not-found-title{{font-size:.875rem;font-weight:600;color:#fbbf5b;margin-bottom:.4rem}}
 .footer{{margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border);font-size:.78rem;color:var(--muted)}}
+figure.img-figure{{margin:1em auto;text-align:center;max-width:100%;page-break-inside:avoid}}
+figure.img-figure img{{max-width:100%;border-radius:8px}}
+figure.img-figure figcaption{{font-size:.82em;color:var(--muted);margin-top:.4em}}
 @media print{{body{{background:#fff;color:#1a1a2e}}body::before{{display:none}}
   .ticket{{background:#fff;border:1px solid #ddd;box-shadow:none}}
   .ticket::before{{display:none}}.ticket-body h2{{color:#2563eb}}
@@ -2939,8 +3126,12 @@ async def export_tickets_html(slug: str, inline: int = 0, user: dict = Depends(c
     title = subject_row["title"] if subject_row else slug
 
     tickets_html = []
+    tickets_html = []
+    total_img_bytes = 0
+    size_warning = ""
     for i, r in enumerate(rows, 1):
-        answer_html = _md_to_html(r["answer"]) if r["answer"] else "<p><em>Ответ не сгенерирован</em></p>"
+        answer_html = _md_to_html(r["answer"], embed_images=True) if r["answer"] else "<p><em>Ответ не сгенерирован</em></p>"
+        total_img_bytes += len(answer_html.encode("utf-8"))
         tickets_html.append(
             f'<div class="ticket">'
             f'<div class="ticket-num">Билет {i}</div>'
@@ -2948,12 +3139,16 @@ async def export_tickets_html(slug: str, inline: int = 0, user: dict = Depends(c
             f'<div class="ticket-body">{answer_html}</div>'
             f'</div>'
         )
+    _SIZE_WARN_BYTES = 15 * 1024 * 1024  # 15 MB
+    if total_img_bytes > _SIZE_WARN_BYTES:
+        size_mb = total_img_bytes / 1024 / 1024
+        size_warning = f'<div style="padding:.5rem 1rem;background:rgba(251,191,91,.12);border-left:3px solid #fbbf5b;border-radius:8px;margin-bottom:1rem;font-size:.88rem">Предупреждение: экспорт содержит много изображений ({size_mb:.1f} МБ). Файл может открываться медленно.</div>'
 
     now = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
     html = TICKET_HTML_TEMPLATE.format(
         title=f"Билеты: {title}",
         subtitle=f"{len(rows)} вопросов · {title}",
-        tickets_html="\n".join(tickets_html),
+        tickets_html=size_warning + "\n".join(tickets_html),
         date=now
     )
     headers = {} if inline else {"Content-Disposition": f'attachment; filename="tickets_{slug}.html"'}
@@ -2970,7 +3165,7 @@ async def export_single_ticket(slug: str, tid: int, inline: int = 0, user: dict 
         raise HTTPException(404, "Билет не найден")
     title = subject_row["title"] if subject_row else slug
 
-    answer_html = _md_to_html(row["answer"]) if row["answer"] else "<p><em>Ответ не сгенерирован</em></p>"
+    answer_html = _md_to_html(row["answer"], embed_images=True) if row["answer"] else "<p><em>Ответ не сгенерирован</em></p>"
     ticket_html = (
         f'<div class="ticket">'
         f'<div class="ticket-num">Билет</div>'
@@ -3161,6 +3356,67 @@ async def list_images(slug: str, source_slug: str = "",
         d["url"] = f"/api/images/{d['id']}"
         result.append(d)
     return result
+
+
+@app.get("/api/subjects/{slug}/ticket-images")
+async def ticket_images_meta(slug: str, ids: str = Query(default=""),
+                              user: dict = Depends(current_user)):
+    """Return image metadata for a comma-separated list of image IDs.
+    Used by client-side md() to render [img:ID] markers without extra per-image requests.
+    Only returns active (non-hidden), subject-accessible images."""
+    if not ids.strip():
+        return []
+    id_list = []
+    for part in ids.split(","):
+        part = part.strip()
+        if part.isdigit():
+            id_list.append(int(part))
+    if not id_list:
+        return []
+
+    db = get_db()
+    # Verify subject exists
+    subj_check = db.execute("SELECT slug FROM subjects WHERE slug=?", (slug,)).fetchone()
+    if not subj_check:
+        db.close()
+        raise HTTPException(404, "Предмет не найден")
+    # Also fetch active source slugs for this subject (and all subjects for cross-subject)
+    placeholders = ",".join("?" * len(id_list))
+    rows = db.execute(
+        f"SELECT i.id, i.subject_slug, i.source_slug, i.segment, i.kind, i.caption, "
+        f"i.latex, i.figure_label, i.context, i.hidden, s.status AS src_status "
+        f"FROM images i "
+        f"JOIN sources s ON s.slug=i.source_slug AND s.subject_slug=i.subject_slug "
+        f"WHERE i.id IN ({placeholders}) AND i.hidden=0 AND s.status='indexed'",
+        id_list
+    ).fetchall()
+    db.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["url"] = f"/api/images/{d['id']}?w=600"
+        result.append(d)
+    return result
+
+
+@app.get("/api/images/{image_id}/meta")
+async def image_meta(image_id: int, user: dict = Depends(current_user)):
+    """Return metadata for a single image (used by lightbox)."""
+    db = get_db()
+    row = db.execute(
+        "SELECT i.id, i.subject_slug, i.source_slug, i.segment, i.kind, i.caption, "
+        "i.latex, i.figure_label, i.context, i.hidden, "
+        "s.title AS source_title "
+        "FROM images i "
+        "LEFT JOIN sources s ON s.slug=i.source_slug AND s.subject_slug=i.subject_slug "
+        "WHERE i.id=?", (image_id,)
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Изображение не найдено")
+    d = dict(row)
+    d["url"] = f"/api/images/{image_id}?w=600"
+    return d
 
 
 # ─── ROUTES END ────────────────────────────────────────────────────────
@@ -3500,6 +3756,12 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 .ticket-answer code{background:var(--glass2);padding:1px 5px;border-radius:3px}
 .ticket-answer h2,.ticket-answer h3{margin:1em 0 .4em;font-size:.8125rem;font-weight:600;letter-spacing:.06em;
   text-transform:uppercase;color:var(--accent)}
+/* img-figure: rendered [img:ID] markers */
+.img-figure{margin:1em auto;text-align:center;max-width:100%;border-radius:8px}
+.img-figure img{max-width:100%;max-height:500px;border-radius:8px;cursor:zoom-in;
+  box-shadow:0 4px 20px rgba(0,0,0,.3);transition:opacity .2s}
+.img-figure img:hover{opacity:.9}
+.img-figure figcaption{font-size:.82em;color:var(--muted);margin-top:.4em;line-height:1.4}
 .not-found-block{margin:1em 0 .5em;padding:.75rem 1rem;background:rgba(251,191,91,0.07);
   border-left:3px solid rgba(251,191,91,0.45);border-radius:8px}
 .not-found-title{font-size:.8125rem!important;font-weight:600!important;color:var(--yellow)!important;
@@ -3611,7 +3873,8 @@ input::placeholder,textarea::placeholder{color:var(--dim)}
 </div>
 <script>
 // ── State ──────────────────────────────────────────────────────────────
-const S = { user: null, chatES: null, pendingImg: null, chatConvId: 0, titles: {}, _pollTimers: [] };
+const S = { user: null, chatES: null, pendingImg: null, chatConvId: 0, titles: {}, _pollTimers: [],
+            _imgCache: {} };  // id -> {caption, kind, latex, figure_label, source_slug, segment, url}
 
 // Stop all polling timers
 function stopPolling() { S._pollTimers.forEach(clearTimeout); S._pollTimers = []; }
@@ -3711,7 +3974,13 @@ function md(text) {
     tables.push(html);
     return '\x00T' + (tables.length - 1) + '\x00';
   });
-  // Protect images from esc() — save them and restore after
+  // Protect [img:ID] markers from esc() — save and restore after
+  var imgMarkers = [];
+  t = t.replace(/\[img:(\d+)\]/gi, function(_, imgId) {
+    imgMarkers.push(imgId);
+    return '\x00IMGM' + (imgMarkers.length - 1) + '\x00';
+  });
+  // Protect markdown images from esc() — save them and restore after
   var images = [];
   t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(_, alt, src) {
     // Security: only /api/ paths, no quotes/angles/spaces/newlines, then esc() output
@@ -3786,9 +4055,48 @@ function md(text) {
     return f;
   });
   h = h.replace(/<p>\s*<\/p>/g, '');
-  // Restore images
+  // Restore markdown images
   h = h.replace(/\x00I(\d+)\x00/g, function(_, i) {
     return '</p>' + images[parseInt(i)] + '<p>';
+  });
+  h = h.replace(/<p>\s*<\/p>/g, '');
+  // Restore [img:ID] markers as figures using S._imgCache
+  h = h.replace(/\x00IMGM(\d+)\x00/g, function(_, idx) {
+    var imgId = imgMarkers[parseInt(idx)];
+    if (!imgId) return '';
+    var cached = S._imgCache[imgId];
+    var caption = cached ? (cached.figure_label || cached.caption || ('Рис. ' + imgId)) : ('Рис. ' + imgId);
+    var kind = cached ? (cached.kind || '') : '';
+    var latexVal = cached ? (cached.latex || '') : '';
+    var subjectSlug = cached ? (cached.subject_slug || '') : '';
+    var srcSlug = cached ? (cached.source_slug || '') : '';
+    var seg = cached ? (cached.segment || 0) : 0;
+    var readerHref = (subjectSlug && srcSlug)
+      ? '#/reader/' + subjectSlug + '?src=' + srcSlug + '&seg=' + seg
+      : '';
+    // Formula kind: render LaTeX block instead of image
+    if (kind === 'formula' && latexVal) {
+      return '</p><figure class="img-figure" style="text-align:center;margin:1em 0">' +
+        '<div class="math-block">$$' + esc(latexVal) + '$$</div>' +
+        '<figcaption style="font-size:.82em;color:var(--muted);margin-top:.3em">' + esc(caption) +
+        (readerHref ? ' · <a href="' + readerHref + '" style="color:var(--accent)">читалка</a>' : '') +
+        '</figcaption></figure><p>';
+    }
+    // Regular image
+    var imgSrc = '/api/images/' + imgId + '?w=600';
+    var figHtml =
+      '<figure class="img-figure" style="margin:1em 0;text-align:center" data-imgid="' + imgId + '">' +
+      '<img src="' + imgSrc + '" alt="' + esc(caption) + '" ' +
+      'style="max-width:100%;border-radius:8px;cursor:zoom-in" ' +
+      'onclick="_showImgModal(' + imgId + ')" ' +
+      'onerror="this.closest(\'figure\').style.display=\'none\'">' +
+      '<figcaption style="font-size:.82em;color:var(--muted);margin-top:.4em">' +
+      esc(caption) +
+      (readerHref ? ' · <a href="' + readerHref + '" style="color:var(--accent)">читалка</a>' : '') +
+      '<button style="margin-left:8px;background:none;border:none;font-size:.8em;color:var(--muted);cursor:pointer;padding:0 4px" ' +
+      'title="Скрыть из ответов" onclick="_hideImg(' + imgId + ',this.closest(\'figure\'))">✕</button>' +
+      '</figcaption></figure>';
+    return '</p>' + figHtml + '<p>';
   });
   h = h.replace(/<p>\s*<\/p>/g, '');
   return '<p>' + h + '</p>';
@@ -4803,16 +5111,122 @@ function _highlightInReader(container, query) {
   }
 }
 
-function _showImgModal(src, alt) {
+// _showImgModal(imgId) — enhanced lightbox with caption, source link, hide button
+// _showImgModal(src, alt) — legacy call from reader images (still works)
+function _showImgModal(srcOrId, alt) {
   var overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.82);z-index:9000;display:flex;align-items:center;justify-content:center;cursor:zoom-out;padding:20px';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.86);z-index:9000;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;gap:12px';
+  var inner = document.createElement('div');
+  inner.style.cssText = 'position:relative;display:flex;flex-direction:column;align-items:center;gap:10px;max-width:900px;width:100%';
+  // Close button
+  var closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕';
+  closeBtn.style.cssText = 'position:absolute;top:-16px;right:-8px;background:rgba(255,255,255,.15);border:none;color:#fff;font-size:1.1rem;width:36px;height:36px;border-radius:50%;cursor:pointer;z-index:1;line-height:1';
+  closeBtn.addEventListener('click', function(e) { e.stopPropagation(); document.body.removeChild(overlay); });
+  inner.appendChild(closeBtn);
+  // Image
   var img = document.createElement('img');
-  img.src = src;
-  img.alt = alt || '';
-  img.style.cssText = 'max-width:100%;max-height:100%;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6)';
-  overlay.appendChild(img);
-  overlay.addEventListener('click', function() { document.body.removeChild(overlay); });
+  var imgSrc, imgAlt, imgId;
+  if (typeof srcOrId === 'number' || (typeof srcOrId === 'string' && /^\d+$/.test(String(srcOrId)) && !srcOrId.startsWith('/'))) {
+    // Called as _showImgModal(imgId)
+    imgId = String(srcOrId);
+    imgSrc = '/api/images/' + imgId + '?w=900';
+    var cached = S._imgCache[imgId];
+    imgAlt = cached ? (cached.figure_label || cached.caption || ('Рис. ' + imgId)) : ('Рис. ' + imgId);
+  } else {
+    // Legacy: _showImgModal(src, alt)
+    imgSrc = srcOrId;
+    imgAlt = alt || '';
+    imgId = null;
+  }
+  img.src = imgSrc;
+  img.alt = imgAlt;
+  img.style.cssText = 'max-width:100%;max-height:70vh;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6);object-fit:contain';
+  inner.appendChild(img);
+  // Caption + actions row
+  var info = document.createElement('div');
+  info.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:.875rem;color:rgba(255,255,255,.75)';
+  if (imgId) {
+    var cached2 = S._imgCache[imgId];
+    var caption2 = cached2 ? (cached2.figure_label || cached2.caption || '') : '';
+    var srcSlug2 = cached2 ? (cached2.source_slug || '') : '';
+    var seg2 = cached2 ? (cached2.segment || 0) : 0;
+    var subj2 = cached2 ? (cached2.subject_slug || '') : '';
+    if (caption2) {
+      var capEl = document.createElement('span');
+      capEl.textContent = caption2;
+      info.appendChild(capEl);
+    }
+    if (subj2 && srcSlug2) {
+      var readerLink = document.createElement('a');
+      readerLink.href = '#/reader/' + subj2 + '?src=' + srcSlug2 + '&seg=' + seg2;
+      readerLink.textContent = 'Открыть в читалке';
+      readerLink.style.cssText = 'color:#60a5fa;text-decoration:none;padding:4px 10px;border:1px solid rgba(96,165,250,.4);border-radius:6px';
+      readerLink.addEventListener('click', function() { document.body.removeChild(overlay); });
+      info.appendChild(readerLink);
+    }
+    // Hide button
+    var hideBtn = document.createElement('button');
+    hideBtn.textContent = 'Скрыть из ответов';
+    hideBtn.style.cssText = 'background:rgba(255,59,48,.15);border:1px solid rgba(255,59,48,.3);color:#ff8080;font-size:.8125rem;padding:4px 10px;border-radius:6px;cursor:pointer;font-family:inherit';
+    hideBtn.addEventListener('click', function() {
+      api('/api/images/' + imgId, {
+        method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({hidden: 1})
+      }).then(function() {
+        toast('Картинка скрыта из ответов', 'info');
+        // Hide the figure in the current view
+        document.querySelectorAll('figure[data-imgid="' + imgId + '"]').forEach(function(f) { f.style.display = 'none'; });
+        document.body.removeChild(overlay);
+      }).catch(function() { toast('Ошибка', 'error'); });
+    });
+    info.appendChild(hideBtn);
+  }
+  inner.appendChild(info);
+  overlay.appendChild(inner);
+  overlay.addEventListener('click', function(e) { if (e.target === overlay) document.body.removeChild(overlay); });
+  // Keyboard close
+  function _keyHandler(e) { if (e.key === 'Escape') { document.body.removeChild(overlay); document.removeEventListener('keydown', _keyHandler); } }
+  document.addEventListener('keydown', _keyHandler);
   document.body.appendChild(overlay);
+}
+
+// Hide an image from answers
+function _hideImg(imgId, figureEl) {
+  api('/api/images/' + imgId, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({hidden: 1})
+  }).then(function() {
+    if (figureEl) figureEl.style.display = 'none';
+    toast('Картинка скрыта из ответов', 'info');
+  }).catch(function() { toast('Ошибка скрытия', 'error'); });
+}
+
+// Preload image metadata for [img:ID] rendering
+// ids: array of string/number IDs; slug: subject slug (used to build API URL)
+async function _preloadImgCache(ids, slug) {
+  if (!ids || !ids.length) return;
+  // Filter out already cached
+  var missing = ids.filter(function(id) { return !S._imgCache[String(id)]; });
+  if (!missing.length) return;
+  var subjectSlug = slug || (location.hash.match(/\/(chat|tickets|subject|reader)\/([^/?#]+)/) || [])[2] || '';
+  if (!subjectSlug) {
+    // Fallback: fetch each individually
+    for (var i = 0; i < missing.length; i++) {
+      try {
+        var r = await api('/api/images/' + missing[i] + '/meta');
+        if (r.ok) { var d = await r.json(); S._imgCache[String(d.id)] = d; }
+      } catch(e2) {}
+    }
+    return;
+  }
+  try {
+    var r2 = await api('/api/subjects/' + subjectSlug + '/ticket-images?ids=' + missing.join(','));
+    if (r2.ok) {
+      var arr = await r2.json();
+      arr.forEach(function(d) { S._imgCache[String(d.id)] = d; });
+    }
+  } catch(e3) {}
 }
 
 async function loadSeg(slug, srcSlug, segId, tocEl) {
@@ -4992,10 +5406,20 @@ async function vChat(main, slug) {
     es.onmessage = function(ev) {
       if (ev.data === '[DONE]') {
         es.close(); S.chatES = null;
-        bubble.innerHTML = md(full);
-        renderMath(bubble);
-        msgsDiv.scrollTop = msgsDiv.scrollHeight;
-        loadConvList(slug);
+        // Preload [img:ID] cache then render final answer
+        var imgIds4 = []; var re4 = /\[img:(\d+)\]/gi; var m4;
+        while ((m4 = re4.exec(full)) !== null) { if (imgIds4.indexOf(m4[1]) === -1) imgIds4.push(m4[1]); }
+        var _renderFinalChat = function() {
+          bubble.innerHTML = md(full);
+          renderMath(bubble);
+          msgsDiv.scrollTop = msgsDiv.scrollHeight;
+          loadConvList(slug);
+        };
+        if (imgIds4.length) {
+          _preloadImgCache(imgIds4, slug).then(_renderFinalChat);
+        } else {
+          _renderFinalChat();
+        }
         return;
       }
       try {
@@ -5097,7 +5521,22 @@ function appendMsg(role, content) {
     '<div class="msg-avatar" aria-hidden="true">' + (role === 'user' ? esc(((S.user && S.user.username) || 'Я').charAt(0).toUpperCase()) : 'S') + '</div>' +
     '<div class="msg-bubble">' + (content ? md(content) : '') + '</div>';
   msgsEl.appendChild(div);
-  if (content) renderMath(div.querySelector('.msg-bubble'));
+  if (content) {
+    renderMath(div.querySelector('.msg-bubble'));
+    // If content has [img:ID] markers and cache is incomplete, preload and re-render
+    if (/\[img:\d+\]/i.test(content)) {
+      var imgIds3 = []; var re3 = /\[img:(\d+)\]/gi; var m3;
+      while ((m3 = re3.exec(content)) !== null) { if (imgIds3.indexOf(m3[1]) === -1) imgIds3.push(m3[1]); }
+      var slug3 = (location.hash.match(/\/(chat|tickets|subject|reader)\/([^/?#]+)/) || [])[2] || '';
+      var bubble3 = div.querySelector('.msg-bubble');
+      _preloadImgCache(imgIds3, slug3).then(function() {
+        if (bubble3 && bubble3.isConnected) {
+          bubble3.innerHTML = md(content);
+          renderMath(bubble3);
+        }
+      });
+    }
+  }
   return div;
 }
 
@@ -5739,7 +6178,23 @@ async function loadTickets(slug) {
   _TK.selected = new Set(Array.from(_TK.selected).filter(function(id) {
     return _TK.all.some(function(t) { return t.id === id; });
   }));
-  _tkRenderList(slug);
+  // Collect [img:ID] from all answers, preload metadata, then render
+  var allImgIds = [];
+  _TK.all.forEach(function(t) {
+    if (t.answer) {
+      var m; var re = /\[img:(\d+)\]/gi;
+      while ((m = re.exec(t.answer)) !== null) {
+        if (allImgIds.indexOf(m[1]) === -1) allImgIds.push(m[1]);
+      }
+    }
+  });
+  if (allImgIds.length) {
+    _preloadImgCache(allImgIds, slug).then(function() {
+      _tkRenderList(slug);
+    });
+  } else {
+    _tkRenderList(slug);
+  }
   _tkUpdateBulkBar(slug);
   _tkUpdateSelectAllState();
   // Update counter in header
@@ -5823,14 +6278,23 @@ async function genTicket(slug, tid, depth, wishes) {
   es.onmessage = function(ev) {
     if (ev.data === '[DONE]') {
       es.close();
-      contentEl.innerHTML = md(full);
-      renderMath(contentEl);
-      if (genPanel) genPanel.style.opacity = '';
-      // Issue 8: update generate button text with depth label
-      var genBtn = ansWrapper.querySelector('.gen-btn');
-      var depthLabel = _DEPTH_LABELS[depth] || depth;
-      if (genBtn) { genBtn.textContent = 'Составить заново (' + depthLabel + ')'; }
-      loadTickets(slug);
+      // Extract and preload any [img:ID] from the completed answer
+      var imgIds2 = []; var re2 = /\[img:(\d+)\]/gi; var m2;
+      while ((m2 = re2.exec(full)) !== null) { if (imgIds2.indexOf(m2[1]) === -1) imgIds2.push(m2[1]); }
+      var _doFinalRender = function() {
+        contentEl.innerHTML = md(full);
+        renderMath(contentEl);
+        if (genPanel) genPanel.style.opacity = '';
+        var genBtn = ansWrapper.querySelector('.gen-btn');
+        var depthLabel = _DEPTH_LABELS[depth] || depth;
+        if (genBtn) { genBtn.textContent = 'Составить заново (' + depthLabel + ')'; }
+        loadTickets(slug);
+      };
+      if (imgIds2.length) {
+        _preloadImgCache(imgIds2, slug).then(_doFinalRender);
+      } else {
+        _doFinalRender();
+      }
       return;
     }
     try {
